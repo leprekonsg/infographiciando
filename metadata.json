@@ -1,0 +1,5 @@
+{
+  "name": "Infographiciando",
+  "description": "Transform markdown text into professional infographics using Gemini 3 Flash and Gemini 3 Pro Image generation.",
+  "requestFramePermissions": []
+}

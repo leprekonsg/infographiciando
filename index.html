@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>InfographIQ - Design Intelligence</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200..800&display=swap" rel="stylesheet">
+    <style>
+      :root {
+        --bg-main: #0a0c10;
+        --bg-panel: #12141c;
+        --accent-primary: #10b981; /* Emerald */
+        --accent-secondary: #f59e0b; /* Amber */
+        --accent-tertiary: #3b82f6; /* Blue */
+        --text-dim: #94a3b8;
+      }
+
+      body {
+        font-family: 'Bricolage Grotesque', sans-serif;
+        background-color: var(--bg-main);
+        color: #f8fafc;
+      }
+
+      /* Distinctive UI Scrollbars */
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent; 
+      }
+      ::-webkit-scrollbar-thumb {
+        background: #334155; 
+        border-radius: 10px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: #475569; 
+      }
+
+      /* Motion: Staggered Fade In */
+      @keyframes reveal {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .animate-reveal {
+        animation: reveal 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+      }
+
+      /* Loading Shimmer */
+      @keyframes shimmer {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(100%); }
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.554.0",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "react-dom/server": "https://aistudiocdn.com/react-dom@^19.2.0/server",
+    "pptxgenjs": "https://cdn.jsdelivr.net/npm/pptxgenjs@3.12.0/+esm",
+    "zod": "https://cdn.jsdelivr.net/npm/zod@3.22.4/+esm"
+  }
+}
+</script>
+</head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
