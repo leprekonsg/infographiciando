@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { EditableSlideDeck } from '../types/slideTypes';
 import { generateAgenticDeck, regenerateSingleSlide } from '../services/slideAgentService';
@@ -125,14 +126,15 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
     for (const slide of deck.slides) {
         const pSlide = pres.addSlide({ masterName: "MASTER" });
         if (slide.backgroundImageUrl) {
+            // FIX: Explicit dimensions in inches (standard 16:9 PPTX) to avoid 100% bug
             pSlide.addImage({ 
                 data: slide.backgroundImageUrl, 
-                x: 0, y: 0, w: '100%', h: '100%', 
+                x: 0, y: 0, w: 10, h: 5.625, 
                 transparency: 60 
             });
         }
         await renderer.renderSlideFromPlan({ slide, styleGuide: deck.meta.styleGuide, pptSlide: pSlide, pres });
-        pSlide.addNotes(slide.speakerNotes);
+        // Notes handled within renderer to account for new array format
     }
     pres.writeFile({ fileName: `InfographIQ-${deck.meta.title}.pptx` });
   };
@@ -201,6 +203,11 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
 
   const activeSlide = deck.slides[activeSlideIndex];
   const hasCriticalWarnings = activeSlide.warnings?.some(w => w.includes('Error') || w.includes('Safe Mode'));
+  
+  // Format speaker notes for display (handle array or string legacy)
+  const displayNotes = activeSlide.speakerNotesLines && Array.isArray(activeSlide.speakerNotesLines) 
+      ? activeSlide.speakerNotesLines.join('\n\n')
+      : "No notes.";
 
   return (
       <div className="flex flex-col h-full animate-reveal">
@@ -286,8 +293,8 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
 
                         <div className="space-y-2">
                              <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Speaker Notes</label>
-                             <div className="bg-black/30 p-4 rounded-2xl border border-white/5 text-slate-300 text-xs leading-relaxed italic">
-                                "{activeSlide.speakerNotes}"
+                             <div className="bg-black/30 p-4 rounded-2xl border border-white/5 text-slate-300 text-xs leading-relaxed italic whitespace-pre-wrap">
+                                "{displayNotes}"
                              </div>
                         </div>
 

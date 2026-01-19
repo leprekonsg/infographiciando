@@ -83,6 +83,21 @@ const BuilderCanvas: React.FC<BuilderCanvasProps> = ({ slide, styleGuide, onRege
                                 {el.content}
                             </div>
                         );
+                    } else if (el.type === 'image') {
+                        return (
+                            <div key={i} className="absolute transition-all"
+                                style={{
+                                    left: toPxX(el.x), top: toPxY(el.y),
+                                    width: toPxX(el.w), height: toPxY(el.h),
+                                    backgroundImage: `url(${el.data})`,
+                                    backgroundSize: 'contain',
+                                    backgroundRepeat: 'no-repeat',
+                                    backgroundPosition: 'center',
+                                    opacity: 1 - (el.transparency || 0)/100,
+                                    zIndex: el.zIndex
+                                }} 
+                            />
+                        );
                     }
                     return null;
                 })}

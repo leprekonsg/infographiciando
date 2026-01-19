@@ -1,5 +1,7 @@
 
-import { GoogleGenAI, Type, Modality, GenerateContentResponse } from "@google/genai";
+
+import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { PROMPTS } from "./promptRegistry";
 
 // Helper to create client instance
 const getAiClient = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -36,6 +38,361 @@ interface GenerationPlan {
 }
 
 export type GenerationMode = 'infographic' | 'presentation' | 'visual-asset' | 'vector-svg' | 'sticker';
+
+const MODEL_SMART = "gemini-3-pro-preview"; 
+const MODEL_FAST = "gemini-3-flash-preview"; 
+const MODEL_BACKUP = "gemini-2.0-flash";
+const MODEL_LITE = "gemini-2.0-flash-lite-preview-02-05";
+
+// Pricing in USD per 1M tokens (Approximation) & Per Image
+const PRICING = {
+  TOKENS: {
+    [MODEL_FAST]: { input: 0.075, output: 0.30 },
+    [MODEL_SMART]: { input: 3.50, output: 10.50 },
+    [MODEL_BACKUP]: { input: 0.10, output: 0.40 },
+    [MODEL_LITE]: { input: 0.075, output: 0.30 }
+  },
+  IMAGES: {
+    'gemini-3-pro-image-preview': 0.134,
+    'gemini-2.5-flash-image': 0.039
+  }
+};
+
+export class TokenTracker {
+  totalCost = 0;
+  
+  addTokenUsage(model: string, inputTokens: number, outputTokens: number) {
+    const rates = PRICING.TOKENS[model as keyof typeof PRICING.TOKENS] || { input: 0, output: 0 };
+    const cost = (inputTokens / 1_000_000 * rates.input) + (outputTokens / 1_000_000 * rates.output);
+    this.totalCost += cost;
+  }
+
+  addImageCost(model: string) {
+      const cost = PRICING.IMAGES[model as keyof typeof PRICING.IMAGES] || 0.134; 
+      this.totalCost += cost;
+  }
+}
+
+// --- ERROR HANDLING TYPES ---
+export type JsonErrorType = 'REPETITION' | 'TRUNCATION' | 'MALFORMED' | 'EMPTY';
+
+export class JsonParseError extends Error {
+  constructor(public type: JsonErrorType, public text: string, message: string) {
+    super(message);
+    this.name = 'JsonParseError';
+  }
+}
+
+// Helper: robustly extract JSON text from a larger string
+function extractJsonBlock(text: string): string {
+    const match = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/);
+    if (match && match[1]) return match[1].trim();
+    return text.trim();
+}
+
+// Robust JSON Repair with Decode Ladder & Auto-Closer
+export function cleanAndParseJson(text: string): any {
+  if (!text) throw new JsonParseError('EMPTY', '', "Empty response received.");
+  
+  // 0. SAFETY: Detect Repetition Loop Hallucination immediately
+  // Matches any word (4+ chars) repeated 25+ times with spaces/punctuation
+  const repetitionRegex = /(\b\w{4,}\b)(?:[\s,."]*\1){25,}/;
+  if (repetitionRegex.test(text)) {
+     throw new JsonParseError('REPETITION', text, "Detected repetition loop hallucination.");
+  }
+
+  // CIRCUIT BREAKER LOGIC
+  if (text.length > 200000) {
+      console.warn(`[JSON SAFETY] Output extremely large (${text.length} chars).`);
+  }
+
+  let cleaned = extractJsonBlock(text);
+  
+  // 1. Find Boundaries (Start { or [ and End } or ])
+  const firstBrace = cleaned.indexOf('{');
+  const firstBracket = cleaned.indexOf('[');
+  
+  if (firstBrace === -1 && firstBracket === -1) {
+       throw new JsonParseError('MALFORMED', text.substring(0, 1000), "No JSON envelope found.");
+  }
+
+  // Determine start index
+  let startIdx = -1;
+  if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
+      startIdx = firstBracket;
+  } else {
+      startIdx = firstBrace;
+  }
+
+  // Determine end index
+  const isArray = cleaned[startIdx] === '[';
+  const endChar = isArray ? ']' : '}';
+  const lastIdx = cleaned.lastIndexOf(endChar);
+  
+  // Slice correctly
+  if (lastIdx === -1 || lastIdx <= startIdx) {
+      cleaned = cleaned.substring(startIdx); // Truncated, take all we have
+  } else {
+      cleaned = cleaned.substring(startIdx, lastIdx + 1);
+  }
+
+  // 2. Try Standard Parse First
+  try {
+    return JSON.parse(cleaned);
+  } catch (e) {
+    // Continue to repair strategies
+  }
+
+  // 3. Heuristic Repair: Auto-Close Truncated JSON
+  const stack: string[] = [];
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < cleaned.length; i++) {
+      const char = cleaned[i];
+      if (escape) { escape = false; continue; }
+      if (char === '\\') { escape = true; continue; }
+      if (char === '"') { inString = !inString; continue; }
+      
+      if (!inString) {
+          if (char === '{') stack.push('}');
+          else if (char === '[') stack.push(']');
+          else if (char === '}' || char === ']') {
+              if (stack.length > 0 && stack[stack.length - 1] === char) {
+                  stack.pop();
+              }
+          }
+      }
+  }
+
+  // Append missing closers in reverse order
+  if (stack.length > 0) {
+      const closers = stack.reverse().join('');
+      console.warn(`[JSON REPAIR] Detected truncation. Appending: "${closers}"`);
+      cleaned += closers;
+  }
+
+  // 4. THE DECODE LADDER (Attempt to parse the Auto-Closed string)
+  try {
+    return JSON.parse(cleaned);
+  } catch (e1) {
+    try {
+        const noNewLines = cleaned.replace(/(?<!\\)\n/g, "\\n");
+        return JSON.parse(noNewLines);
+    } catch (e2) { }
+
+    if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
+        try {
+            const firstLayer = JSON.parse(cleaned);
+            if (typeof firstLayer === 'string') return JSON.parse(firstLayer);
+            return firstLayer;
+        } catch (e4) { }
+    }
+
+    const isTruncated = stack.length > 0;
+    throw new JsonParseError(isTruncated ? 'TRUNCATION' : 'MALFORMED', text.substring(0, 5000), "Heuristic parse failed.");
+  }
+}
+
+// Fallback Chain Configuration
+const FALLBACK_CHAIN: Record<string, string> = {
+    [MODEL_SMART]: MODEL_FAST,
+    [MODEL_FAST]: MODEL_BACKUP,
+    [MODEL_BACKUP]: MODEL_LITE
+};
+
+// CIRCUIT BREAKER STATE
+const CIRCUIT_BREAKER: Record<string, { failures: number, cooldownUntil: number, threshold: number, duration: number }> = {
+    [MODEL_SMART]: { failures: 0, cooldownUntil: 0, threshold: 2, duration: 60000 } // 60s cooldown for Pro
+};
+
+function getHealthyModel(requestedModel: string): string {
+    const breaker = CIRCUIT_BREAKER[requestedModel];
+    if (breaker && Date.now() < breaker.cooldownUntil) {
+        console.warn(`[CIRCUIT BREAKER] ${requestedModel} is cooling down. Downgrading to ${MODEL_FAST}.`);
+        return MODEL_FAST; 
+    }
+    return requestedModel;
+}
+
+function reportFailure(model: string, isQuota: boolean) {
+    const breaker = CIRCUIT_BREAKER[model];
+    if (breaker && isQuota) {
+        breaker.failures++;
+        if (breaker.failures >= breaker.threshold) {
+            breaker.cooldownUntil = Date.now() + breaker.duration;
+            breaker.failures = 0; // Reset
+            console.error(`[CIRCUIT BREAKER] ${model} TRIPPED. Downgrading to ${MODEL_FAST} for ${breaker.duration/1000}s.`);
+        }
+    }
+}
+
+export async function runJsonRepair(brokenJson: string, schema: any, tracker?: TokenTracker): Promise<any> {
+    try {
+        console.log("[JSON REPAIR] Attempting agentic repair with SMART model...");
+        const safeInput = brokenJson.length > 15000 ? brokenJson.substring(0, 15000) + "...(truncated)" : brokenJson;
+        
+        // Use MODEL_SMART (Pro) for repair because repairing broken JSON requires high reasoning.
+        // We set a high token limit to ensure the repaired JSON isn't truncated again.
+        return await callAI(
+            MODEL_SMART,
+            PROMPTS.JSON_REPAIRER.TASK(safeInput),
+            { mode: 'json', schema: schema, config: { temperature: 0.1, maxOutputTokens: 8192 } },
+            tracker
+        );
+    } catch (e) {
+        console.error("[JSON REPAIR] Repair failed.", e);
+        throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Agent repair failed.");
+    }
+}
+
+interface CallAIOptions {
+    mode: 'json' | 'text';
+    config?: any;
+    schema?: any; // The JSON Schema object
+    systemInstruction?: string;
+}
+
+export async function callAI(
+    model: string, 
+    prompt: string, 
+    options: CallAIOptions,
+    tracker?: TokenTracker, 
+    retryCount = 0
+): Promise<any> {
+    const MAX_RETRIES_SAME_MODEL = 2; 
+
+    // 1. Check Circuit Breaker
+    const effectiveModel = getHealthyModel(model);
+    
+    // Adjust config if downgraded
+    const effectiveConfig = { ...options.config };
+    if (effectiveModel !== model) {
+        if (effectiveModel === MODEL_FAST || effectiveModel === MODEL_BACKUP) {
+            // Remove thinking config if downgraded to a model that might not support it well or to save cost
+             if (effectiveConfig.thinkingConfig) delete effectiveConfig.thinkingConfig;
+        }
+    }
+
+    try {
+        const client = getAiClient();
+        
+        // --- PREPARE GENERATE CONTENT REQUEST ---
+        const config: any = {};
+        
+        // System Instruction
+        if (options.systemInstruction) {
+            config.systemInstruction = options.systemInstruction;
+        }
+
+        // Response Format
+        if (options.mode === 'json') {
+            config.responseMimeType = "application/json";
+            if (options.schema) {
+                config.responseSchema = options.schema;
+            }
+        }
+
+        // Tools
+        if (effectiveConfig.tools) {
+            config.tools = effectiveConfig.tools;
+        }
+
+        // Map Standard Configs
+        if (effectiveConfig.temperature !== undefined) config.temperature = effectiveConfig.temperature;
+        if (effectiveConfig.topP !== undefined) config.topP = effectiveConfig.topP;
+        if (effectiveConfig.maxOutputTokens !== undefined) config.maxOutputTokens = effectiveConfig.maxOutputTokens;
+        if (effectiveConfig.seed !== undefined) config.seed = effectiveConfig.seed;
+
+        // Map Thinking Config
+        if (effectiveConfig.thinkingConfig) {
+            // Only add Thinking Config for supported models
+            if (effectiveModel.includes('gemini-3') || effectiveModel.includes('gemini-2.5')) {
+                 config.thinkingConfig = effectiveConfig.thinkingConfig;
+            }
+        }
+
+        const req = {
+            model: effectiveModel,
+            contents: prompt,
+            config: config
+        };
+        
+        // Timeout wrapper to prevent hanging indefinitely
+        const generatePromise = client.models.generateContent(req);
+        
+        // 180s timeout (increased for Thinking models which can take time)
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error(`Timeout: ${effectiveModel} took too long to respond.`)), 180000)
+        );
+
+        const response: any = await Promise.race([generatePromise, timeoutPromise]);
+
+        if (tracker && response.usageMetadata) {
+            tracker.addTokenUsage(effectiveModel, response.usageMetadata.promptTokenCount || 0, response.usageMetadata.candidatesTokenCount || 0);
+        }
+        
+        const rawText = response.text || "";
+
+        if (options.mode === 'json') {
+             return cleanAndParseJson(rawText || "{}");
+        } else {
+             return rawText;
+        }
+
+    } catch (e: any) {
+        if (e instanceof JsonParseError) {
+             throw e;
+        }
+
+        const errorMessage = e.message || '';
+        const status = e.status;
+        
+        const isQuota = status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
+        const isOverloaded = status === 503 || errorMessage.includes('503') || errorMessage.includes('Overloaded');
+        const isTimeout = status === 499 || errorMessage.includes('cancelled') || errorMessage.includes('timeout') || errorMessage.includes('The operation was cancelled');
+
+        if (effectiveModel === model) {
+            reportFailure(model, isQuota || isOverloaded || isTimeout);
+        }
+
+        if ((isQuota || isOverloaded || isTimeout) && retryCount < MAX_RETRIES_SAME_MODEL) {
+            const delay = Math.pow(2, retryCount + 1) * 1000 + Math.random() * 500; 
+            console.warn(`[AI SERVICE WARN] ${effectiveModel} failed (${status || 'timeout'}). Retrying in ${Math.round(delay)}ms (Attempt ${retryCount + 1})...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return callAI(effectiveModel, prompt, options, tracker, retryCount + 1);
+        }
+
+        // FALLBACK LOGIC
+        const nextModel = FALLBACK_CHAIN[effectiveModel];
+
+        if ((isQuota || isOverloaded || isTimeout) && nextModel) {
+            console.warn(`[AI SERVICE WARN] Exhausted retries for ${effectiveModel}. Falling back to ${nextModel}.`);
+            
+            const newConfig = { ...effectiveConfig };
+            // Strip thinking for basic models
+            if ((nextModel === MODEL_BACKUP || nextModel === MODEL_LITE)) {
+                 if (newConfig.thinkingConfig) delete newConfig.thinkingConfig;
+            }
+            if (nextModel === MODEL_FAST || nextModel === MODEL_BACKUP) {
+                newConfig.temperature = 0.1;
+                newConfig.topP = 0.8; 
+            }
+
+            return callAI(nextModel, prompt, { ...options, config: newConfig }, tracker, 0); 
+        }
+
+        if (isOverloaded) {
+            throw new Error("Service Unavailable (503). All models overloaded. Please try again later.");
+        }
+        
+        console.error(`[AI SERVICE ERROR] Call Failed on ${effectiveModel}`, e);
+        throw new Error(`AI Call Failed: ${errorMessage}`);
+    }
+}
+
+
+// --- EXISTING GENERATION LOGIC ---
 
 // Robust JSON Extractor
 const extractJson = (text: string): string => {
@@ -155,6 +512,7 @@ const callWithRetry = async <T>(
 };
 
 // --- SINGLE IMAGE GENERATOR (EXPORTED FOR AGENTIC BUILDER) ---
+// Note: Keeping models.generateContent for images as Interactions API image config support is experimental/sparse.
 export const generateImageFromPrompt = async (
   prompt: string,
   aspectRatio: string = "16:9"
@@ -287,11 +645,8 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
       OUTPUT FORMAT:
       Return a JSON object conforming to the schema, containing 'globalVisualStyle' and a list of 'slides'.
     `;
-
-    const config: any = {
-      systemInstruction: systemInstruction,
-      responseMimeType: "application/json",
-      responseSchema: {
+    
+    const responseFormat = {
         type: Type.OBJECT,
         properties: {
           globalVisualStyle: { type: Type.STRING },
@@ -311,26 +666,27 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
           }
         },
         required: ["globalVisualStyle", "slides"]
-      }
     };
 
-    if (enableThinking) {
-       config.thinkingConfig = { thinkingBudget: 4096 }; // High budget for deep metaphor/structure analysis
-    }
-
     try {
-      const response = await callWithRetry<GenerateContentResponse>(
+      const response = await callWithRetry<any>(
         () => ai.models.generateContent({
           model: modelName,
           contents: taskPrompt, 
-          config
+          config: {
+            systemInstruction: systemInstruction,
+            responseMimeType: "application/json",
+            responseSchema: responseFormat,
+            thinkingConfig: enableThinking ? { thinkingBudget: 2048 } : undefined
+          }
         }),
         (attempt, delay) => console.log(`Planning retry attempt ${attempt}...`)
       );
 
-      if (!response.text) throw new Error("Empty response from AI model");
+      const rawText = response.text;
+      if (!rawText) throw new Error("Empty response from AI model");
 
-      const cleanedJson = extractJson(response.text);
+      const cleanedJson = extractJson(rawText);
       try {
         return JSON.parse(cleanedJson) as GenerationPlan;
       } catch (e) {
@@ -393,20 +749,21 @@ export const generateVisualContent = async (
       `;
 
       try {
-        const response = await callWithRetry<GenerateContentResponse>(
+        const response = await callWithRetry<any>(
           () => ai.models.generateContent({
              model: 'gemini-3-flash-preview', 
              contents: svgPrompt,
-             config: { 
-               systemInstruction: svgSystemInstruction,
-               thinkingConfig: { thinkingBudget: 1024 } 
+             config: {
+                 systemInstruction: svgSystemInstruction,
+                 thinkingConfig: { thinkingBudget: 1024 }
              }
           }),
           (attempt, delay) => onStatus(`System overloaded. Retrying SVG ${page.title} (Attempt ${attempt})...`)
         );
         
-        if (response.text) {
-          const svgCode = extractSvg(response.text);
+        const rawText = response.text;
+        if (rawText) {
+          const svgCode = extractSvg(rawText);
           const encodedSvg = encodeURIComponent(svgCode);
           const dataUrl = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
           

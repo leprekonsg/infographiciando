@@ -52,6 +52,35 @@ export const ValidationResultSchema = z.object({
   }))
 });
 
+// --- VISUAL & SPATIAL SCHEMAS (NEW) ---
+
+export const SpatialZoneSchema = z.object({
+  id: z.string(),
+  purpose: z.enum(['hero', 'secondary', 'accent', 'negative-space']),
+  x: z.number(), y: z.number(), w: z.number(), h: z.number(),
+  content_suggestion: z.string().optional()
+});
+
+export const SpatialStrategySchema = z.object({
+  zones: z.array(SpatialZoneSchema),
+  compositional_hierarchy: z.string(),
+  negative_space_plan: z.string(),
+  visual_weight_distribution: z.string()
+});
+
+export const VisualDesignSpecSchema = z.object({
+  spatial_strategy: SpatialStrategySchema,
+  prompt_with_composition: z.string(),
+  foreground_elements: z.array(z.string()).optional(),
+  background_treatment: z.string(),
+  negative_space_allocation: z.string(),
+  color_harmony: z.object({
+    primary: z.string(),
+    accent: z.string(),
+    background_tone: z.string()
+  })
+});
+
 // --- CORE DATA SCHEMAS ---
 
 // 1. CITATION SCHEMA (The Contract)
@@ -176,7 +205,7 @@ export const StyleGuideSchema = z.object({
 export const SelfCritiqueSchema = z.object({
   readabilityScore: z.number().min(0).max(10),
   textDensityStatus: z.enum(['optimal', 'high', 'overflow']),
-  layoutAction: z.string()
+  layoutAction: z.enum(['keep', 'simplify', 'shrink_text', 'add_visuals'])
 });
 
 export const SlideNodeSchema = z.object({
@@ -190,12 +219,15 @@ export const SlideNodeSchema = z.object({
   validation: ValidationResultSchema.optional(),
 
   layoutPlan: SlideLayoutPlanSchema.optional(),
+  visualDesignSpec: VisualDesignSpecSchema.optional(), // New: Detailed visual spec
   agentLayout: AgentLayoutSchema.optional(), // Legacy/Advanced
   
   // Content & Evidence
   content: z.array(z.string()).optional(), // Legacy compat
   citations: z.array(CitationSchema).optional(),
-  speakerNotes: z.string(),
+  
+  // SCHEMA HARDENING: Use array of strings to prevent newline breakage in JSON
+  speakerNotesLines: z.array(z.string()),
 
   // Specialized Payloads
   chartSpec: ChartSpecSchema.optional(),
@@ -249,6 +281,9 @@ export type ValidationResult = z.infer<typeof ValidationResultSchema>;
 export type ResearchFact = z.infer<typeof ResearchFactSchema>;
 export type AgentLayout = z.infer<typeof AgentLayoutSchema>;
 export type FactCluster = z.infer<typeof FactClusterSchema>;
+export type VisualDesignSpec = z.infer<typeof VisualDesignSpecSchema>;
+export type SpatialZone = z.infer<typeof SpatialZoneSchema>;
+export type SpatialStrategy = z.infer<typeof SpatialStrategySchema>;
 
 export type VisualElement = 
   | {
