@@ -52,6 +52,48 @@ export const ValidationResultSchema = z.object({
   }))
 });
 
+// --- VISUAL CRITIQUE SCHEMAS (System 2) ---
+
+export const CritiqueSeveritySchema = z.enum(['critical', 'major', 'minor']);
+
+export const CritiqueCategorySchema = z.enum([
+  'overlap',      // Components overlap in spatial space
+  'contrast',     // Text/background contrast issues
+  'alignment',    // Elements not aligned to grid
+  'hierarchy',    // Visual weight doesn't match importance
+  'density'       // Too many/few elements in zone
+]);
+
+export const CritiqueIssueSchema = z.object({
+  severity: CritiqueSeveritySchema,
+  category: CritiqueCategorySchema,
+  zone: z.string().optional(),
+  description: z.string().max(200),
+  suggestedFix: z.string().max(200)
+});
+
+export const VisualCritiqueReportSchema = z.object({
+  issues: z.array(CritiqueIssueSchema).max(10),
+  overallScore: z.number().min(0).max(100),
+  hasCriticalIssues: z.boolean()
+});
+
+export type CritiqueSeverity = z.infer<typeof CritiqueSeveritySchema>;
+export type CritiqueCategory = z.infer<typeof CritiqueCategorySchema>;
+export type CritiqueIssue = z.infer<typeof CritiqueIssueSchema>;
+export type VisualCritiqueReport = z.infer<typeof VisualCritiqueReportSchema>;
+
+// System 2 Visual Critique Thresholds
+export const VISUAL_THRESHOLDS = {
+  EXCELLENT: 95,        // No critique needed
+  TARGET: 85,           // Critique activation point
+  REPAIR_REQUIRED: 70,  // Force repair attempt
+  CRITICAL: 60,         // Aggressive repair
+  FALLBACK: 50          // Give up
+} as const;
+
+export type VisualThreshold = typeof VISUAL_THRESHOLDS[keyof typeof VISUAL_THRESHOLDS];
+
 // --- VISUAL & SPATIAL SCHEMAS (NEW) ---
 
 export const SpatialZoneSchema = z.object({
@@ -290,6 +332,14 @@ export interface GeneratorResult {
   needsReroute: boolean;
   rerouteReason?: string;
   avoidLayoutVariants?: string[];
+  // System 2 tracking
+  visualCritiqueRan?: boolean;
+  visualRepairAttempted?: boolean;
+  visualRepairSucceeded?: boolean;
+  // System 2 cost breakdown
+  system2Cost?: number;
+  system2InputTokens?: number;
+  system2OutputTokens?: number;
 }
 
 /**
@@ -306,6 +356,16 @@ export interface DeckMetrics {
   visualAlignmentFirstPassSuccess: number;
   totalVisualDesignAttempts: number;
   rerouteCount: number;
+  // System 2 Visual Critique Tracking
+  visualCritiqueAttempts: number;
+  visualRepairSuccess: number;
+  // System 2 Cost Breakdown
+  system2Cost?: number;
+  system2TokensInput?: number;
+  system2TokensOutput?: number;
+  // GAP 2: Deck-Wide Narrative Coherence
+  coherenceScore?: number;
+  coherenceIssues?: number;
 }
 
 export type EditableSlideDeck = {

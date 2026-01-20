@@ -73,58 +73,65 @@ export const PROMPTS = {
       `
   },
 
-  // --- VISUAL COMPOSER AGENT (with Validator-Driven Vibe Coding) ---
+  // --- VISUAL COMPOSER AGENT (Background Aesthetics Only) ---
+  // IMPORTANT: This agent designs BACKGROUND IMAGES only.
+  // Text, icons, diagrams, and charts are rendered separately by SpatialLayoutEngine.
   VISUAL_COMPOSER: {
-    // Phase 2: Expert UI Architect with validateVisualLayoutAlignment awareness
-    ROLE: "Expert UI Architect. Think: 'Does this pass validateVisualLayoutAlignment?'",
+    ROLE: "Background Design Architect. You design ABSTRACT BACKGROUNDS only - no text, no icons, no diagrams.",
     TASK: (context: any) => `
-You are an Expert UI Architect. Before generating, mentally verify: "Does this pass validateVisualLayoutAlignment?"
+You are a Background Design Architect. Your job is to create a PROMPT for an abstract background image.
+
+CRITICAL UNDERSTANDING:
+- You are designing a BACKGROUND TEXTURE/GRADIENT only
+- The image generation system will NOT include any text, icons, or diagrams
+- Text and icons are overlaid SEPARATELY by another rendering system
+- Your prompt_with_composition describes ONLY: colors, gradients, lighting, abstract shapes, textures
 
 SLIDE CONTEXT:
-- Title: ${context.title}
+- Title Theme: ${context.title}
 - Visual Focus: ${context.visualFocus}
 - Layout Variant: ${context.layoutVariant}
-- Components: ${context.componentTypes.join(', ')}
 
-VALIDATOR HEURISTICS (you MUST pass these checks):
-1. VISUAL FOCUS KEYWORDS: Mention "${context.visualFocus}" keywords 2+ times in prompt_with_composition
-2. NEGATIVE SPACE: Allocate 15-35% range (validator rejects <10% or >50%)
-3. ZONE PLACEMENT: ${context.layoutVariant} requires ${context.componentTypes.join(', ')} to be placed in correct zones
-4. DARK BACKGROUND: For text overlay, use YIQ<180 (dark colors like #0f172a, #1e293b, not mid-tones)
+BACKGROUND DESIGN REQUIREMENTS:
 
-SPATIAL STRATEGY PROVIDED:
-${JSON.stringify(context.spatialStrategy, null, 2)}
+1. prompt_with_composition MUST describe ONLY:
+   - Color gradients (e.g., "dark blue to purple gradient")
+   - Lighting effects (e.g., "soft ambient glow", "cinematic lighting")
+   - Abstract textures (e.g., "subtle mesh pattern", "soft bokeh")
+   - Mood/atmosphere (e.g., "professional", "modern", "sophisticated")
+   
+2. prompt_with_composition must NOT describe:
+   - Any text, words, labels, or numbers
+   - Any diagrams, flowcharts, or process flows
+   - Any icons, symbols, or logos
+   - Any charts, graphs, or data visualizations
 
-DESIGN PROCESS:
+3. EXAMPLE GOOD PROMPTS:
+   - "Dark navy gradient with subtle teal accent glow, abstract geometric shapes fading into background, cinematic lighting"
+   - "Deep purple to black gradient, soft particle effects, premium corporate aesthetic"
+   - "Slate gray background with soft radial lighting, minimal abstract lines"
 
-1. FIRST: Mentally draft the spatial zones for ${context.layoutVariant}
-2. THEN: Compile to VisualDesignSpec JSON
+4. EXAMPLE BAD PROMPTS (NEVER DO THIS):
+   - "Diagram showing technology stack with arrows" ❌
+   - "Flowchart with boxes and labels" ❌
+   - "Icons representing features" ❌
 
-DESIGN REQUIREMENTS:
+VALIDATOR HEURISTICS:
+1. NEGATIVE SPACE: 15-35% range for text overlay areas (use "20%" or "25%")
+2. DARK BACKGROUND: background_tone MUST be dark (#0f172a, #1e293b, #0d1117)
+3. VISUAL FOCUS: Reference "${context.visualFocus}" theme in color/mood choices
 
-1. COMPOSITION:
-   - Create a visual that fills the designated zones efficiently
-   - Use compositional hierarchy (focal point, supporting elements, negative space)
-   - Ensure visual elements don't overlap with text zones
+COLOR HARMONY:
+- background_tone: Dark hex like #0f172a, #1a1a2e (YIQ < 180)
+- primary: Main accent color
+- accent: Secondary highlight color
 
-2. NEGATIVE SPACE (CRITICAL - validator checks this):
-   - ${context.spatialStrategy.negative_space_plan || 'Maintain breathing room'}
-   - MUST be between 15% and 35% - use "20%" or "25%" as safe values
-   - Output format: "20%" (not "twenty percent")
-
-3. COLOR HARMONY (CRITICAL - validator checks YIQ contrast):
-   - background_tone MUST be dark (hex values like #0f172a, #1a1a2e, #0d1117)
-   - NEVER use mid-tones (avoid #808080, #a0a0a0, etc.)
-   - Accent colors should be vibrant for contrast
-
-4. CONTENT ALIGNMENT (CRITICAL - validator checks this):
-   - prompt_with_composition MUST include "${context.visualFocus}" keywords explicitly
-   - foreground_elements SHOULD reference the visual focus topic
-
-5. SPATIAL ZONES:
-   ${context.spatialStrategy.zones ? context.spatialStrategy.zones.map((z: any) => `- ${z.purpose} zone (${z.id}): ${z.content_suggestion || 'supporting element'}`).join('\n') : 'No specific zones'}
-
-OUTPUT: Return JSON conforming to VisualDesignSpecSchema. Ensure alignment.score >= 80.
+OUTPUT: Return JSON with:
+- spatial_strategy: Zone layout information
+- prompt_with_composition: ABSTRACT BACKGROUND DESCRIPTION ONLY
+- background_treatment: "Gradient" | "Solid" | "Textured"
+- negative_space_allocation: "20%" (string format)
+- color_harmony: {primary, accent, background_tone}
 `
   },
 
@@ -193,7 +200,7 @@ OUTPUT: Return JSON conforming to VisualDesignSpecSchema. Ensure alignment.score
     TASK: (brokenJson: string) => `
       You are a specialized JSON repair engine.
       The following text contains a malformed or "dirty" JSON object.
-      
+
       YOUR JOB:
       1. Extract the intended JSON object.
       2. Fix syntax errors (unescaped quotes, trailing commas, newlines in strings).
@@ -203,5 +210,88 @@ OUTPUT: Return JSON conforming to VisualDesignSpecSchema. Ensure alignment.score
       BAD INPUT:
       ${brokenJson}
       `
+  },
+
+  // --- SYSTEM 2: VISUAL CRITIQUE & REPAIR PROMPTS ---
+
+  LAYOUT_CRITIC: {
+    ROLE: `Senior Art Director with 15+ years in presentation design.
+You review spatial layouts for professional slide decks.
+Your critique is precise, actionable, and focused on visual clarity.`,
+
+    TASK: (svgProxy: string, layoutVariant: string, componentTypes: string[]) => {
+      // GAP 8: Layout Variant Context - Define expected structure for each variant
+      const LAYOUT_EXPECTATIONS: Record<string, string> = {
+        'bento-grid': 'Expect 2x2 or 2x3 grid structure with evenly distributed cells. Each cell should contain distinct content (metrics or icons). No single item should dominate. Cells should have similar visual weight.',
+        'hero-centered': 'Large central text area with high visual impact. Minimal secondary content. Asymmetry is intentional and acceptable. Title should be prominent (1.4x normal size). Bottom accent element is decorative.',
+        'split-left-text': 'Left side contains text (60% width max), right side contains visuals (charts, images). Vertical divider accent between sections. Left-right asymmetry is by design. Text should not overflow into visual zone.',
+        'split-right-text': 'Right side contains text (60% width max), left side contains visuals. Mirror of split-left-text. Text should align to the right zone, visuals to the left.',
+        'timeline-horizontal': 'Horizontal flow with process steps progressing left-to-right. Horizontal timeline track with connecting line. Steps should be evenly spaced. Vertical misalignment between steps indicates an error.',
+        'standard-vertical': 'Vertical stack of content zones. Title at top, optional divider, then 1-2 stacked content areas. Simple, clean layout. Vertical alignment is critical.'
+      };
+
+      const expectation = LAYOUT_EXPECTATIONS[layoutVariant] || 'Standard layout expectations apply.';
+
+      return `
+Review this slide layout for visual issues.
+
+LAYOUT VARIANT: ${layoutVariant}
+LAYOUT EXPECTATIONS: ${expectation}
+COMPONENT TYPES: ${componentTypes.join(', ')}
+
+SVG SPATIAL PROXY (content-aware rendering):
+${svgProxy}
+
+LEGEND:
+- Zone purpose codes: H=hero, S=secondary, A=accent
+- Component codes: TB=text-bullets, MC=metric-cards, PF=process-flow, IG=icon-grid, CF=chart-frame
+
+CRITICAL: Evaluate the layout against the LAYOUT EXPECTATIONS above. Some visual patterns (like asymmetry in split layouts) are intentional, not errors.
+
+EVALUATE FOR:
+1. OVERLAP: Do any content bounding boxes intersect improperly? (Intentional overlays are OK)
+2. CONTRAST: Are text zones placed over low-contrast areas?
+3. ALIGNMENT: Are elements aligned to a consistent grid? (Check against layout variant expectations)
+4. HIERARCHY: Does visual weight (size/position) match importance?
+5. DENSITY: Are zones overcrowded or too sparse for the layout variant?
+
+OUTPUT: JSON VisualCritiqueReport with issues array and overall score (0-100).
+Score 70+ = acceptable, 85+ = good, 95+ = excellent.
+
+REMEMBER:
+- Be specific about which zones/elements have issues
+- Provide actionable fixes that respect the layout variant's intended structure
+- Don't flag intentional design patterns as errors
+`;
+    }
+  },
+
+  LAYOUT_REPAIRER: {
+    ROLE: `Layout Engineer specializing in spatial composition.
+You fix visual layout issues while preserving content integrity.
+Your repairs are minimal, targeted, and respect the original design intent.`,
+
+    TASK: (originalLayoutPlan: string, critiqueReport: string, svgProxy: string) => `
+Fix the visual issues identified in this layout.
+
+ORIGINAL LAYOUT PLAN:
+${originalLayoutPlan}
+
+CRITIQUE REPORT:
+${critiqueReport}
+
+CURRENT SPATIAL LAYOUT (SVG):
+${svgProxy}
+
+REPAIR RULES:
+1. Preserve ALL text content - only adjust spatial properties
+2. Fix critical issues first, then major, then minor
+3. Prefer moving/resizing over removing elements
+4. Maintain the layout variant's intended structure
+5. If overlap cannot be fixed, truncate the LESS important element
+
+OUTPUT: Complete repaired layoutPlan JSON (same schema as original).
+Only output the JSON, no explanation.
+`
   }
 };

@@ -18,9 +18,11 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 import {
     EditableSlideDeck, SlideNode, OutlineSchema, SLIDE_TYPES, GlobalStyleGuide,
     ResearchFact, RouterDecision, RouterDecisionSchema, SlideNodeSchema, LayoutVariantSchema, RenderModeSchema,
-    FactClusterSchema, VisualDesignSpec,
+    FactClusterSchema, VisualDesignSpec, ValidationResult,
     // Level 3 Agentic Stack Types
-    NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics
+    NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics,
+    // System 2 Visual Critique
+    VISUAL_THRESHOLDS
 } from "../types/slideTypes";
 import {
     InteractionsClient,
@@ -33,7 +35,7 @@ import {
     ThinkingLevel
 } from "./interactionsClient";
 import { PROMPTS } from "./promptRegistry";
-import { validateSlide, validateVisualLayoutAlignment } from "./validators";
+import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence } from "./validators";
 import { runVisualDesigner } from "./visualDesignAgent";
 import { z } from "zod";
 
@@ -270,7 +272,7 @@ function deepParseJsonStrings(obj: any): any {
     return obj;
 }
 
-function autoRepairSlide(slide: SlideNode): SlideNode {
+export function autoRepairSlide(slide: SlideNode): SlideNode {
     // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
 
     // Fix malformed selfCritique (model outputs prose in layoutAction instead of enum)
@@ -895,18 +897,193 @@ async function runContentPlanner(
     }
 }
 
+// --- SYSTEM 2: RECURSIVE VISUAL CRITIQUE ---
+
+/**
+ * Runs recursive visual critique loop on a slide candidate.
+ * Implements bounded recursion (MAX_ROUNDS=3) with score-based convergence.
+ *
+ * @param candidate - Slide to critique
+ * @param validation - Initial validation result
+ * @param costTracker - Cost tracking
+ * @param styleGuide - Global style guide for SVG rendering
+ * @returns Enhanced result with rounds, finalScore, repairSucceeded
+ */
+async function runRecursiveVisualCritique(
+    candidate: SlideNode,
+    validation: ValidationResult,
+    costTracker: CostTracker,
+    styleGuide: GlobalStyleGuide
+): Promise<{
+    slide: SlideNode;
+    rounds: number;
+    finalScore: number;
+    repairSucceeded: boolean;
+    system2Cost: number;
+    system2InputTokens: number;
+    system2OutputTokens: number;
+}> {
+    const MAX_VISUAL_ROUNDS = 3;
+    const MIN_IMPROVEMENT_DELTA = 5; // Require meaningful improvement
+
+    // Capture cost before System 2 operations
+    const preSystem2Summary = costTracker.getSummary();
+    const preSystem2Cost = preSystem2Summary.totalCost;
+    const preSystem2InputTokens = preSystem2Summary.totalInputTokens;
+    const preSystem2OutputTokens = preSystem2Summary.totalOutputTokens;
+
+    // Import visual cortex functions
+    const { generateSvgProxy, runVisualCritique, runLayoutRepair } = await import('./visualDesignAgent');
+
+    let currentSlide = candidate;
+    let currentValidation = validation;
+    let round = 0;
+    let repairSucceeded = false;
+
+    // GAP 9: Issue Persistence Tracking
+    // Track issue categories across rounds to detect unfixable issues
+    const issueHistory = new Map<string, number>(); // category -> count
+
+    while (round < MAX_VISUAL_ROUNDS && currentValidation.score < VISUAL_THRESHOLDS.TARGET) {
+        round++;
+        console.log(`[SYSTEM 2] Visual critique round ${round}/${MAX_VISUAL_ROUNDS} (score: ${currentValidation.score})...`);
+
+        try {
+            // Generate SVG proxy from current slide state
+            const svgProxy = generateSvgProxy(currentSlide, styleGuide);
+
+            // Run visual critique
+            const critique = await runVisualCritique(currentSlide, svgProxy, costTracker);
+
+            // Check if critique score meets target
+            if (critique.overallScore >= VISUAL_THRESHOLDS.TARGET) {
+                console.log(`[SYSTEM 2] Critique passed (score: ${critique.overallScore}), exiting loop`);
+                break;
+            }
+
+            // GAP 9: Track issue persistence
+            critique.issues.forEach(issue => {
+                const count = issueHistory.get(issue.category) || 0;
+                issueHistory.set(issue.category, count + 1);
+            });
+
+            // Check for persistent issues (same category appears 2+ times)
+            const persistentIssues = Array.from(issueHistory.entries())
+                .filter(([_, count]) => count >= 2)
+                .map(([category]) => category);
+
+            if (persistentIssues.length > 0 && round >= 2) {
+                console.warn(`[SYSTEM 2] Persistent issues detected after ${round} rounds: ${persistentIssues.join(', ')}`);
+                console.warn(`[SYSTEM 2] These issues may be unfixable at current layout, exiting critique loop`);
+
+                currentSlide.warnings = [
+                    ...(currentSlide.warnings || []),
+                    `Persistent visual issues after ${round} repair attempts: ${persistentIssues.join(', ')}`
+                ];
+                break;
+            }
+
+            // Determine if repair is needed based on thresholds
+            const needsRepair = critique.hasCriticalIssues ||
+                               critique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+
+            if (needsRepair) {
+                console.warn(`[SYSTEM 2] Repair needed (score: ${critique.overallScore}, critical: ${critique.hasCriticalIssues})`);
+
+                // Run layout repair
+                const repairedCandidate = await runLayoutRepair(
+                    currentSlide,
+                    critique,
+                    svgProxy,
+                    costTracker
+                );
+
+                // Apply deterministic repair normalization
+                const normalizedRepair = autoRepairSlide(repairedCandidate);
+
+                // Re-validate repaired candidate
+                const repairedValidation = validateSlide(normalizedRepair);
+
+                // Check if repair improved the score meaningfully
+                const improvement = repairedValidation.score - currentValidation.score;
+                const meetsMinImprovement = improvement >= MIN_IMPROVEMENT_DELTA;
+                const crossedThreshold = currentValidation.score < VISUAL_THRESHOLDS.REPAIR_REQUIRED &&
+                                       repairedValidation.score >= VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+
+                if (repairedValidation.passed &&
+                    (meetsMinImprovement || crossedThreshold)) {
+                    console.log(`[SYSTEM 2] Repair succeeded (${currentValidation.score} → ${repairedValidation.score}, Δ=${improvement})`);
+                    currentSlide = normalizedRepair;
+                    currentValidation = repairedValidation;
+                    repairSucceeded = true;
+
+                    // Re-generate SVG proxy for next iteration (if any)
+                    // This happens at the start of the next loop iteration
+                } else {
+                    console.warn(`[SYSTEM 2] Repair did not improve slide (Δ=${improvement}), keeping original`);
+                    // Keep current slide, exit loop
+                    break;
+                }
+            } else {
+                // Score between REPAIR_REQUIRED and TARGET - informational only
+                console.log(`[SYSTEM 2] Critique identified ${critique.issues.length} issues but no repair needed`);
+                currentSlide.warnings = [
+                    ...(currentSlide.warnings || []),
+                    `Visual critique: ${critique.issues.length} issues (score: ${critique.overallScore})`
+                ];
+                break;
+            }
+
+        } catch (critiqueErr: any) {
+            console.error(`[SYSTEM 2] Round ${round} error:`, critiqueErr.message);
+            currentSlide.warnings = [
+                ...(currentSlide.warnings || []),
+                `Visual critique round ${round} failed: ${critiqueErr.message}`
+            ];
+            // Continue to next round or exit
+            if (round >= MAX_VISUAL_ROUNDS) break;
+        }
+    }
+
+    // Final summary
+    if (round >= MAX_VISUAL_ROUNDS && currentValidation.score < VISUAL_THRESHOLDS.TARGET) {
+        console.warn(`[SYSTEM 2] Max rounds reached (${MAX_VISUAL_ROUNDS}), final score: ${currentValidation.score}`);
+    } else if (currentValidation.score >= VISUAL_THRESHOLDS.TARGET) {
+        console.log(`[SYSTEM 2] Converged to target score (${currentValidation.score})`);
+    }
+
+    // Calculate System 2 cost impact
+    const postSystem2Summary = costTracker.getSummary();
+    const system2Cost = postSystem2Summary.totalCost - preSystem2Cost;
+    const system2InputTokens = postSystem2Summary.totalInputTokens - preSystem2InputTokens;
+    const system2OutputTokens = postSystem2Summary.totalOutputTokens - preSystem2OutputTokens;
+
+    console.log(`[SYSTEM 2] Cost: $${system2Cost.toFixed(4)} (${system2InputTokens} in, ${system2OutputTokens} out)`);
+
+    return {
+        slide: currentSlide,
+        rounds: round,
+        finalScore: currentValidation.score,
+        repairSucceeded,
+        system2Cost,
+        system2InputTokens,
+        system2OutputTokens
+    };
+}
+
 // --- AGENT 5: GENERATOR (Phase 1+3: Context Folding + Circuit Breaker) ---
 
 /**
  * Generator with Self-Healing Circuit Breaker
  * Returns GeneratorResult with needsReroute flag for reliability-targeted self-healing.
- * 
+ *
  * @param meta - Slide metadata
  * @param routerConfig - Router decision (layout, density, etc.)
  * @param contentPlan - Content plan from planner
  * @param visualDesignSpec - Visual design spec (optional)
  * @param facts - Research facts
  * @param factClusters - Fact clusters from architect
+ * @param styleGuide - Global style guide for visual rendering
  * @param costTracker - Cost tracking
  * @param recentHistory - Phase 1: Recent narrative history for context folding
  */
@@ -917,6 +1094,7 @@ async function runGenerator(
     visualDesignSpec: VisualDesignSpec | undefined,
     facts: ResearchFact[],
     factClusters: z.infer<typeof FactClusterSchema>[],
+    styleGuide: GlobalStyleGuide,
     costTracker: CostTracker,
     recentHistory?: NarrativeTrail[]
 ): Promise<GeneratorResult> {
@@ -981,40 +1159,37 @@ async function runGenerator(
     let generatorFailures = 0;
 
     // AGGRESSIVE PRE-TRUNCATION: Limit contentPlan size before prompt construction
+    // Reduced limits to prevent token exhaustion causing "o0o0o0" degeneration
     let safeContentPlan = { ...contentPlan };
-    if (safeContentPlan.keyPoints && safeContentPlan.keyPoints.length > 5) {
-        console.warn(`[GENERATOR] Truncating keyPoints from ${safeContentPlan.keyPoints.length} to 5`);
-        safeContentPlan.keyPoints = safeContentPlan.keyPoints.slice(0, 5);
+    if (safeContentPlan.keyPoints && safeContentPlan.keyPoints.length > 4) {
+        console.warn(`[GENERATOR] Truncating keyPoints from ${safeContentPlan.keyPoints.length} to 4`);
+        safeContentPlan.keyPoints = safeContentPlan.keyPoints.slice(0, 4);
     }
-    if (safeContentPlan.dataPoints && safeContentPlan.dataPoints.length > 4) {
-        console.warn(`[GENERATOR] Truncating dataPoints from ${safeContentPlan.dataPoints.length} to 4`);
-        safeContentPlan.dataPoints = safeContentPlan.dataPoints.slice(0, 4);
+    if (safeContentPlan.dataPoints && safeContentPlan.dataPoints.length > 3) {
+        console.warn(`[GENERATOR] Truncating dataPoints from ${safeContentPlan.dataPoints.length} to 3`);
+        safeContentPlan.dataPoints = safeContentPlan.dataPoints.slice(0, 3);
+    }
+    // Truncate individual key points if too long (prevent verbose LLM inputs)
+    if (safeContentPlan.keyPoints) {
+        safeContentPlan.keyPoints = safeContentPlan.keyPoints.map((kp: string) =>
+            kp.length > 150 ? kp.slice(0, 147) + '...' : kp
+        );
     }
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
             const isRecoveryAttempt = attempt > 0;
 
-            // TOKEN BUDGET: Start at 4096, increase slightly on retry but stay reasonable
+            // TOKEN BUDGET: Start at 5120, increase on retry to prevent "o0o0o0" truncation
             // NOTE: We do NOT escalate to MODEL_REASONING (Pro) because:
             // - Pro uses reasoning tokens that reduce output budget
             // - Flash is faster, cheaper, and equally capable for JSON generation
-            const maxTokens = isRecoveryAttempt ? 6144 : 4096;
+            const maxTokens = isRecoveryAttempt ? 7168 : 5120;
 
-            // COMPACT component examples - minimal tokens, maximum clarity
-            // Layer 1: Explicit examples to prevent model from outputting prose in selfCritique
-            const componentExamples = `
-COMPONENTS (use EXACT type names):
-- "text-bullets": {"content": ["point 1", "point 2"]}
-- "metric-cards": {"metrics": [{"value": "85%", "label": "Growth", "icon": "TrendingUp"}]}
-- "process-flow": {"steps": [{"number": 1, "title": "Step", "icon": "Zap"}]}
-- "icon-grid": {"items": [{"label": "Feature", "icon": "Star"}]}
-Max 3 components. Keep JSON short.
-
-REQUIRED FIELDS (exact format):
-- "speakerNotesLines": ["Note 1", "Note 2"] (array of strings, NOT empty "")
-- "selfCritique": {"readabilityScore": 8, "textDensityStatus": "optimal", "layoutAction": "keep"}
-  layoutAction must be one of: "keep", "simplify", "shrink_text", "add_visuals" (NOT prose)`;
+            // ULTRA-COMPACT component examples - minimize prompt tokens to maximize output budget
+            const componentExamples = `TYPES: text-bullets, metric-cards, process-flow, icon-grid, chart-frame
+MAX 2 COMPONENTS. Keep arrays short (2-3 items max).
+selfCritique: {"readabilityScore":8,"textDensityStatus":"optimal","layoutAction":"keep"}`;
 
             let basePrompt: string;
             if (isRecoveryAttempt && lastValidation?.errors) {
@@ -1079,6 +1254,19 @@ REQUIRED FIELDS (exact format):
             candidate = autoRepairSlide(candidate);
             const validation = validateSlide(candidate);
 
+            // GAP 1: Content-Intent Alignment Validation
+            // Validate that Generator honored Router's decisions
+            const complianceValidation = validateGeneratorCompliance(candidate, routerConfig);
+            if (!complianceValidation.passed || complianceValidation.errors.length > 0) {
+                validation.errors.push(...complianceValidation.errors);
+                validation.score = Math.min(validation.score, complianceValidation.score);
+                if (!complianceValidation.passed) {
+                    validation.passed = false;
+                    console.warn(`[GENERATOR] Compliance validation failed (score: ${complianceValidation.score}):`,
+                        complianceValidation.errors.map(e => e.code).join(', '));
+                }
+            }
+
             // Merge Visual Alignment Validation
             if (visualDesignSpec) {
                 const alignment = validateVisualLayoutAlignment(visualDesignSpec, routerConfig, candidate.layoutPlan);
@@ -1093,19 +1281,77 @@ REQUIRED FIELDS (exact format):
 
             lastValidation = validation;
 
+            // --- SYSTEM 2: RECURSIVE VISUAL CRITIQUE LOOP ---
+            // Run recursive visual critique if validation passed but score < TARGET threshold
+            // This catches spatial issues that text-based validation misses
+            const VISUAL_REPAIR_ENABLED = true;
+
+            let visualCritiqueRan = false;
+            let visualRepairAttempted = false;
+            let visualRepairSucceeded = false;
+            let system2Rounds = 0;
+            let system2Cost = 0;
+            let system2InputTokens = 0;
+            let system2OutputTokens = 0;
+
+            if (VISUAL_REPAIR_ENABLED && validation.passed && validation.score < VISUAL_THRESHOLDS.TARGET) {
+                console.log(`[GENERATOR] Entering System 2 recursive critique (score: ${validation.score})...`);
+                visualCritiqueRan = true;
+
+                try {
+                    const system2Result = await runRecursiveVisualCritique(
+                        candidate,
+                        validation,
+                        costTracker,
+                        styleGuide
+                    );
+
+                    // Update candidate with System 2 result
+                    candidate = system2Result.slide;
+                    system2Rounds = system2Result.rounds;
+                    visualRepairSucceeded = system2Result.repairSucceeded;
+                    visualRepairAttempted = system2Result.rounds > 0;
+                    system2Cost = system2Result.system2Cost;
+                    system2InputTokens = system2Result.system2InputTokens;
+                    system2OutputTokens = system2Result.system2OutputTokens;
+
+                    // Update validation with final score
+                    candidate.validation = validateSlide(candidate);
+                    lastValidation = candidate.validation;
+
+                    console.log(`[GENERATOR] System 2 complete: ${system2Rounds} rounds, final score: ${system2Result.finalScore}, cost: $${system2Result.system2Cost.toFixed(4)}`);
+
+                } catch (critiqueErr: any) {
+                    // Don't block on visual critique errors - graceful degradation
+                    console.error(`[GENERATOR] System 2 critique error:`, critiqueErr.message);
+                    candidate.warnings = [...(candidate.warnings || []), `Visual critique skipped: ${critiqueErr.message}`];
+                }
+            }
+
             if (validation.passed) {
                 candidate.validation = validation;
                 // Phase 3: Return GeneratorResult with successful slide
                 return {
                     slide: candidate,
-                    needsReroute: false
+                    needsReroute: false,
+                    visualCritiqueRan,
+                    visualRepairAttempted,
+                    visualRepairSucceeded,
+                    system2Cost,
+                    system2InputTokens,
+                    system2OutputTokens
                 };
             }
 
             // Phase 3: Check for critical errors that warrant rerouting
+            // GAP 1: Include compliance errors as reroute triggers
             const criticalErrors = validation.errors.filter(e =>
                 e.code === 'ERR_TEXT_OVERFLOW_CRITICAL' ||
-                e.code === 'ERR_MISSING_VISUALS_CRITICAL'
+                e.code === 'ERR_MISSING_VISUALS_CRITICAL' ||
+                e.code === 'ERR_LAYOUT_MISMATCH_CRITICAL' ||
+                e.code === 'ERR_DENSITY_CRITICAL_EXCEEDED' ||
+                e.code === 'ERR_TOO_MANY_COMPONENTS' ||
+                e.code === 'ERR_ITEM_COUNT_CRITICAL'
             );
 
             if (criticalErrors.length > 0 && attempt === MAX_RETRIES) {
@@ -1115,7 +1361,13 @@ REQUIRED FIELDS (exact format):
                     slide: candidate,
                     needsReroute: true,
                     rerouteReason: criticalErrors[0].code,
-                    avoidLayoutVariants: [routerConfig.layoutVariant]
+                    avoidLayoutVariants: [routerConfig.layoutVariant],
+                    visualCritiqueRan,
+                    visualRepairAttempted,
+                    visualRepairSucceeded,
+                    system2Cost,
+                    system2InputTokens,
+                    system2OutputTokens
                 };
             }
 
@@ -1162,12 +1414,33 @@ REQUIRED FIELDS (exact format):
     };
 
     // Phase 3: Return fallback with needsReroute = false (no more attempts)
-    return { slide: fallbackSlide, needsReroute: false };
+    return {
+        slide: fallbackSlide,
+        needsReroute: false,
+        visualCritiqueRan: false,
+        visualRepairAttempted: false,
+        visualRepairSucceeded: false,
+        system2Cost: 0,
+        system2InputTokens: 0,
+        system2OutputTokens: 0
+    };
 }
 
 // --- IMAGE GENERATION (Still uses generateContent for image modality) ---
 
-const NEGATIVE_PROMPT_INFO = "photorealistic, 3d render, messy, clutter, blurry, low resolution, distorted text, bad layout, sketch, hand drawn, organic textures, grunge, footer text, copyright notice, watermark, template borders, frame, mock-up, padding, margins";
+// CRITICAL: Background images must NOT contain any content elements.
+// Text, icons, diagrams, charts are rendered separately by SpatialLayoutEngine.
+const NEGATIVE_PROMPT_INFO = `
+photorealistic, 3d render, messy, clutter, blurry, low resolution, 
+distorted text, bad layout, sketch, hand drawn, organic textures, grunge,
+footer text, copyright notice, watermark, template borders, frame, mock-up, 
+padding, margins,
+TEXT, WORDS, LETTERS, LABELS, NUMBERS, CAPTIONS, TITLES, HEADINGS,
+DIAGRAMS, CHARTS, GRAPHS, PIE CHARTS, BAR CHARTS, FLOWCHARTS, ARROWS,
+ICONS, SYMBOLS, LOGOS, UI ELEMENTS, BUTTONS, BOXES, RECTANGLES WITH TEXT,
+INFOGRAPHICS, DATA VISUALIZATIONS, PROCESS FLOWS, TIMELINES,
+PEOPLE, FACES, HANDS, HUMANS, FIGURES
+`.trim().replace(/\n/g, ' ');
 
 // Image model configuration:
 // - Default to 2.5 Flash Image: 71% cheaper ($0.039 vs $0.134 per image)
@@ -1222,13 +1495,26 @@ export async function generateImageFromPrompt(
     // Order: 2.5 Flash first (cheaper), Pro as fallback
     const models = [IMAGE_MODELS.DEFAULT, IMAGE_MODELS.FALLBACK];
 
-    // Compact prompt for image generation (minimal tokens)
+    // Background-only prompt: NO text, diagrams, icons, or content elements
+    // All content is rendered separately by SpatialLayoutEngine
     const richPrompt = `
-SUBJECT: ${prompt}
-CONTEXT: Professional Presentation Slide Background.
-STYLE: High-fidelity, cinematic lighting, corporate aesthetic.
-CONSTRAINT: Ensure substantial negative space or low contrast areas for overlay text. 
-NEGATIVE: ${NEGATIVE_PROMPT_INFO}
+TASK: Generate an ABSTRACT BACKGROUND IMAGE only.
+
+SUBJECT THEME: ${prompt}
+
+STRICT RULES:
+- This is a BACKGROUND TEXTURE/GRADIENT only
+- Text, icons, charts, and diagrams will be overlaid SEPARATELY by another system
+- DO NOT generate any readable text, words, letters, or numbers
+- DO NOT generate any diagrams, flowcharts, arrows, or process flows
+- DO NOT generate any icons, symbols, logos, or UI elements
+- ONLY generate: gradients, lighting effects, abstract shapes, textures, color fields
+
+STYLE: Cinematic lighting, subtle gradients, professional corporate aesthetic.
+COMPOSITION: Large areas of low contrast or dark tones for text overlay.
+MOOD: Modern, premium, sophisticated.
+
+NEGATIVE (DO NOT INCLUDE): ${NEGATIVE_PROMPT_INFO}
 `.trim();
 
     // Log prompt length to verify it's short
@@ -1319,6 +1605,13 @@ export const generateAgenticDeck = async (
     let visualAlignmentFirstPassSuccess = 0;
     let totalVisualDesignAttempts = 0;
     let rerouteCount = 0;
+    // System 2 Visual Critique Tracking
+    let visualCritiqueAttempts = 0;
+    let visualRepairSuccess = 0;
+    // System 2 Cost Breakdown
+    let system2TotalCost = 0;
+    let system2TotalInputTokens = 0;
+    let system2TotalOutputTokens = 0;
 
     // 1. RESEARCH PHASE
     onProgress("Agent 1/5: Deep Research (Interactions API)...", 10);
@@ -1388,49 +1681,75 @@ export const generateAgenticDeck = async (
             }
 
             // 3d. Final Generation (with narrative history + circuit breaker)
-            onProgress(`Agent 4/5: Generating Slide ${i + 1}...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
-            let generatorResult = await runGenerator(
-                slideMeta,
-                routerConfig,
-                contentPlan,
-                visualDesign,
-                facts,
-                outline.factClusters || [],
-                costTracker,
-                recentHistory
-            );
+            // GAP 3: Bounded reroute loop to prevent infinite reroutes
+            const MAX_REROUTES_PER_SLIDE = 2;
+            let slideRerouteCount = 0;
+            let generatorResult: any;
+            let currentContentPlan = contentPlan;
+            let currentVisualDesign = visualDesign;
+            let currentRouterConfig = routerConfig;
 
-            // --- PHASE 3: SELF-HEALING CIRCUIT BREAKER ---
-            if (generatorResult.needsReroute) {
-                console.warn(`[ORCHESTRATOR] Reroute triggered for slide ${i + 1}: ${generatorResult.rerouteReason}`);
-                rerouteCount++;
-
-                // Re-run router with constraints to avoid failed layout
-                const newConstraints: RouterConstraints = {
-                    avoidLayoutVariants: generatorResult.avoidLayoutVariants
-                };
-                routerConfig = await runRouter(slideMeta, costTracker, newConstraints);
-
-                // Re-run content planner and generator with new route
-                const reroutedContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
-                const reroutedVisualDesign = await runVisualDesigner(
-                    slideMeta.title,
-                    reroutedContentPlan,
-                    routerConfig,
-                    facts,
-                    costTracker
-                );
-
+            while (slideRerouteCount <= MAX_REROUTES_PER_SLIDE) {
+                onProgress(`Agent 4/5: Generating Slide ${i + 1}...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
                 generatorResult = await runGenerator(
                     slideMeta,
-                    routerConfig,
-                    reroutedContentPlan,
-                    reroutedVisualDesign,
+                    currentRouterConfig,
+                    currentContentPlan,
+                    currentVisualDesign,
                     facts,
                     outline.factClusters || [],
+                    outline.styleGuide,
                     costTracker,
                     recentHistory
                 );
+
+                // Track System 2 metrics
+                if (generatorResult.visualCritiqueRan) visualCritiqueAttempts++;
+                if (generatorResult.visualRepairSucceeded) visualRepairSuccess++;
+                // Accumulate System 2 costs
+                if (generatorResult.system2Cost) {
+                    system2TotalCost += generatorResult.system2Cost;
+                    system2TotalInputTokens += generatorResult.system2InputTokens || 0;
+                    system2TotalOutputTokens += generatorResult.system2OutputTokens || 0;
+                }
+
+                // --- PHASE 3: SELF-HEALING CIRCUIT BREAKER ---
+                if (generatorResult.needsReroute && slideRerouteCount < MAX_REROUTES_PER_SLIDE) {
+                    slideRerouteCount++;
+                    console.warn(`[ORCHESTRATOR] Reroute ${slideRerouteCount}/${MAX_REROUTES_PER_SLIDE} for slide ${i + 1}: ${generatorResult.rerouteReason}`);
+                    rerouteCount++;
+
+                    // Re-run router with constraints to avoid failed layout
+                    const newConstraints: RouterConstraints = {
+                        avoidLayoutVariants: generatorResult.avoidLayoutVariants
+                    };
+                    currentRouterConfig = await runRouter(slideMeta, costTracker, newConstraints);
+
+                    // Re-run content planner and visual designer with new route
+                    currentContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
+                    currentVisualDesign = await runVisualDesigner(
+                        slideMeta.title,
+                        currentContentPlan,
+                        currentRouterConfig,
+                        facts,
+                        costTracker
+                    );
+
+                    // Continue loop for another attempt
+                    continue;
+                } else if (generatorResult.needsReroute && slideRerouteCount >= MAX_REROUTES_PER_SLIDE) {
+                    // Max reroutes exhausted - force fallback
+                    console.error(`[ORCHESTRATOR] Max reroutes (${MAX_REROUTES_PER_SLIDE}) exhausted for slide ${i + 1}, using fallback`);
+                    generatorResult.slide.warnings = [
+                        ...(generatorResult.slide.warnings || []),
+                        `Failed to find suitable layout after ${MAX_REROUTES_PER_SLIDE} reroutes, using fallback`
+                    ];
+                    fallbackSlides++;
+                    break;
+                } else {
+                    // Success - exit loop
+                    break;
+                }
             }
 
             const slideNode = generatorResult.slide;
@@ -1507,6 +1826,40 @@ export const generateAgenticDeck = async (
 
     onProgress("Finalizing Deck...", 100);
 
+    // GAP 2: Deck-Wide Narrative Coherence Validation
+    console.log("[ORCHESTRATOR] Validating deck-wide narrative coherence...");
+    const coherenceReport = validateDeckCoherence(slides);
+
+    if (!coherenceReport.passed || coherenceReport.issues.length > 0) {
+        console.warn(`[ORCHESTRATOR] Coherence validation: score ${coherenceReport.coherenceScore}/100`);
+        coherenceReport.issues.forEach(issue => {
+            const severity = issue.severity === 'critical' ? '🔴' : issue.severity === 'major' ? '🟡' : '🔵';
+            const slideRefs = issue.slideIndices.map(i => `#${i + 1}`).join(', ');
+            console.warn(`${severity} [${issue.type.toUpperCase()}] ${issue.message} (slides: ${slideRefs})`);
+
+            // Add warnings to affected slides
+            issue.slideIndices.forEach(idx => {
+                if (slides[idx]) {
+                    slides[idx].warnings = [
+                        ...(slides[idx].warnings || []),
+                        `Coherence issue: ${issue.message}`
+                    ];
+                }
+            });
+        });
+
+        // Log summary
+        const repetitionCount = coherenceReport.issues.filter(i => i.type === 'repetition').length;
+        const arcViolationCount = coherenceReport.issues.filter(i => i.type === 'arc_violation').length;
+        const driftCount = coherenceReport.issues.filter(i => i.type === 'thematic_drift').length;
+
+        if (repetitionCount > 0) console.warn(`[ORCHESTRATOR]   - ${repetitionCount} repetition issue(s)`);
+        if (arcViolationCount > 0) console.warn(`[ORCHESTRATOR]   - ${arcViolationCount} narrative arc violation(s)`);
+        if (driftCount > 0) console.warn(`[ORCHESTRATOR]   - ${driftCount} thematic drift issue(s)`);
+    } else {
+        console.log(`[ORCHESTRATOR] ✅ Deck coherence validation passed (score: ${coherenceReport.coherenceScore}/100)`);
+    }
+
     const totalDurationMs = Date.now() - startTime;
     const costSummary = costTracker.getSummary();
 
@@ -1526,6 +1879,11 @@ export const generateAgenticDeck = async (
     console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ≤1/deck`);
     console.log(`[ORCHESTRATOR]   - Visual First-Pass Success: ${visualAlignmentFirstPassSuccess}/${totalVisualDesignAttempts} (${visualFirstPassRate}%) - Target: ≥80%`);
     console.log(`[ORCHESTRATOR]   - Reroute Count: ${rerouteCount}`);
+    console.log(`[ORCHESTRATOR] 🔍 SYSTEM 2 VISUAL CRITIQUE:`);
+    console.log(`[ORCHESTRATOR]   - Visual Critique Attempts: ${visualCritiqueAttempts}/${totalSlides}`);
+    console.log(`[ORCHESTRATOR]   - Visual Repair Success: ${visualRepairSuccess}/${visualCritiqueAttempts > 0 ? visualCritiqueAttempts : 1}`);
+    console.log(`[ORCHESTRATOR]   - System 2 Cost: $${system2TotalCost.toFixed(4)} (${costSummary.totalCost > 0 ? (system2TotalCost/costSummary.totalCost*100).toFixed(1) : 0}% of total)`);
+    console.log(`[ORCHESTRATOR]   - System 2 Tokens: ${system2TotalInputTokens} in, ${system2TotalOutputTokens} out`);
 
     // Compute metrics for reliability targets
     const deckMetrics: DeckMetrics = {
@@ -1535,7 +1893,14 @@ export const generateAgenticDeck = async (
         fallbackSlides,
         visualAlignmentFirstPassSuccess,
         totalVisualDesignAttempts,
-        rerouteCount
+        rerouteCount,
+        visualCritiqueAttempts,
+        visualRepairSuccess,
+        system2Cost: system2TotalCost,
+        system2TokensInput: system2TotalInputTokens,
+        system2TokensOutput: system2TotalOutputTokens,
+        coherenceScore: coherenceReport.coherenceScore,
+        coherenceIssues: coherenceReport.issues.length
     };
 
     return {
@@ -1567,8 +1932,24 @@ export const regenerateSingleSlide = async (
         costTracker
     );
 
+    // Use default styleGuide for single slide regeneration
+    const defaultStyleGuide: GlobalStyleGuide = {
+        themeName: "Default",
+        fontFamilyTitle: "Inter",
+        fontFamilyBody: "Inter",
+        colorPalette: {
+            primary: "#10b981",
+            secondary: "#3b82f6",
+            background: "#0f172a",
+            text: "#f8fafc",
+            accentHighContrast: "#f59e0b"
+        },
+        imageStyle: "Clean",
+        layoutStrategy: "Standard"
+    };
+
     // Generator now returns GeneratorResult, extract the slide
-    const generatorResult = await runGenerator(meta, routerConfig, contentPlan, visualDesign, facts, factClusters, costTracker);
+    const generatorResult = await runGenerator(meta, routerConfig, contentPlan, visualDesign, facts, factClusters, defaultStyleGuide, costTracker);
     const newSlide = generatorResult.slide;
 
     newSlide.visualPrompt = visualDesign.prompt_with_composition;

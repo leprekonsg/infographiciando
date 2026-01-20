@@ -1,5 +1,5 @@
 
-import { SlideNode, ValidationResult, RenderModeSchema, VisualDesignSpec, RouterDecision, SlideLayoutPlanSchema } from "../types/slideTypes";
+import { SlideNode, ValidationResult, RenderModeSchema, VisualDesignSpec, RouterDecision, SlideLayoutPlanSchema, VisualCritiqueReportSchema, VisualCritiqueReport } from "../types/slideTypes";
 
 // Helper for contrast check (handles hex with or without # prefix)
 const hasGoodContrast = (hex: string): boolean => {
@@ -290,3 +290,332 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
     errors
   };
 };
+
+/**
+ * Validates API response for visual critique against Zod schema.
+ * Returns validated VisualCritiqueReport or null on failure.
+ */
+export function validateCritiqueResponse(raw: any): VisualCritiqueReport | null {
+  const result = VisualCritiqueReportSchema.safeParse(raw);
+  if (!result.success) {
+    console.error('[VALIDATOR] Critique response invalid:', result.error.format());
+    return null;
+  }
+  return result.data;
+}
+
+/**
+ * Validates API response for layout repair against Zod schema.
+ * Returns validated SlideLayoutPlan or null on failure.
+ */
+export function validateRepairResponse(raw: any): any | null {
+  const result = SlideLayoutPlanSchema.safeParse(raw);
+  if (!result.success) {
+    console.error('[VALIDATOR] Repair response invalid:', result.error.format());
+    return null;
+  }
+  return result.data;
+}
+
+/**
+ * GAP 1: Content-Intent Alignment Validation
+ * Validates that Generator honored Router's layout and density decisions.
+ * Prevents slides from deviating from intended structure.
+ */
+export function validateGeneratorCompliance(
+  slide: SlideNode,
+  routerConfig: RouterDecision
+): ValidationResult {
+  const errors: { code: string; message: string; suggestedFix?: string }[] = [];
+  let score = 100;
+  let isCritical = false;
+
+  const components = slide.layoutPlan?.components || [];
+  const componentTypes = components.map(c => c.type);
+  const layoutVariant = routerConfig.layoutVariant;
+
+  // 1. Layout Variant Compliance
+  const variantExpectations: Record<string, { requiredTypes?: string[], forbiddenTypes?: string[], minComponents?: number, maxComponents?: number }> = {
+    'bento-grid': {
+      requiredTypes: ['metric-cards', 'icon-grid'],
+      maxComponents: 6,
+      minComponents: 2
+    },
+    'hero-centered': {
+      maxComponents: 2,
+      minComponents: 1
+    },
+    'split-left-text': {
+      minComponents: 2,
+      maxComponents: 3
+    },
+    'split-right-text': {
+      minComponents: 2,
+      maxComponents: 3
+    },
+    'timeline-horizontal': {
+      requiredTypes: ['process-flow'],
+      maxComponents: 2
+    }
+  };
+
+  const expectations = variantExpectations[layoutVariant];
+  if (expectations) {
+    // Check required component types
+    if (expectations.requiredTypes && expectations.requiredTypes.length > 0) {
+      const hasRequired = expectations.requiredTypes.some(type => componentTypes.includes(type));
+      if (!hasRequired) {
+        score -= 25;
+        isCritical = true;
+        errors.push({
+          code: 'ERR_LAYOUT_MISMATCH_CRITICAL',
+          message: `Layout '${layoutVariant}' requires one of: ${expectations.requiredTypes.join(', ')}. Found: ${componentTypes.join(', ')}`,
+          suggestedFix: `Add ${expectations.requiredTypes[0]} component or reroute to different layout`
+        });
+      }
+    }
+
+    // Check component count constraints
+    if (expectations.minComponents && components.length < expectations.minComponents) {
+      score -= 15;
+      errors.push({
+        code: 'ERR_INSUFFICIENT_COMPONENTS',
+        message: `Layout '${layoutVariant}' needs at least ${expectations.minComponents} components, found ${components.length}`,
+        suggestedFix: 'Add more components or use simpler layout'
+      });
+    }
+
+    if (expectations.maxComponents && components.length > expectations.maxComponents) {
+      score -= 15;
+      isCritical = true;
+      errors.push({
+        code: 'ERR_TOO_MANY_COMPONENTS',
+        message: `Layout '${layoutVariant}' supports max ${expectations.maxComponents} components, found ${components.length}`,
+        suggestedFix: 'Reduce components or reroute to standard-vertical layout'
+      });
+    }
+  }
+
+  // 2. Density Budget Compliance
+  const totalTextChars = components.reduce((sum, comp) => {
+    let chars = 0;
+    // FIX: text-bullets uses .content, not .items
+    if (comp.type === 'text-bullets') chars += (comp.content || []).join('').length;
+    if (comp.type === 'metric-cards') chars += (comp.metrics || []).map((m: any) => (m.label || '') + (m.value || '')).join('').length;
+    if (comp.type === 'process-flow') chars += (comp.steps || []).map((s: any) => (s.title || '') + (s.description || '')).join('').length;
+    if (comp.type === 'icon-grid') chars += (comp.items || []).map((i: any) => (i.label || '') + (i.description || '')).join('').length;
+    return sum + chars;
+  }, 0);
+
+  const densityBudget = routerConfig.densityBudget;
+  const charOverage = totalTextChars - densityBudget.maxChars;
+
+  if (charOverage > densityBudget.maxChars * 0.3) {
+    // More than 30% over budget
+    score -= 25;
+    isCritical = true;
+    errors.push({
+      code: 'ERR_DENSITY_CRITICAL_EXCEEDED',
+      message: `Text content ${totalTextChars} chars significantly exceeds budget ${densityBudget.maxChars} (${Math.round(charOverage / densityBudget.maxChars * 100)}% over)`,
+      suggestedFix: 'Reroute to layout with higher density budget or reduce content'
+    });
+  } else if (charOverage > densityBudget.maxChars * 0.15) {
+    // 15-30% over budget
+    score -= 15;
+    errors.push({
+      code: 'WARN_DENSITY_EXCEEDED',
+      message: `Text content ${totalTextChars} chars exceeds budget ${densityBudget.maxChars} by ${Math.round(charOverage / densityBudget.maxChars * 100)}%`,
+      suggestedFix: 'Consider reducing bullet points or metric labels'
+    });
+  }
+
+  // 3. Item Count Budget Compliance
+  const totalItems = components.reduce((sum, comp) => {
+    // FIX: text-bullets uses .content, not .items
+    if (comp.type === 'text-bullets') return sum + (comp.content?.length || 0);
+    if (comp.type === 'metric-cards') return sum + (comp.metrics?.length || 0);
+    if (comp.type === 'process-flow') return sum + (comp.steps?.length || 0);
+    if (comp.type === 'icon-grid') return sum + (comp.items?.length || 0);
+    return sum;
+  }, 0);
+
+  if (totalItems > densityBudget.maxItems * 1.5) {
+    score -= 20;
+    isCritical = true;
+    errors.push({
+      code: 'ERR_ITEM_COUNT_CRITICAL',
+      message: `Total items ${totalItems} significantly exceeds budget ${densityBudget.maxItems}`,
+      suggestedFix: 'Reduce number of bullet points, metrics, or grid items'
+    });
+  } else if (totalItems > densityBudget.maxItems) {
+    score -= 10;
+    errors.push({
+      code: 'WARN_ITEM_COUNT_EXCEEDED',
+      message: `Total items ${totalItems} exceeds budget ${densityBudget.maxItems}`,
+      suggestedFix: 'Consider reducing items for better visual clarity'
+    });
+  }
+
+  return {
+    passed: !isCritical,
+    score,
+    errors
+  };
+}
+
+/**
+ * GAP 2: Deck-Wide Narrative Coherence Validation
+ * Detects repeated content, narrative arc violations, and thematic drift.
+ */
+export interface CoherenceIssue {
+  type: 'repetition' | 'arc_violation' | 'thematic_drift';
+  slideIndices: number[];
+  message: string;
+  severity: 'minor' | 'major' | 'critical';
+}
+
+export interface CoherenceReport {
+  coherenceScore: number;
+  issues: CoherenceIssue[];
+  passed: boolean;
+}
+
+/**
+ * Calculate Jaccard similarity between two sets of text tokens
+ */
+function jaccardSimilarity(text1: string, text2: string): number {
+  const tokens1 = new Set(text1.toLowerCase().split(/\s+/).filter(t => t.length > 3));
+  const tokens2 = new Set(text2.toLowerCase().split(/\s+/).filter(t => t.length > 3));
+
+  if (tokens1.size === 0 && tokens2.size === 0) return 0;
+
+  const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
+  const union = new Set([...tokens1, ...tokens2]);
+
+  return intersection.size / union.size;
+}
+
+/**
+ * Extract all text content from a slide
+ */
+function extractSlideText(slide: SlideNode): string {
+  const components = slide.layoutPlan?.components || [];
+  const textParts: string[] = [slide.layoutPlan?.title || ''];
+
+  components.forEach(comp => {
+    // FIX: text-bullets uses .content, not .items
+    if (comp.type === 'text-bullets') {
+      textParts.push(...(comp.content || []));
+    } else if (comp.type === 'metric-cards') {
+      (comp.metrics || []).forEach((m: any) => {
+        textParts.push(m.label || '', m.value || '');
+      });
+    } else if (comp.type === 'process-flow') {
+      (comp.steps || []).forEach((s: any) => {
+        textParts.push(s.title || '', s.description || '');
+      });
+    } else if (comp.type === 'icon-grid') {
+      // FIX: icon-grid items have .label, not .title
+      (comp.items || []).forEach((i: any) => {
+        textParts.push(i.label || '', i.description || '');
+      });
+    }
+  });
+
+  return textParts.join(' ');
+}
+
+export function validateDeckCoherence(slides: SlideNode[]): CoherenceReport {
+  const issues: CoherenceIssue[] = [];
+  let score = 100;
+
+  if (slides.length < 2) {
+    return { coherenceScore: 100, issues: [], passed: true };
+  }
+
+  // 1. Detect Repetition
+  const REPETITION_THRESHOLD = 0.6; // 60% similarity is suspicious
+  for (let i = 0; i < slides.length; i++) {
+    for (let j = i + 1; j < slides.length; j++) {
+      const text1 = extractSlideText(slides[i]);
+      const text2 = extractSlideText(slides[j]);
+
+      if (text1.length < 50 || text2.length < 50) continue; // Skip very short slides
+
+      const similarity = jaccardSimilarity(text1, text2);
+
+      if (similarity > REPETITION_THRESHOLD) {
+        const severity = similarity > 0.8 ? 'critical' : similarity > 0.7 ? 'major' : 'minor';
+        score -= severity === 'critical' ? 20 : severity === 'major' ? 10 : 5;
+
+        issues.push({
+          type: 'repetition',
+          slideIndices: [i, j],
+          message: `Slides ${i + 1} and ${j + 1} have ${Math.round(similarity * 100)}% similar content`,
+          severity
+        });
+      }
+    }
+  }
+
+  // 2. Narrative Arc Validation
+  // Intro slides should be early, conclusion slides should be late
+  slides.forEach((slide, idx) => {
+    const title = slide.layoutPlan?.title?.toLowerCase() || '';
+    const purpose = slide.meta?.purpose?.toLowerCase() || '';
+
+    const isIntro = title.includes('intro') || title.includes('overview') ||
+                    purpose.includes('intro') || purpose.includes('hook');
+    const isConclusion = title.includes('conclusion') || title.includes('summary') ||
+                         title.includes('takeaway') || purpose.includes('conclusion');
+
+    // Intro after slide 2 is suspicious
+    if (isIntro && idx > 2 && slides.length > 4) {
+      score -= 10;
+      issues.push({
+        type: 'arc_violation',
+        slideIndices: [idx],
+        message: `Introduction slide at position ${idx + 1} (expected in first 3 slides)`,
+        severity: 'major'
+      });
+    }
+
+    // Conclusion before last 2 slides is suspicious
+    if (isConclusion && idx < slides.length - 2 && slides.length > 4) {
+      score -= 10;
+      issues.push({
+        type: 'arc_violation',
+        slideIndices: [idx],
+        message: `Conclusion slide at position ${idx + 1} (expected in last 2 slides)`,
+        severity: 'major'
+      });
+    }
+  });
+
+  // 3. Thematic Drift Detection
+  // Check if middle slides diverge significantly from opening theme
+  if (slides.length >= 5) {
+    const firstSlideText = extractSlideText(slides[0]);
+    const middleIndex = Math.floor(slides.length / 2);
+    const middleSlideText = extractSlideText(slides[middleIndex]);
+
+    const thematicAlignment = jaccardSimilarity(firstSlideText, middleSlideText);
+
+    // Some divergence is expected (0.1-0.3 is healthy), but < 0.05 suggests drift
+    if (thematicAlignment < 0.05 && firstSlideText.length > 100 && middleSlideText.length > 100) {
+      score -= 15;
+      issues.push({
+        type: 'thematic_drift',
+        slideIndices: [0, middleIndex],
+        message: `Slide ${middleIndex + 1} has minimal thematic connection to opening slide (${Math.round(thematicAlignment * 100)}% overlap)`,
+        severity: 'major'
+      });
+    }
+  }
+
+  return {
+    coherenceScore: Math.max(0, score),
+    issues,
+    passed: score >= 70 // 70+ is acceptable coherence
+  };
+}

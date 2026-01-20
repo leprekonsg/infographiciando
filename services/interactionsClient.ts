@@ -27,6 +27,7 @@ export type JsonFailureType =
     | 'escaped_json'     // JSON inside a JSON string (double-encoded)
     | 'schema_drift'     // Wrong field types (e.g., string[] instead of object[])
     | 'string_array'     // Flat string array instead of object structure
+    | 'empty_response'   // API returned empty/whitespace-only response (often after 500 error)
     | 'unknown';         // Unclassified malformation
 
 interface JsonClassification {
@@ -41,6 +42,19 @@ interface JsonClassification {
  */
 function classifyJsonFailure(text: string): JsonClassification {
     const trimmed = text.trim();
+
+    // Check for empty/whitespace-only response (often after API 500 errors)
+    if (trimmed.length === 0) {
+        console.warn(`[JSON CLASSIFY] Empty response detected (API likely returned 500 or no content)`);
+        return { type: 'empty_response', confidence: 'high' };
+    }
+
+    // Check for degeneration pattern (o0o0o0, aaaaa, etc.) - severe token exhaustion
+    // This happens when the model runs out of tokens and starts repeating characters
+    if (/([a-z0-9])\1{10,}/.test(trimmed.slice(-50))) {
+        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (token exhaustion)`);
+        return { type: 'truncation', confidence: 'high' };
+    }
 
     // Check for string array pattern: ["item1", "item2", ...]
     if (/^\s*\[\s*"[^"]*"\s*(,\s*"[^"]*"\s*)*\]\s*$/.test(trimmed)) {
@@ -439,83 +453,116 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
 
     /**
      * Create a new interaction (single turn)
+     * Includes automatic retry with exponential backoff for transient errors (500, 503)
      */
     async create(request: InteractionRequest): Promise<InteractionResponse> {
-        console.log(`[INTERACTIONS CLIENT] Sending request to ${request.model || 'model'}...`);
+        const MAX_RETRIES = 2;
+        const BASE_DELAY_MS = 2000;
 
-        const controller = new AbortController();
-        const timeoutMs = 300_000; // 5 minute timeout
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            console.log(`[INTERACTIONS CLIENT] Sending request to ${request.model || 'model'}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}...`);
 
-        // Progress logger
-        const startTime = Date.now();
-        const progressInterval = setInterval(() => {
-            const elapsed = Math.round((Date.now() - startTime) / 1000);
-            if (elapsed % 10 === 0) { // Log every 10 seconds
-                console.log(`[INTERACTIONS CLIENT] Waiting for response from ${request.model || 'model'}... (${elapsed}s)`);
-            }
-        }, 1000);
+            const controller = new AbortController();
+            const timeoutMs = 300_000; // 5 minute timeout
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-        try {
-            const response = await fetch(`${INTERACTIONS_API_BASE}?key=${this.apiKey}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(request),
-                signal: controller.signal
-            });
+            // Progress logger
+            const startTime = Date.now();
+            const progressInterval = setInterval(() => {
+                const elapsed = Math.round((Date.now() - startTime) / 1000);
+                if (elapsed % 10 === 0) { // Log every 10 seconds
+                    console.log(`[INTERACTIONS CLIENT] Waiting for response from ${request.model || 'model'}... (${elapsed}s)`);
+                }
+            }, 1000);
 
-            if (!response.ok) {
-                const errorText = await response.text();
+            try {
+                const response = await fetch(`${INTERACTIONS_API_BASE}?key=${this.apiKey}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(request),
+                    signal: controller.signal
+                });
 
-                // Parse and provide actionable guidance for common errors
-                let errorMessage = `Interactions API error (${response.status}): ${errorText}`;
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    const status = response.status;
 
-                try {
-                    const errorJson = JSON.parse(errorText);
-                    const message = errorJson?.error?.message || '';
+                    // Check for transient errors that warrant retry
+                    const isTransient = status === 500 || status === 503 || status === 429;
 
-                    // Schema nesting depth error
-                    if (message.includes('nesting depth')) {
-                        console.error(`[INTERACTIONS CLIENT] Schema nesting depth exceeded.
-                        
+                    if (isTransient && attempt < MAX_RETRIES) {
+                        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+                        console.warn(`[INTERACTIONS CLIENT] Transient error (${status}). Retrying in ${delay}ms...`);
+                        clearTimeout(timeoutId);
+                        clearInterval(progressInterval);
+                        await new Promise(r => setTimeout(r, delay));
+                        continue; // Retry
+                    }
+
+                    // Parse and provide actionable guidance for common errors
+                    let errorMessage = `Interactions API error (${status}): ${errorText}`;
+
+                    try {
+                        const errorJson = JSON.parse(errorText);
+                        const message = errorJson?.error?.message || '';
+
+                        // Schema nesting depth error
+                        if (message.includes('nesting depth')) {
+                            console.error(`[INTERACTIONS CLIENT] Schema nesting depth exceeded.
+
     The Gemini Interactions API has a maximum schema nesting depth of 4 levels.
     To fix this:
     1. Flatten nested object definitions in your response_format schema
     2. Use simplified array types without deeply nested item schemas
     3. Move complex structure requirements to the prompt instead of schema
-    
-    Problematic request model: ${request.model}`);
-                    }
 
-                    // Invalid schema error
-                    if (message.includes('schema') || message.includes('GenerationConfig')) {
-                        console.error(`[INTERACTIONS CLIENT] Schema validation error detected.
+    Problematic request model: ${request.model}`);
+                        }
+
+                        // Invalid schema error
+                        if (message.includes('schema') || message.includes('GenerationConfig')) {
+                            console.error(`[INTERACTIONS CLIENT] Schema validation error detected.
     The response_format schema may be invalid or too complex.
     Common issues:
     - Nesting depth exceeds 4 levels
     - Union types (oneOf, anyOf) not supported
     - Circular references
     - Advanced validations (minLength, pattern) not supported`);
+                        }
+
+                        // 500 error specific guidance
+                        if (status === 500) {
+                            console.error(`[INTERACTIONS CLIENT] Internal server error (500).
+    This is a server-side issue with the Gemini API.
+    Possible causes:
+    - Temporary service disruption
+    - High API load
+    - Invalid request that triggers server error
+    Recommended: Wait and retry, or simplify the request.`);
+                        }
+
+                        errorMessage = `Interactions API error (${status}): ${message || errorText}`;
+                    } catch {
+                        // Keep original error if JSON parsing fails
                     }
 
-                    errorMessage = `Interactions API error (${response.status}): ${message || errorText}`;
-                } catch {
-                    // Keep original error if JSON parsing fails
+                    throw new Error(errorMessage);
                 }
 
-                throw new Error(errorMessage);
+                return response.json();
+            } catch (err: any) {
+                if (err.name === 'AbortError') {
+                    throw new Error(`Interactions API request timed out after ${timeoutMs / 1000}s`);
+                }
+                throw err;
+            } finally {
+                clearTimeout(timeoutId);
+                clearInterval(progressInterval);
             }
-
-            return response.json();
-        } catch (err: any) {
-            if (err.name === 'AbortError') {
-                throw new Error(`Interactions API request timed out after ${timeoutMs / 1000}s`);
-            }
-            throw err;
-        } finally {
-            clearTimeout(timeoutId);
-            clearInterval(progressInterval);
         }
+
+        // This should never be reached due to the throw above, but TypeScript needs it
+        throw new Error('Max retries exceeded');
     }
 
     /**
@@ -750,11 +797,16 @@ export async function createInteraction(
         }
     }
 
-    // --- CASE 2 FIX: Empty response (thinking exhaustion) ---
-    // Model returned no text - likely spent all tokens on thinking
+    // --- CASE 2 FIX: Empty response (thinking exhaustion or API error) ---
+    // Model returned no text - likely spent all tokens on thinking, or API returned 500
     // Retry once with thinkingLevel disabled and higher token budget
     if (outputs.length === 0 || !outputs.some((o: any) => o.type === 'text')) {
-        console.warn(`[INTERACTIONS CLIENT] Empty response detected. Retrying with thinking disabled...`);
+        console.warn(`[INTERACTIONS CLIENT] Empty response detected. Waiting 2s before retry...`);
+
+        // Wait before retry (500 errors are often transient)
+        await new Promise(r => setTimeout(r, 2000));
+
+        console.warn(`[INTERACTIONS CLIENT] Retrying with thinking disabled...`);
 
         // Retry without thinking to maximize output budget
         const retryRequest: InteractionRequest = {
@@ -818,7 +870,18 @@ export async function createJsonInteraction<T = any>(
         costTracker
     );
 
-    // --- LAYER 0: Direct Parse ---
+    // --- LAYER 0: Early empty response check ---
+    // Short-circuit before attempting parse/repair on empty responses
+    if (!text || text.trim().length === 0) {
+        console.error(`[JSON PARSE] API returned empty response. This usually means:`);
+        console.error(`  1. API returned 500/503 error (server-side issue)`);
+        console.error(`  2. Rate limiting (429 error)`);
+        console.error(`  3. Content was filtered by safety settings`);
+        console.error(`Retry the request or check API status.`);
+        throw new Error('API returned empty response. Check API status or retry.');
+    }
+
+    // --- LAYER 1: Direct Parse ---
     try {
         return JSON.parse(text) as T;
     } catch (err) {
@@ -891,6 +954,8 @@ export async function createJsonInteraction<T = any>(
 
             // Pattern-based truncation fixes
             const truncationPatterns: Array<{ pattern: RegExp; replacement: string | ((m: string) => string) }> = [
+                // FIRST: Remove degeneration patterns (o0o0o0, aaaaa, etc.) from token exhaustion
+                { pattern: /([a-z0-9])\1{5,}[^"]*$/, replacement: '' },
                 { pattern: /,\s*\{\s*"[^"]+"\s*:\s*"[^"]*"?\s*$/, replacement: '' },
                 { pattern: /,\s*"[a-zA-Z]{1,3}$/, replacement: '' },
                 { pattern: /,\s*"[^"]+"\s*:\s*"[^"]*$/, replacement: '' },

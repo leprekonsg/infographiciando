@@ -43,9 +43,23 @@ const LAYOUT_TEMPLATES: Record<string, SpatialZone[]> = {
 };
 
 export class SpatialLayoutEngine {
+  // GAP 5: Track rendering warnings (truncation, overflow, etc.)
+  private renderWarnings: string[] = [];
 
   public getZonesForVariant(variant: string): SpatialZone[] {
     return LAYOUT_TEMPLATES[variant] || LAYOUT_TEMPLATES['standard-vertical'];
+  }
+
+  private addWarning(message: string): void {
+    this.renderWarnings.push(message);
+  }
+
+  private clearWarnings(): void {
+    this.renderWarnings = [];
+  }
+
+  private getWarnings(): string[] {
+    return [...this.renderWarnings];
   }
 
   public allocateComponents(
@@ -187,6 +201,9 @@ export class SpatialLayoutEngine {
     getIconUrl: (name: string) => string | undefined,
     visualDesignSpec?: VisualDesignSpec // NEW: Accept visual design spec for color overrides
   ): VisualElement[] {
+    // GAP 5: Clear warnings from previous renders
+    this.clearWarnings();
+
     const elements: VisualElement[] = [];
     const variant = slide.routerConfig?.layoutVariant || 'standard-vertical';
     const zones = this.getZonesForVariant(variant);
@@ -270,6 +287,13 @@ export class SpatialLayoutEngine {
       }
     });
 
+    // GAP 5: Apply rendering warnings to slide
+    const warnings = this.getWarnings();
+    if (warnings.length > 0) {
+      slide.warnings = [...(slide.warnings || []), ...warnings];
+      console.warn(`[SPATIAL RENDERER] ${warnings.length} rendering warning(s) for slide "${slide.title}"`);
+    }
+
     return elements;
   }
 
@@ -311,11 +335,12 @@ export class SpatialLayoutEngine {
         const spacing = 0.6 * scale;
 
         if (curY + lineH > maxY) {
-          // Check if we can fit "..."
-          if (i < lines.length && els.length > 0) {
-            // Maybe add "..." to previous element or just stop? 
-            // Simple truncation: stop.
-            console.warn(`[SpatialRenderer] Text overflow in zone ${zone.id}`);
+          // GAP 5: Track truncation with detailed warning
+          if (i < lines.length) {
+            const truncatedCount = lines.length - i;
+            const message = `Text truncated in zone '${zone.id}': ${truncatedCount} of ${lines.length} lines hidden due to space constraints`;
+            this.addWarning(message);
+            console.warn(`[SPATIAL RENDERER] ${message}`);
           }
           break;
         }
