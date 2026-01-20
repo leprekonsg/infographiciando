@@ -44,20 +44,24 @@ export const PROMPTS = {
 
   ROUTER: {
     ROLE: "Lead Visual Designer",
-    TASK: (slideMeta: any) => `
+    // Phase 3: Router now accepts constraints for circuit breaker rerouting
+    TASK: (slideMeta: any, constraints?: { avoidLayoutVariants?: string[] }) => `
       Assign a specific layout structure to: "${slideMeta.title}" - ${slideMeta.purpose}
       LAYOUT VARIANTS: 'standard-vertical', 'split-left-text', 'split-right-text', 'hero-centered', 'bento-grid', 'timeline-horizontal'.
+      ${constraints?.avoidLayoutVariants?.length ? `AVOID THESE LAYOUTS (they failed validation): ${constraints.avoidLayoutVariants.join(', ')}` : ''}
       DECISION: 1. Intro/Conclusion -> 'hero-centered'. 2. Comparison -> 'split-*'. 3. Multi-item -> 'bento-grid'.
     `,
     OUTPUT_SCHEMA: "JSON RouterDecision"
   },
 
-  // --- NEW: PHASE 1 CONTENT PLANNER ---
+  // --- PHASE 1 CONTENT PLANNER (with Context Folding) ---
   CONTENT_PLANNER: {
     ROLE: "Senior Editor",
-    TASK: (title: string, purpose: string, facts: string) => `
+    // Phase 1: Content Planner now receives recentHistory for narrative arc awareness
+    TASK: (title: string, purpose: string, facts: string, recentHistory?: Array<{ title: string, mainPoint: string }>) => `
         TASK: Draft the core semantic content for slide "${title}".
         PURPOSE: ${purpose}
+        ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}` : ''}
         FACTS: ${facts}
         
         CONSTRAINTS:
@@ -65,14 +69,16 @@ export const PROMPTS = {
         - Create a list of 'keyPoints' (strings). Max 4 items.
         - If numbers exist, extract 'dataPoints' ({label, value}).
         - NO VISUALS. NO LAYOUT. TEXT ONLY.
+        - Build on the narrative so far - avoid repeating what was already covered.
       `
   },
 
-  // --- NEW: VISUAL COMPOSER AGENT ---
+  // --- VISUAL COMPOSER AGENT (with Validator-Driven Vibe Coding) ---
   VISUAL_COMPOSER: {
-    ROLE: "Visual Architect",
+    // Phase 2: Expert UI Architect with validateVisualLayoutAlignment awareness
+    ROLE: "Expert UI Architect. Think: 'Does this pass validateVisualLayoutAlignment?'",
     TASK: (context: any) => `
-You are a world-class presentation designer with deep understanding of spatial composition.
+You are an Expert UI Architect. Before generating, mentally verify: "Does this pass validateVisualLayoutAlignment?"
 
 SLIDE CONTEXT:
 - Title: ${context.title}
@@ -80,8 +86,19 @@ SLIDE CONTEXT:
 - Layout Variant: ${context.layoutVariant}
 - Components: ${context.componentTypes.join(', ')}
 
+VALIDATOR HEURISTICS (you MUST pass these checks):
+1. VISUAL FOCUS KEYWORDS: Mention "${context.visualFocus}" keywords 2+ times in prompt_with_composition
+2. NEGATIVE SPACE: Allocate 15-35% range (validator rejects <10% or >50%)
+3. ZONE PLACEMENT: ${context.layoutVariant} requires ${context.componentTypes.join(', ')} to be placed in correct zones
+4. DARK BACKGROUND: For text overlay, use YIQ<180 (dark colors like #0f172a, #1e293b, not mid-tones)
+
 SPATIAL STRATEGY PROVIDED:
 ${JSON.stringify(context.spatialStrategy, null, 2)}
+
+DESIGN PROCESS:
+
+1. FIRST: Mentally draft the spatial zones for ${context.layoutVariant}
+2. THEN: Compile to VisualDesignSpec JSON
 
 DESIGN REQUIREMENTS:
 
@@ -90,31 +107,36 @@ DESIGN REQUIREMENTS:
    - Use compositional hierarchy (focal point, supporting elements, negative space)
    - Ensure visual elements don't overlap with text zones
 
-2. NEGATIVE SPACE:
+2. NEGATIVE SPACE (CRITICAL - validator checks this):
    - ${context.spatialStrategy.negative_space_plan || 'Maintain breathing room'}
-   - Maintain at least 15% white/dark space for visual breathing room
+   - MUST be between 15% and 35% - use "20%" or "25%" as safe values
+   - Output format: "20%" (not "twenty percent")
 
-3. COLOR HARMONY:
-   - Align with style guide colors
-   - Use accent colors to guide viewer attention
-   - CRITICAL: Ensure sufficient contrast (e.g. Dark background + Light text). avoid mid-tone backgrounds.
+3. COLOR HARMONY (CRITICAL - validator checks YIQ contrast):
+   - background_tone MUST be dark (hex values like #0f172a, #1a1a2e, #0d1117)
+   - NEVER use mid-tones (avoid #808080, #a0a0a0, etc.)
+   - Accent colors should be vibrant for contrast
 
-4. CONTENT ALIGNMENT:
-   - Your 'prompt_with_composition' MUST explicitly include keywords from the Visual Focus ("${context.visualFocus}") to ensure the image matches the topic.
+4. CONTENT ALIGNMENT (CRITICAL - validator checks this):
+   - prompt_with_composition MUST include "${context.visualFocus}" keywords explicitly
+   - foreground_elements SHOULD reference the visual focus topic
 
-4. SPATIAL ZONES:
-   Generate a visual prompt that respects these zones:
+5. SPATIAL ZONES:
    ${context.spatialStrategy.zones ? context.spatialStrategy.zones.map((z: any) => `- ${z.purpose} zone (${z.id}): ${z.content_suggestion || 'supporting element'}`).join('\n') : 'No specific zones'}
 
-OUTPUT: Return JSON conforming to VisualDesignSpecSchema.
+OUTPUT: Return JSON conforming to VisualDesignSpecSchema. Ensure alignment.score >= 80.
 `
   },
 
-  // --- NEW: PHASE 2 VISUAL DESIGNER (RLM STRICT) ---
+  // --- PHASE 2 VISUAL DESIGNER (with Context Folding + Validator Awareness) ---
   VISUAL_DESIGNER: {
     ROLE: "Information Designer",
-    TASK: (contentPlanJson: string, routerConfig: any, visualDesignSpec?: any) => `
+    // Phase 1+2: Generator receives narrative history and validator awareness
+    TASK: (contentPlanJson: string, routerConfig: any, visualDesignSpec?: any, recentHistory?: Array<{ title: string, mainPoint: string }>) => `
       You produce structured slide data that must validate against the provided response schema.
+
+      ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}
+      Continue the story - don't repeat previous slide content.` : ''}
 
       Hard rules:
       - Output ONLY the JSON object. No preamble ("Here is…"), no markdown fences.

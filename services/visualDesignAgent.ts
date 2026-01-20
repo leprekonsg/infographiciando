@@ -160,16 +160,20 @@ export const runVisualDesigner = async (
                 routerConfig
             );
 
+            // Phase 2: Log alignment score for tracking visual first-pass success rate
+            console.log(`[VISUAL DESIGNER] Alignment score: ${alignment.score}/100 for "${slideTitle}"`);
+
             if (alignment.passed) {
-                console.log(`[VISUAL DESIGNER] Success for "${slideTitle}"`);
+                console.log(`[VISUAL DESIGNER] ✅ SUCCESS for "${slideTitle}" (score: ${alignment.score})`);
                 return visualPrompt;
             }
 
-            console.warn(`[VISUAL DESIGNER] Validation warning: ${alignment.errors.map(e => e.message).join(', ')}`);
+            console.warn(`[VISUAL DESIGNER] ⚠️ Validation warning (score: ${alignment.score}): ${alignment.errors.map(e => e.message).join(', ')}`);
             previousErrors = alignment.errors.map(e => e.message);
 
             if (attempt === MAX_ATTEMPTS) {
                 // Return best effort if out of retries
+                console.log(`[VISUAL DESIGNER] Returning best effort (score: ${alignment.score})`);
                 return visualPrompt;
             }
 

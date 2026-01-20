@@ -133,7 +133,7 @@ export const TemplateComponentSchema = z.discriminatedUnion('type', [
     metrics: z.array(z.object({
       value: z.string(),
       label: z.string().max(40),
-      icon: z.string().optional(), 
+      icon: z.string().optional(),
       trend: z.enum(['up', 'down', 'neutral']).optional(),
     })).min(2).max(6),
   }),
@@ -213,7 +213,7 @@ export const SlideNodeSchema = z.object({
   type: z.nativeEnum(SLIDE_TYPES),
   title: z.string(),
   purpose: z.string(),
-  
+
   // RLM Fields
   routerConfig: RouterDecisionSchema.optional(),
   validation: ValidationResultSchema.optional(),
@@ -221,11 +221,11 @@ export const SlideNodeSchema = z.object({
   layoutPlan: SlideLayoutPlanSchema.optional(),
   visualDesignSpec: VisualDesignSpecSchema.optional(), // New: Detailed visual spec
   agentLayout: AgentLayoutSchema.optional(), // Legacy/Advanced
-  
+
   // Content & Evidence
   content: z.array(z.string()).optional(), // Legacy compat
   citations: z.array(CitationSchema).optional(),
-  
+
   // SCHEMA HARDENING: Use array of strings to prevent newline breakage in JSON
   speakerNotesLines: z.array(z.string()),
 
@@ -234,9 +234,9 @@ export const SlideNodeSchema = z.object({
 
   // Visuals (Critique 1: Stop fighting yourself)
   visualReasoning: z.string(),
-  visualPrompt: z.string(), 
-  backgroundImageUrl: z.string().optional(), 
-  
+  visualPrompt: z.string(),
+  backgroundImageUrl: z.string().optional(),
+
   // Optimization Loop (Critique 2: Programmatic optimization)
   selfCritique: SelfCritiqueSchema.optional(),
 
@@ -250,7 +250,7 @@ export const OutlineSchema = z.object({
   title: z.string(),
   knowledgeSheet: KnowledgeSheetSchema,
   factClusters: z.array(FactClusterSchema).optional(), // The Librarian's Index
-  styleGuide: StyleGuideSchema, 
+  styleGuide: StyleGuideSchema,
   slides: z.array(z.object({
     order: z.number(),
     type: z.nativeEnum(SLIDE_TYPES),
@@ -262,17 +262,58 @@ export const OutlineSchema = z.object({
 });
 
 export type SlideNode = z.infer<typeof SlideNodeSchema>;
+
+// --- LEVEL 3 AGENTIC STACK TYPES ---
+
+/**
+ * NarrativeTrail: Context Folding for orchestrator-level memory.
+ * Allows Generator to know narrative arc without verbose fact re-injection.
+ */
+export interface NarrativeTrail {
+  title: string;
+  mainPoint: string; // First 100 chars of speaker notes
+}
+
+/**
+ * RouterConstraints: Allows circuit breaker to avoid failed layouts.
+ */
+export interface RouterConstraints {
+  avoidLayoutVariants?: string[];
+}
+
+/**
+ * GeneratorResult: Extended return type for circuit breaker pattern.
+ * If needsReroute is true, orchestrator should re-run pipeline with new constraints.
+ */
+export interface GeneratorResult {
+  slide: SlideNode;
+  needsReroute: boolean;
+  rerouteReason?: string;
+  avoidLayoutVariants?: string[];
+}
+
+/**
+ * DeckMetrics: Enhanced metrics for reliability tracking.
+ * Target: 95% decks ≤1 fallback slide, 80% visual designs pass 1st attempt.
+ */
+export interface DeckMetrics {
+  totalDurationMs: number;
+  retries: number;
+  totalCost?: number;
+  avgQualityScore?: number;
+  // Level 3 Reliability Tracking
+  fallbackSlides: number;
+  visualAlignmentFirstPassSuccess: number;
+  totalVisualDesignAttempts: number;
+  rerouteCount: number;
+}
+
 export type EditableSlideDeck = {
   id: string;
   topic: string;
   meta: z.infer<typeof OutlineSchema>;
   slides: SlideNode[];
-  metrics: {
-    totalDurationMs: number;
-    retries: number;
-    totalCost?: number;
-    avgQualityScore?: number;
-  };
+  metrics: DeckMetrics;
 };
 export type GlobalStyleGuide = z.infer<typeof StyleGuideSchema>;
 export type RouterDecision = z.infer<typeof RouterDecisionSchema>;
@@ -285,45 +326,45 @@ export type VisualDesignSpec = z.infer<typeof VisualDesignSpecSchema>;
 export type SpatialZone = z.infer<typeof SpatialZoneSchema>;
 export type SpatialStrategy = z.infer<typeof SpatialStrategySchema>;
 
-export type VisualElement = 
+export type VisualElement =
   | {
-      type: 'shape';
-      shapeType: string;
-      x: number;
-      y: number;
-      w: number;
-      h: number;
-      fill?: { color: string; alpha: number };
-      border?: { color: string; width: number; alpha: number };
-      text?: string;
-      textColor?: string;
-      rotation?: number;
-      zIndex?: number;
-      rectRadius?: number;
-    }
+    type: 'shape';
+    shapeType: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    fill?: { color: string; alpha: number };
+    border?: { color: string; width: number; alpha: number };
+    text?: string;
+    textColor?: string;
+    rotation?: number;
+    zIndex?: number;
+    rectRadius?: number;
+  }
   | {
-      type: 'text';
-      content: string;
-      x: number;
-      y: number;
-      w: number;
-      h: number;
-      fontSize: number;
-      color: string;
-      fontFamily?: string;
-      bold?: boolean;
-      italic?: boolean;
-      align?: "left" | "center" | "right";
-      rotation?: number;
-      zIndex?: number;
-    }
+    type: 'text';
+    content: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    fontSize: number;
+    color: string;
+    fontFamily?: string;
+    bold?: boolean;
+    italic?: boolean;
+    align?: "left" | "center" | "right";
+    rotation?: number;
+    zIndex?: number;
+  }
   | {
-      type: 'image';
-      data: string;
-      x: number;
-      y: number;
-      w: number;
-      h: number;
-      zIndex?: number;
-      transparency?: number;
+    type: 'image';
+    data: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    zIndex?: number;
+    transparency?: number;
   };

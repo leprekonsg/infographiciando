@@ -18,7 +18,9 @@ import { GoogleGenAI, Type, Modality } from "@google/genai";
 import {
     EditableSlideDeck, SlideNode, OutlineSchema, SLIDE_TYPES, GlobalStyleGuide,
     ResearchFact, RouterDecision, RouterDecisionSchema, SlideNodeSchema, LayoutVariantSchema, RenderModeSchema,
-    FactClusterSchema, VisualDesignSpec
+    FactClusterSchema, VisualDesignSpec,
+    // Level 3 Agentic Stack Types
+    NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics
 } from "../types/slideTypes";
 import {
     InteractionsClient,
@@ -269,6 +271,69 @@ function deepParseJsonStrings(obj: any): any {
 }
 
 function autoRepairSlide(slide: SlideNode): SlideNode {
+    // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
+
+    // Fix malformed selfCritique (model outputs prose in layoutAction instead of enum)
+    if (slide.selfCritique) {
+        if (typeof slide.selfCritique === 'string') {
+            // Model returned string instead of object
+            console.warn(`[AUTO-REPAIR] selfCritique was string, converting to object`);
+            slide.selfCritique = {
+                layoutAction: 'keep',
+                readabilityScore: 8,
+                textDensityStatus: 'optimal' as any
+            };
+        } else {
+            // Validate/normalize fields
+            const sc = slide.selfCritique as any;
+
+            // layoutAction: If prose text, extract intent or default to 'keep'
+            if (sc.layoutAction && typeof sc.layoutAction === 'string') {
+                const action = sc.layoutAction.toLowerCase();
+                if (action.includes('simplif')) sc.layoutAction = 'simplify' as any;
+                else if (action.includes('shrink') || action.includes('reduce')) sc.layoutAction = 'shrink_text' as any;
+                else if (action.includes('visual') || action.includes('add')) sc.layoutAction = 'add_visuals' as any;
+                else if (!['keep', 'simplify', 'shrink_text', 'add_visuals'].includes(action)) {
+                    console.warn(`[AUTO-REPAIR] layoutAction was prose: "${sc.layoutAction.slice(0, 50)}...", defaulting to 'keep'`);
+                    sc.layoutAction = 'keep' as any;
+                }
+            } else {
+                sc.layoutAction = 'keep' as any;
+            }
+
+            // readabilityScore: Ensure number 0-10
+            if (typeof sc.readabilityScore !== 'number' || sc.readabilityScore < 0 || sc.readabilityScore > 10) {
+                sc.readabilityScore = 8;
+            }
+
+            // textDensityStatus: Normalize to enum
+            if (sc.textDensityStatus && typeof sc.textDensityStatus === 'string') {
+                const status = sc.textDensityStatus.toLowerCase();
+                if (status.includes('optim')) sc.textDensityStatus = 'optimal' as any;
+                else if (status.includes('high') || status.includes('dens')) sc.textDensityStatus = 'high' as any;
+                else if (status.includes('over')) sc.textDensityStatus = 'overflow' as any;
+                else sc.textDensityStatus = 'optimal' as any;
+            } else {
+                sc.textDensityStatus = 'optimal' as any;
+            }
+        }
+    }
+
+    // Fix missing/malformed speakerNotesLines (model sometimes outputs "" or garbage)
+    if (!slide.speakerNotesLines || !Array.isArray(slide.speakerNotesLines)) {
+        console.warn(`[AUTO-REPAIR] speakerNotesLines missing or invalid, generating default`);
+        slide.speakerNotesLines = [`Slide: ${slide.title || 'Content'}`];
+    } else {
+        // Filter out empty strings and garbage entries
+        slide.speakerNotesLines = slide.speakerNotesLines
+            .filter((line: any) => typeof line === 'string' && line.trim().length > 0)
+            .slice(0, 5); // Limit to 5 notes
+
+        if (slide.speakerNotesLines.length === 0) {
+            slide.speakerNotesLines = [`Slide: ${slide.title || 'Content'}`];
+        }
+    }
+
     const components = slide.layoutPlan?.components || [];
     const SAFE_ICONS = ['Activity', 'Zap', 'BarChart3', 'Box', 'Layers', 'PieChart', 'TrendingUp', 'Target', 'CheckCircle', 'Lightbulb'];
 
@@ -691,10 +756,23 @@ async function runArchitect(
     }
 }
 
-// --- AGENT 3: ROUTER ---
+// --- AGENT 3: ROUTER (Phase 3: Circuit Breaker Support) ---
 
-async function runRouter(slideMeta: any, costTracker: CostTracker): Promise<RouterDecision> {
+/**
+ * Router with Circuit Breaker Constraints
+ * @param slideMeta - Slide metadata from architect
+ * @param costTracker - Cost tracking
+ * @param constraints - Optional constraints for rerouting (avoidLayoutVariants)
+ */
+async function runRouter(
+    slideMeta: any,
+    costTracker: CostTracker,
+    constraints?: RouterConstraints
+): Promise<RouterDecision> {
     console.log(`[ROUTER] Routing slide: "${slideMeta.title}"...`);
+    if (constraints?.avoidLayoutVariants?.length) {
+        console.log(`[ROUTER] Avoiding layouts: ${constraints.avoidLayoutVariants.join(', ')}`);
+    }
 
     const routerSchema = {
         type: "object",
@@ -721,7 +799,7 @@ async function runRouter(slideMeta: any, costTracker: CostTracker): Promise<Rout
         // 79% cheaper than Flash, sufficient for layout variant selection
         const result = await createJsonInteraction<RouterDecision>(
             MODEL_SIMPLE,
-            PROMPTS.ROUTER.TASK(slideMeta),
+            PROMPTS.ROUTER.TASK(slideMeta, constraints),
             routerSchema,
             {
                 systemInstruction: PROMPTS.ROUTER.ROLE,
@@ -729,6 +807,16 @@ async function runRouter(slideMeta: any, costTracker: CostTracker): Promise<Rout
             },
             costTracker
         );
+
+        // Validate that the chosen layout isn't in the avoid list
+        if (constraints?.avoidLayoutVariants?.includes(result.layoutVariant)) {
+            console.warn(`[ROUTER] Model chose avoided layout ${result.layoutVariant}, falling back to standard-vertical`);
+            return {
+                ...result,
+                layoutVariant: 'standard-vertical',
+                layoutIntent: 'Fallback (avoided layout)'
+            };
+        }
 
         return result.renderMode
             ? result
@@ -751,14 +839,25 @@ async function runRouter(slideMeta: any, costTracker: CostTracker): Promise<Rout
     }
 }
 
-// --- AGENT 4: CONTENT PLANNER ---
+// --- AGENT 4: CONTENT PLANNER (Phase 1: Context Folding) ---
 
+/**
+ * Content Planner with Narrative History
+ * @param meta - Slide metadata
+ * @param factsContext - Relevant facts for this slide
+ * @param costTracker - Cost tracking
+ * @param recentHistory - Last 2 slides for narrative arc awareness (Phase 1 Context Folding)
+ */
 async function runContentPlanner(
     meta: any,
     factsContext: string,
-    costTracker: CostTracker
+    costTracker: CostTracker,
+    recentHistory?: NarrativeTrail[]
 ) {
     console.log(`[CONTENT PLANNER] Planning content for: "${meta.title}"...`);
+    if (recentHistory?.length) {
+        console.log(`[CONTENT PLANNER] Narrative context: ${recentHistory.length} previous slides`);
+    }
 
     // NOTE: Schema flattened for consistency with Gemini Interactions API nesting limits.
     const contentPlanSchema = {
@@ -777,7 +876,7 @@ async function runContentPlanner(
         // Content Planner: Moderate reasoning for keyPoints extraction → MODEL_AGENTIC (3 Flash)
         return await createJsonInteraction(
             MODEL_AGENTIC,
-            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, factsContext),
+            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, factsContext, recentHistory),
             contentPlanSchema,
             {
                 systemInstruction: PROMPTS.CONTENT_PLANNER.ROLE,
@@ -796,8 +895,21 @@ async function runContentPlanner(
     }
 }
 
-// --- AGENT 5: GENERATOR (Final Assembly with Agentic Loop) ---
+// --- AGENT 5: GENERATOR (Phase 1+3: Context Folding + Circuit Breaker) ---
 
+/**
+ * Generator with Self-Healing Circuit Breaker
+ * Returns GeneratorResult with needsReroute flag for reliability-targeted self-healing.
+ * 
+ * @param meta - Slide metadata
+ * @param routerConfig - Router decision (layout, density, etc.)
+ * @param contentPlan - Content plan from planner
+ * @param visualDesignSpec - Visual design spec (optional)
+ * @param facts - Research facts
+ * @param factClusters - Fact clusters from architect
+ * @param costTracker - Cost tracking
+ * @param recentHistory - Phase 1: Recent narrative history for context folding
+ */
 async function runGenerator(
     meta: any,
     routerConfig: RouterDecision,
@@ -805,9 +917,13 @@ async function runGenerator(
     visualDesignSpec: VisualDesignSpec | undefined,
     facts: ResearchFact[],
     factClusters: z.infer<typeof FactClusterSchema>[],
-    costTracker: CostTracker
-): Promise<SlideNode> {
+    costTracker: CostTracker,
+    recentHistory?: NarrativeTrail[]
+): Promise<GeneratorResult> {
     console.log(`[GENERATOR] Generating slide: "${meta.title}"...`);
+    if (recentHistory?.length) {
+        console.log(`[GENERATOR] Narrative context: ${recentHistory.length} previous slides`);
+    }
 
     // BALANCED SCHEMA: Type is enforced, internals are loosened for autoRepairSlide to normalize
     const minimalGeneratorSchema = {
@@ -845,8 +961,15 @@ async function runGenerator(
                 type: "object",
                 properties: {
                     readabilityScore: { type: "number" },
-                    textDensityStatus: { type: "string" },
-                    layoutAction: { type: "string" }
+                    // Enum constraints prevent model from outputting prose
+                    textDensityStatus: {
+                        type: "string",
+                        enum: ["optimal", "high", "overflow"]
+                    },
+                    layoutAction: {
+                        type: "string",
+                        enum: ["keep", "simplify", "shrink_text", "add_visuals"]
+                    }
                 }
             }
         },
@@ -879,13 +1002,19 @@ async function runGenerator(
             const maxTokens = isRecoveryAttempt ? 6144 : 4096;
 
             // COMPACT component examples - minimal tokens, maximum clarity
+            // Layer 1: Explicit examples to prevent model from outputting prose in selfCritique
             const componentExamples = `
 COMPONENTS (use EXACT type names):
 - "text-bullets": {"content": ["point 1", "point 2"]}
 - "metric-cards": {"metrics": [{"value": "85%", "label": "Growth", "icon": "TrendingUp"}]}
 - "process-flow": {"steps": [{"number": 1, "title": "Step", "icon": "Zap"}]}
 - "icon-grid": {"items": [{"label": "Feature", "icon": "Star"}]}
-Max 3 components. Keep JSON short.`;
+Max 3 components. Keep JSON short.
+
+REQUIRED FIELDS (exact format):
+- "speakerNotesLines": ["Note 1", "Note 2"] (array of strings, NOT empty "")
+- "selfCritique": {"readabilityScore": 8, "textDensityStatus": "optimal", "layoutAction": "keep"}
+  layoutAction must be one of: "keep", "simplify", "shrink_text", "add_visuals" (NOT prose)`;
 
             let basePrompt: string;
             if (isRecoveryAttempt && lastValidation?.errors) {
@@ -966,7 +1095,28 @@ Max 3 components. Keep JSON short.`;
 
             if (validation.passed) {
                 candidate.validation = validation;
-                return candidate;
+                // Phase 3: Return GeneratorResult with successful slide
+                return {
+                    slide: candidate,
+                    needsReroute: false
+                };
+            }
+
+            // Phase 3: Check for critical errors that warrant rerouting
+            const criticalErrors = validation.errors.filter(e =>
+                e.code === 'ERR_TEXT_OVERFLOW_CRITICAL' ||
+                e.code === 'ERR_MISSING_VISUALS_CRITICAL'
+            );
+
+            if (criticalErrors.length > 0 && attempt === MAX_RETRIES) {
+                // Instead of falling back immediately, signal reroute opportunity
+                console.warn(`[GENERATOR] Critical errors detected, signaling reroute: ${criticalErrors.map(e => e.code).join(', ')}`);
+                return {
+                    slide: candidate,
+                    needsReroute: true,
+                    rerouteReason: criticalErrors[0].code,
+                    avoidLayoutVariants: [routerConfig.layoutVariant]
+                };
             }
 
             console.warn(`[GENERATOR] Validation failed (attempt ${attempt + 1}):`, validation.errors);
@@ -986,7 +1136,7 @@ Max 3 components. Keep JSON short.`;
 
     // Fallback: Use text-bullets only for maximum reliability
     console.warn(`[GENERATOR] All attempts exhausted. Using text-bullets fallback.`);
-    return {
+    const fallbackSlide: SlideNode = {
         order: meta.order || 0,
         type: meta.type as any,
         title: meta.title,
@@ -1010,11 +1160,57 @@ Max 3 components. Keep JSON short.`;
         citations: [],
         warnings: lastValidation?.errors?.map((e: any) => e.message) || ["Generation failed after max retries"]
     };
+
+    // Phase 3: Return fallback with needsReroute = false (no more attempts)
+    return { slide: fallbackSlide, needsReroute: false };
 }
 
 // --- IMAGE GENERATION (Still uses generateContent for image modality) ---
 
 const NEGATIVE_PROMPT_INFO = "photorealistic, 3d render, messy, clutter, blurry, low resolution, distorted text, bad layout, sketch, hand drawn, organic textures, grunge, footer text, copyright notice, watermark, template borders, frame, mock-up, padding, margins";
+
+// Image model configuration:
+// - Default to 2.5 Flash Image: 71% cheaper ($0.039 vs $0.134 per image)
+// - Visual prompts are short (no long text generation), Flash is sufficient
+// - Pro is fallback for quota/quality issues
+const IMAGE_MODELS = {
+    DEFAULT: 'gemini-2.5-flash-image',      // 71% cheaper, sufficient for visual prompts
+    FALLBACK: 'gemini-3-pro-image-preview'  // Higher quality fallback
+};
+
+interface ImageGenerationError {
+    type: 'quota' | 'content_filter' | 'timeout' | 'network' | 'unknown';
+    model: string;
+    message: string;
+    retryable: boolean;
+}
+
+function classifyImageError(error: any, model: string): ImageGenerationError {
+    const message = error?.message || String(error);
+    const status = error?.status;
+
+    // Quota/Rate limit
+    if (status === 429 || message.includes('429') || message.includes('quota') || message.includes('RESOURCE_EXHAUSTED')) {
+        return { type: 'quota', model, message: 'Rate limit exceeded', retryable: true };
+    }
+
+    // Content filter (safety)
+    if (message.includes('SAFETY') || message.includes('blocked') || message.includes('content filter')) {
+        return { type: 'content_filter', model, message: 'Content blocked by safety filter', retryable: false };
+    }
+
+    // Timeout
+    if (status === 499 || message.includes('timeout') || message.includes('cancelled') || message.includes('DEADLINE')) {
+        return { type: 'timeout', model, message: 'Request timed out', retryable: true };
+    }
+
+    // Network issues
+    if (status === 503 || message.includes('503') || message.includes('Overloaded') || message.includes('UNAVAILABLE')) {
+        return { type: 'network', model, message: 'Service temporarily unavailable', retryable: true };
+    }
+
+    return { type: 'unknown', model, message: message.slice(0, 100), retryable: false };
+}
 
 export async function generateImageFromPrompt(
     prompt: string,
@@ -1022,18 +1218,28 @@ export async function generateImageFromPrompt(
     costTracker?: CostTracker
 ): Promise<{ imageUrl: string, model: string } | null> {
     const ai = getAiClient();
-    const models = ['gemini-3-pro-image-preview', 'gemini-2.5-flash-image'];
 
+    // Order: 2.5 Flash first (cheaper), Pro as fallback
+    const models = [IMAGE_MODELS.DEFAULT, IMAGE_MODELS.FALLBACK];
+
+    // Compact prompt for image generation (minimal tokens)
     const richPrompt = `
-  SUBJECT: ${prompt}
-  CONTEXT: Professional Presentation Slide Background.
-  STYLE: High-fidelity, cinematic lighting, corporate aesthetic.
-  CONSTRAINT: Ensure substantial negative space or low contrast areas for overlay text. 
-  NEGATIVE: ${NEGATIVE_PROMPT_INFO}
-  `;
+SUBJECT: ${prompt}
+CONTEXT: Professional Presentation Slide Background.
+STYLE: High-fidelity, cinematic lighting, corporate aesthetic.
+CONSTRAINT: Ensure substantial negative space or low contrast areas for overlay text. 
+NEGATIVE: ${NEGATIVE_PROMPT_INFO}
+`.trim();
+
+    // Log prompt length to verify it's short
+    console.log(`[IMAGE GEN] Prompt length: ${richPrompt.length} chars, starting with ${models[0]}...`);
+
+    const errors: ImageGenerationError[] = [];
 
     for (const modelName of models) {
         try {
+            console.log(`[IMAGE GEN] Attempting ${modelName}...`);
+
             const response = await ai.models.generateContent({
                 model: modelName,
                 contents: { parts: [{ text: richPrompt }] },
@@ -1049,6 +1255,7 @@ export async function generateImageFromPrompt(
                         if (costTracker) {
                             costTracker.addImageCost(modelName);
                         }
+                        console.log(`[IMAGE GEN] ✅ Success with ${modelName}`);
                         return {
                             imageUrl: `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`,
                             model: modelName
@@ -1056,20 +1263,43 @@ export async function generateImageFromPrompt(
                     }
                 }
             }
+
+            // No image data in response
+            console.warn(`[IMAGE GEN] ${modelName} returned no image data`);
+            errors.push({ type: 'unknown', model: modelName, message: 'No image data in response', retryable: true });
+
         } catch (e: any) {
-            const isQuota = e.status === 429 || (e.message && (e.message.includes('429') || e.message.includes('quota')));
-            if (isQuota && modelName !== models[models.length - 1]) {
-                console.warn(`Quota exceeded for ${modelName}, switching to next model...`);
+            const classifiedError = classifyImageError(e, modelName);
+            errors.push(classifiedError);
+
+            console.warn(`[IMAGE GEN] ${modelName} failed: ${classifiedError.type} - ${classifiedError.message}`);
+
+            // For retryable errors, try next model
+            if (classifiedError.retryable && modelName !== models[models.length - 1]) {
+                console.log(`[IMAGE GEN] Falling back to ${models[models.indexOf(modelName) + 1]}...`);
                 continue;
             }
-            console.error(`Failed to generate image with ${modelName}`, e.message);
-            if (modelName === models[models.length - 1]) return null;
+
+            // Content filter: Don't try other models (same prompt will fail)
+            if (classifiedError.type === 'content_filter') {
+                console.error(`[IMAGE GEN] ⚠️ Content blocked by safety filter. Prompt may need adjustment.`);
+                break;
+            }
+
+            // Last model failed
+            if (modelName === models[models.length - 1]) {
+                console.error(`[IMAGE GEN] ❌ All models failed. Errors:`, errors.map(e => `${e.model}: ${e.type}`));
+                break;
+            }
         }
     }
+
+    // Graceful null return - caller will handle missing image
+    console.warn(`[IMAGE GEN] Returning null. Slide will render without background image.`);
     return null;
 }
 
-// --- ORCHESTRATOR ---
+// --- ORCHESTRATOR (Level 3: Context Folding + Self-Healing Circuit Breaker) ---
 
 export const generateAgenticDeck = async (
     topic: string,
@@ -1078,8 +1308,17 @@ export const generateAgenticDeck = async (
     const costTracker = new CostTracker();
     const startTime = Date.now();
 
-    console.log("[ORCHESTRATOR] Starting agentic deck generation with Interactions API...");
+    console.log("[ORCHESTRATOR] Starting Level 3 Agentic Deck Generation...");
     console.log(`[ORCHESTRATOR] Max iterations per agent: ${MAX_AGENT_ITERATIONS}`);
+
+    // --- PHASE 1: CONTEXT FOLDING STATE ---
+    const narrativeHistory: NarrativeTrail[] = [];
+
+    // --- RELIABILITY METRICS ---
+    let fallbackSlides = 0;
+    let visualAlignmentFirstPassSuccess = 0;
+    let totalVisualDesignAttempts = 0;
+    let rerouteCount = 0;
 
     // 1. RESEARCH PHASE
     onProgress("Agent 1/5: Deep Research (Interactions API)...", 10);
@@ -1094,18 +1333,22 @@ export const generateAgenticDeck = async (
     const slides: SlideNode[] = [];
     const totalSlides = outline.slides.length;
 
-    // 3. PER-SLIDE GENERATION with Error Boundary
+    // 3. PER-SLIDE GENERATION with Context Folding + Circuit Breaker
     for (let i = 0; i < totalSlides; i++) {
         const slideMeta = outline.slides[i];
+        let slideConstraints: RouterConstraints = {};
 
         try {
             console.log(`[ORCHESTRATOR] Processing slide ${i + 1}/${totalSlides}: "${slideMeta.title}"`);
 
-            // 3a. Route Layout
-            onProgress(`Agent 3/5: Routing Slide ${i + 1}/${totalSlides}...`, 30 + Math.floor((i / (totalSlides * 2)) * 30));
-            const routerConfig = await runRouter(slideMeta, costTracker);
+            // --- PHASE 1: Get recent narrative history for context folding ---
+            const recentHistory = narrativeHistory.slice(-2);
 
-            // 3b. Plan Content
+            // 3a. Route Layout (with optional constraints for rerouting)
+            onProgress(`Agent 3/5: Routing Slide ${i + 1}/${totalSlides}...`, 30 + Math.floor((i / (totalSlides * 2)) * 30));
+            let routerConfig = await runRouter(slideMeta, costTracker, slideConstraints);
+
+            // 3b. Plan Content (with narrative history for context folding)
             const clusterIds = slideMeta.relevantClusterIds || [];
             const relevantClusterFacts: string[] = [];
             if (clusterIds.length > 0 && outline.factClusters) {
@@ -1122,29 +1365,80 @@ export const generateAgenticDeck = async (
             const factsContext = relevantClusterFacts.join('\n') || "No specific facts found.";
 
             onProgress(`Agent 3b/5: Content Planning Slide ${i + 1}...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
-            const contentPlan = await runContentPlanner(slideMeta, factsContext, costTracker);
+            const contentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
 
-            // 3c. Visual Design (using Interactions API)
+            // 3c. Visual Design (using Interactions API) - Track first-pass success
             onProgress(`Agent 3c/5: Visual Design Slide ${i + 1}...`, 34 + Math.floor((i / (totalSlides * 2)) * 30));
+            totalVisualDesignAttempts++;
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
                 contentPlan,
                 routerConfig,
                 facts,
-                costTracker // Use actual cost tracker for proper metrics
+                costTracker
             );
 
-            // 3d. Final Generation
+            // Phase 2: Track visual alignment first-pass success
+            const visualValidation = validateVisualLayoutAlignment(visualDesign, routerConfig);
+            if (visualValidation.passed && visualValidation.score >= 80) {
+                visualAlignmentFirstPassSuccess++;
+                console.log(`[ORCHESTRATOR] Visual design first-pass SUCCESS (score: ${visualValidation.score})`);
+            } else {
+                console.log(`[ORCHESTRATOR] Visual design needs improvement (score: ${visualValidation.score})`);
+            }
+
+            // 3d. Final Generation (with narrative history + circuit breaker)
             onProgress(`Agent 4/5: Generating Slide ${i + 1}...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
-            const slideNode = await runGenerator(
+            let generatorResult = await runGenerator(
                 slideMeta,
                 routerConfig,
                 contentPlan,
                 visualDesign,
                 facts,
                 outline.factClusters || [],
-                costTracker
+                costTracker,
+                recentHistory
             );
+
+            // --- PHASE 3: SELF-HEALING CIRCUIT BREAKER ---
+            if (generatorResult.needsReroute) {
+                console.warn(`[ORCHESTRATOR] Reroute triggered for slide ${i + 1}: ${generatorResult.rerouteReason}`);
+                rerouteCount++;
+
+                // Re-run router with constraints to avoid failed layout
+                const newConstraints: RouterConstraints = {
+                    avoidLayoutVariants: generatorResult.avoidLayoutVariants
+                };
+                routerConfig = await runRouter(slideMeta, costTracker, newConstraints);
+
+                // Re-run content planner and generator with new route
+                const reroutedContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
+                const reroutedVisualDesign = await runVisualDesigner(
+                    slideMeta.title,
+                    reroutedContentPlan,
+                    routerConfig,
+                    facts,
+                    costTracker
+                );
+
+                generatorResult = await runGenerator(
+                    slideMeta,
+                    routerConfig,
+                    reroutedContentPlan,
+                    reroutedVisualDesign,
+                    facts,
+                    outline.factClusters || [],
+                    costTracker,
+                    recentHistory
+                );
+            }
+
+            const slideNode = generatorResult.slide;
+
+            // Track if this is a fallback slide
+            if (slideNode.visualReasoning?.includes('Fallback')) {
+                fallbackSlides++;
+            }
 
             // 3e. Image Generation
             const finalVisualPrompt = visualDesign.prompt_with_composition || `${slideNode.title} professional abstract background`;
@@ -1157,11 +1451,19 @@ export const generateAgenticDeck = async (
                     slideNode.backgroundImageUrl = imgResult.imageUrl;
                 }
             }
+
+            // --- PHASE 1: Update narrative history for context folding ---
+            narrativeHistory.push({
+                title: slideNode.title,
+                mainPoint: slideNode.speakerNotesLines?.[0]?.substring(0, 100) || slideNode.purpose || ''
+            });
+
             slides.push(slideNode);
 
         } catch (slideError: any) {
             // --- ERROR BOUNDARY: Create fallback slide instead of failing entire deck ---
             console.error(`[ORCHESTRATOR] Slide ${i + 1} failed, using fallback:`, slideError.message);
+            fallbackSlides++;
 
             const fallbackSlide: SlideNode = {
                 order: slideMeta.order || i,
@@ -1193,6 +1495,12 @@ export const generateAgenticDeck = async (
                 warnings: [`Generation failed: ${slideError.message}`]
             };
 
+            // Still update narrative history for context continuity
+            narrativeHistory.push({
+                title: slideMeta.title,
+                mainPoint: 'Content pending manual edit'
+            });
+
             slides.push(fallbackSlide);
         }
     }
@@ -1202,23 +1510,40 @@ export const generateAgenticDeck = async (
     const totalDurationMs = Date.now() - startTime;
     const costSummary = costTracker.getSummary();
 
-    console.log("[ORCHESTRATOR] Generation complete!");
+    // --- RELIABILITY METRICS LOGGING ---
+    const visualFirstPassRate = totalVisualDesignAttempts > 0
+        ? Math.round((visualAlignmentFirstPassSuccess / totalVisualDesignAttempts) * 100)
+        : 0;
+    const fallbackRate = totalSlides > 0 ? (fallbackSlides / totalSlides) * 100 : 0;
+
+    console.log("[ORCHESTRATOR] ✅ Level 3 Generation Complete!");
     console.log(`[ORCHESTRATOR] Duration: ${(totalDurationMs / 1000).toFixed(1)}s`);
     console.log(`[ORCHESTRATOR] Total Cost: $${costSummary.totalCost.toFixed(4)}`);
     console.log(`[ORCHESTRATOR] 💰 Savings vs Pro: $${costSummary.totalSavingsVsPro.toFixed(4)} (${((costSummary.totalSavingsVsPro / (costSummary.totalCost + costSummary.totalSavingsVsPro)) * 100).toFixed(0)}%)`);
     console.log(`[ORCHESTRATOR] Tokens: ${costSummary.totalInputTokens} in, ${costSummary.totalOutputTokens} out`);
     console.log(`[ORCHESTRATOR] Model Breakdown:`, costSummary.modelBreakdown);
+    console.log(`[ORCHESTRATOR] 📊 RELIABILITY METRICS:`);
+    console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ≤1/deck`);
+    console.log(`[ORCHESTRATOR]   - Visual First-Pass Success: ${visualAlignmentFirstPassSuccess}/${totalVisualDesignAttempts} (${visualFirstPassRate}%) - Target: ≥80%`);
+    console.log(`[ORCHESTRATOR]   - Reroute Count: ${rerouteCount}`);
+
+    // Compute metrics for reliability targets
+    const deckMetrics: DeckMetrics = {
+        totalDurationMs,
+        retries: rerouteCount,
+        totalCost: costSummary.totalCost,
+        fallbackSlides,
+        visualAlignmentFirstPassSuccess,
+        totalVisualDesignAttempts,
+        rerouteCount
+    };
 
     return {
         id: crypto.randomUUID(),
         topic,
         meta: outline,
         slides,
-        metrics: {
-            totalDurationMs,
-            retries: 0,
-            totalCost: costSummary.totalCost
-        }
+        metrics: deckMetrics
     };
 };
 
@@ -1239,10 +1564,12 @@ export const regenerateSingleSlide = async (
         contentPlan,
         routerConfig,
         facts,
-        costTracker // Use actual cost tracker
+        costTracker
     );
 
-    const newSlide = await runGenerator(meta, routerConfig, contentPlan, visualDesign, facts, factClusters, costTracker);
+    // Generator now returns GeneratorResult, extract the slide
+    const generatorResult = await runGenerator(meta, routerConfig, contentPlan, visualDesign, facts, factClusters, costTracker);
+    const newSlide = generatorResult.slide;
 
     newSlide.visualPrompt = visualDesign.prompt_with_composition;
 

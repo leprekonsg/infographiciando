@@ -18,6 +18,148 @@ export type InteractionStatus = 'in_progress' | 'requires_action' | 'completed' 
 
 export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high';
 
+// --- JSON FAILURE CLASSIFICATION ---
+// Classify JSON failures BEFORE attempting repair to apply correct strategy
+
+export type JsonFailureType =
+    | 'garbage_suffix'   // Valid JSON + trailing junk (e.g., `{"valid": 1}, ""`)
+    | 'truncation'       // Missing closing braces/brackets due to token limit
+    | 'escaped_json'     // JSON inside a JSON string (double-encoded)
+    | 'schema_drift'     // Wrong field types (e.g., string[] instead of object[])
+    | 'string_array'     // Flat string array instead of object structure
+    | 'unknown';         // Unclassified malformation
+
+interface JsonClassification {
+    type: JsonFailureType;
+    validPrefixEnd?: number;  // Position of last complete JSON object
+    confidence: 'high' | 'medium' | 'low';
+}
+
+/**
+ * Classify JSON failure type before attempting repair.
+ * This prevents applying truncation repair to garbage-suffix cases (and vice versa).
+ */
+function classifyJsonFailure(text: string): JsonClassification {
+    const trimmed = text.trim();
+
+    // Check for string array pattern: ["item1", "item2", ...]
+    if (/^\s*\[\s*"[^"]*"\s*(,\s*"[^"]*"\s*)*\]\s*$/.test(trimmed)) {
+        return { type: 'string_array', confidence: 'high' };
+    }
+
+    // Check for escaped JSON (starts with " and contains \")
+    if (trimmed.startsWith('"') && trimmed.includes('\\"')) {
+        return { type: 'escaped_json', confidence: 'medium' };
+    }
+
+    // Find first object/array start
+    const firstBrace = trimmed.indexOf('{');
+    const firstBracket = trimmed.indexOf('[');
+    if (firstBrace === -1 && firstBracket === -1) {
+        return { type: 'unknown', confidence: 'low' };
+    }
+
+    const startIdx = (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace))
+        ? firstBracket : firstBrace;
+
+    // Track bracket depth to find last complete object
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let lastValidEnd = -1;
+
+    for (let i = startIdx; i < trimmed.length; i++) {
+        const char = trimmed[i];
+
+        if (escape) { escape = false; continue; }
+        if (char === '\\') { escape = true; continue; }
+        if (char === '"') { inString = !inString; continue; }
+
+        if (!inString) {
+            if (char === '{' || char === '[') {
+                depth++;
+            } else if (char === '}' || char === ']') {
+                depth--;
+                if (depth === 0) {
+                    lastValidEnd = i;
+                }
+            }
+        }
+    }
+
+    // Garbage suffix: Valid JSON exists, but there's content after it
+    if (lastValidEnd !== -1 && lastValidEnd < trimmed.length - 1) {
+        const suffix = trimmed.substring(lastValidEnd + 1).trim();
+        if (suffix.length > 0 && !suffix.match(/^\s*$/)) {
+            // Check if suffix is garbage (commas, empty strings, etc.)
+            if (/^[,\s"]*$/.test(suffix) || suffix.startsWith(',')) {
+                return {
+                    type: 'garbage_suffix',
+                    validPrefixEnd: lastValidEnd,
+                    confidence: 'high'
+                };
+            }
+        }
+        return { type: 'garbage_suffix', validPrefixEnd: lastValidEnd, confidence: 'medium' };
+    }
+
+    // Truncation: depth > 0 means unclosed brackets
+    if (depth > 0) {
+        return { type: 'truncation', confidence: 'high' };
+    }
+
+    // If we get here and still can't parse, it's unknown
+    return { type: 'unknown', confidence: 'low' };
+}
+
+/**
+ * Extract the longest valid JSON prefix from text.
+ * This directly addresses the `, ""` tail pattern by discarding suffixes.
+ */
+function extractLongestValidPrefix(text: string): { json: string; discarded: string } | null {
+    const trimmed = text.trim();
+
+    const firstBrace = trimmed.indexOf('{');
+    const firstBracket = trimmed.indexOf('[');
+    if (firstBrace === -1 && firstBracket === -1) return null;
+
+    const startIdx = (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace))
+        ? firstBracket : firstBrace;
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let lastValidEnd = -1;
+
+    for (let i = startIdx; i < trimmed.length; i++) {
+        const char = trimmed[i];
+
+        if (escape) { escape = false; continue; }
+        if (char === '\\') { escape = true; continue; }
+        if (char === '"') { inString = !inString; continue; }
+
+        if (!inString) {
+            if (char === '{' || char === '[') {
+                depth++;
+            } else if (char === '}' || char === ']') {
+                depth--;
+                if (depth === 0) {
+                    lastValidEnd = i;
+                }
+            }
+        }
+    }
+
+    if (lastValidEnd !== -1) {
+        return {
+            json: trimmed.substring(startIdx, lastValidEnd + 1),
+            discarded: trimmed.substring(lastValidEnd + 1)
+        };
+    }
+
+    return null;
+}
+
 export type ContentType =
     | { type: 'text'; text: string }
     | { type: 'image'; image: { data: string; mimeType: string } }
@@ -563,8 +705,6 @@ export async function runAgentLoop(
     throw new Error(`Agent exceeded maximum iterations (${maxIterations}). Consider simplifying the task or increasing the limit.`);
 }
 
-// --- SIMPLE INTERACTION (Non-agentic, single turn) ---
-
 export async function createInteraction(
     model: string,
     prompt: string,
@@ -602,18 +742,52 @@ export async function createInteraction(
     }
 
     // Extract text from outputs
-    // Note: Some models (thinking models) might return 'thought' chunks but no final 'text' if they get stuck or hit token limits.
-    // We should handle empty outputs gracefully.
     const outputs = response.outputs || [];
-
-    if (outputs.length === 0) {
-        console.warn("[INTERACTIONS CLIENT] Response contained no outputs (Thinking only or empty).");
-    }
 
     for (const output of outputs) {
         if (output.type === 'text') {
             return output.text;
         }
+    }
+
+    // --- CASE 2 FIX: Empty response (thinking exhaustion) ---
+    // Model returned no text - likely spent all tokens on thinking
+    // Retry once with thinkingLevel disabled and higher token budget
+    if (outputs.length === 0 || !outputs.some((o: any) => o.type === 'text')) {
+        console.warn(`[INTERACTIONS CLIENT] Empty response detected. Retrying with thinking disabled...`);
+
+        // Retry without thinking to maximize output budget
+        const retryRequest: InteractionRequest = {
+            model: MODEL_SIMPLE,  // Use simpler model for reliability
+            input: prompt,
+            system_instruction: options.systemInstruction,
+            response_format: options.responseFormat,
+            response_mime_type: options.responseMimeType,
+            generation_config: {
+                temperature: 0.1,  // Lower temp for deterministic output
+                max_output_tokens: (options.maxOutputTokens || 8192) + 2048,  // More budget
+                thinking_level: undefined  // No thinking
+            }
+        };
+
+        try {
+            const retryResponse = await client.create(retryRequest);
+
+            if (costTracker) {
+                costTracker.addUsage(MODEL_SIMPLE, retryResponse.usage);
+            }
+
+            for (const output of retryResponse.outputs || []) {
+                if (output.type === 'text') {
+                    console.log(`[INTERACTIONS CLIENT] Retry succeeded with ${MODEL_SIMPLE}`);
+                    return output.text;
+                }
+            }
+        } catch (retryErr: any) {
+            console.error(`[INTERACTIONS CLIENT] Retry also failed:`, retryErr.message);
+        }
+
+        console.error(`[INTERACTIONS CLIENT] Both attempts returned empty. Returning empty string for fallback handling.`);
     }
 
     return '';
@@ -644,108 +818,27 @@ export async function createJsonInteraction<T = any>(
         costTracker
     );
 
-    // Robust JSON parsing with truncation repair
+    // --- LAYER 0: Direct Parse ---
     try {
         return JSON.parse(text) as T;
     } catch (err) {
-        console.warn(`[JSON PARSE] Initial parse failed, attempting repair...`);
+        console.warn(`[JSON PARSE] Initial parse failed, classifying failure...`);
         console.warn(`[JSON PARSE] Text length: ${text.length}, Last 100 chars: "${text.slice(-100)}"`);
 
-        // Try to repair truncated JSON by auto-closing brackets
-        let repaired = text.trim();
+        // --- NEW: Classify failure BEFORE attempting repair ---
+        const classification = classifyJsonFailure(text);
+        console.log(`[JSON REPAIR] Classified as: ${classification.type} (${classification.confidence} confidence)`);
 
-        // Find the actual JSON start
-        const firstBrace = repaired.indexOf('{');
-        const firstBracket = repaired.indexOf('[');
-        if (firstBrace === -1 && firstBracket === -1) {
-            throw new Error(`Failed to parse JSON response (no JSON envelope): ${text.substring(0, 200)}`);
-        }
-
-        const startIdx = (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace))
-            ? firstBracket : firstBrace;
-        repaired = repaired.substring(startIdx);
-
-        // ENHANCED: Detect and fix mid-value truncation patterns
-        // Pattern: "la (truncated from "label") or :10 (truncated number)
-        const truncationPatterns: Array<{ pattern: RegExp; replacement: string | ((m: string) => string) }> = [
-            // Truncated key: "la -> remove incomplete key-value pair
-            { pattern: /,\s*"[a-zA-Z]{1,3}$/, replacement: '' },
-            // Truncated after colon: "key": -> add null
-            { pattern: /:\s*$/, replacement: ': null' },
-            // Truncated number: :10 without closing -> keep as-is (valid)
-            { pattern: /:\s*\d+$/, replacement: (m: string) => m },
-            // Truncated string value: "value -> close it
-            { pattern: /:\s*"[^"]*$/, replacement: (m: string) => m + '"' },
-            // Trailing comma before truncation
-            { pattern: /,\s*$/, replacement: '' },
-        ];
-
-        for (const { pattern, replacement } of truncationPatterns) {
-            if (pattern.test(repaired)) {
-                const before = repaired.slice(-50);
-                if (typeof replacement === 'function') {
-                    repaired = repaired.replace(pattern, replacement);
-                } else {
-                    repaired = repaired.replace(pattern, replacement);
-                }
-                console.warn(`[JSON REPAIR] Applied pattern fix: "${before}" → "${repaired.slice(-50)}"`);
-            }
-        }
-
-
-        // Count open brackets and braces to determine what's missing
-        const stack: string[] = [];
-        let inString = false;
-        let escape = false;
-
-        for (let i = 0; i < repaired.length; i++) {
-            const char = repaired[i];
-            if (escape) { escape = false; continue; }
-            if (char === '\\') { escape = true; continue; }
-            if (char === '"') { inString = !inString; continue; }
-
-            if (!inString) {
-                if (char === '{') stack.push('}');
-                else if (char === '[') stack.push(']');
-                else if (char === '}' || char === ']') {
-                    if (stack.length > 0 && stack[stack.length - 1] === char) {
-                        stack.pop();
-                    }
-                }
-            }
-        }
-
-        // If we're in the middle of a string, close it first
-        if (inString) {
-            repaired += '"';
-            console.warn(`[JSON REPAIR] Closed unclosed string`);
-        }
-
-        // Append missing closers
-        if (stack.length > 0) {
-            const closers = stack.reverse().join('');
-            console.warn(`[JSON REPAIR] Truncation detected at: "${repaired.slice(-50)}" → Appending: "${closers}"`);
-            repaired += closers;
-        }
-
-        try {
-            const parsed = JSON.parse(repaired) as T;
-            console.log(`[JSON REPAIR] Success! Repaired JSON preview:`, JSON.stringify(parsed).slice(0, 500));
-            return parsed;
-        } catch (repairErr) {
-            // Log more context for debugging
-            console.error(`[JSON REPAIR] Repair failed. Original length: ${text.length}, Truncated: ${text.length > 1000}`);
-            console.error(`[JSON REPAIR] Last 200 chars after repair: "${repaired.slice(-200)}"`);
-
-            // LAST-DITCH: String-array fallback for pattern like ["item1", "item2", ...]
-            // The LLM sometimes returns flat string arrays instead of object arrays
+        // --- LAYER 1: String array fallback (MOVED EARLY) ---
+        // Check for schema drift BEFORE other repairs to avoid corrupting valid arrays
+        if (classification.type === 'string_array') {
+            console.warn(`[JSON REPAIR] Schema drift detected: flat string array instead of objects`);
             const stringArrayMatch = text.match(/\[\s*("[^"]*"\s*,?\s*)+\]/);
             if (stringArrayMatch) {
                 try {
                     const extractedArray = JSON.parse(stringArrayMatch[0]);
                     if (Array.isArray(extractedArray) && extractedArray.length > 0) {
-                        console.warn(`[JSON REPAIR] Found string array, converting to text-bullets fallback`);
-                        // Return a minimal valid structure that downstream can repair
+                        console.warn(`[JSON REPAIR] Converting string array to text-bullets fallback`);
                         return {
                             layoutPlan: {
                                 title: "Content",
@@ -753,19 +846,191 @@ export async function createJsonInteraction<T = any>(
                                 components: [{
                                     type: "text-bullets",
                                     title: "Key Points",
-                                    content: extractedArray.slice(0, 5) // Limit to 5 items
+                                    content: extractedArray.slice(0, 5)
                                 }]
                             },
-                            speakerNotesLines: [],
+                            speakerNotesLines: ['Generated from extracted content.'],
                             selfCritique: { readabilityScore: 0.6, textDensityStatus: "high", layoutAction: "simplify" }
                         } as T;
                     }
-                } catch { /* ignore extraction failure */ }
+                } catch { /* continue to other repairs */ }
+            }
+        }
+
+        // --- LAYER 2: Prefix Extraction (for garbage_suffix) ---
+        // This directly addresses the `, ""` tail pattern
+        if (classification.type === 'garbage_suffix') {
+            console.log(`[JSON REPAIR] Attempting prefix extraction (garbage suffix detected)...`);
+            const prefixResult = extractLongestValidPrefix(text);
+            if (prefixResult) {
+                console.warn(`[JSON REPAIR] Discarding suffix: "${prefixResult.discarded.slice(0, 50)}..."`);
+                try {
+                    const parsed = JSON.parse(prefixResult.json) as T;
+                    console.log(`[JSON REPAIR] Prefix extraction success!`);
+                    return normalizeJsonOutput(parsed);
+                } catch {
+                    console.warn(`[JSON REPAIR] Prefix extraction parse failed, continuing to truncation repair...`);
+                }
+            }
+        }
+
+        // --- LAYER 3: Truncation Repair (for true truncation) ---
+        if (classification.type === 'truncation' || classification.type === 'unknown') {
+            console.log(`[JSON REPAIR] Attempting truncation repair...`);
+
+            let repaired = text.trim();
+            const firstBrace = repaired.indexOf('{');
+            const firstBracket = repaired.indexOf('[');
+            if (firstBrace === -1 && firstBracket === -1) {
+                throw new Error(`Failed to parse JSON response (no JSON envelope): ${text.substring(0, 200)}`);
             }
 
-            throw new Error(`Failed to parse JSON response: ${text.substring(0, 200)}`);
+            const startIdx = (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace))
+                ? firstBracket : firstBrace;
+            repaired = repaired.substring(startIdx);
+
+            // Pattern-based truncation fixes
+            const truncationPatterns: Array<{ pattern: RegExp; replacement: string | ((m: string) => string) }> = [
+                { pattern: /,\s*\{\s*"[^"]+"\s*:\s*"[^"]*"?\s*$/, replacement: '' },
+                { pattern: /,\s*"[a-zA-Z]{1,3}$/, replacement: '' },
+                { pattern: /,\s*"[^"]+"\s*:\s*"[^"]*$/, replacement: '' },
+                { pattern: /:\s*$/, replacement: ': null' },
+                { pattern: /:\s*\d+$/, replacement: (m: string) => m },
+                { pattern: /:\s*"[^"]*$/, replacement: (m: string) => m + '"' },
+                { pattern: /,\s*$/, replacement: '' },
+                { pattern: /,?\s*\{\s*$/, replacement: '' },
+            ];
+
+            for (const { pattern, replacement } of truncationPatterns) {
+                if (pattern.test(repaired)) {
+                    if (typeof replacement === 'function') {
+                        repaired = repaired.replace(pattern, replacement);
+                    } else {
+                        repaired = repaired.replace(pattern, replacement);
+                    }
+                }
+            }
+
+            // Count brackets and auto-close
+            const stack: string[] = [];
+            let inString = false;
+            let escape = false;
+
+            for (let i = 0; i < repaired.length; i++) {
+                const char = repaired[i];
+                if (escape) { escape = false; continue; }
+                if (char === '\\') { escape = true; continue; }
+                if (char === '"') { inString = !inString; continue; }
+
+                if (!inString) {
+                    if (char === '{') stack.push('}');
+                    else if (char === '[') stack.push(']');
+                    else if (char === '}' || char === ']') {
+                        if (stack.length > 0 && stack[stack.length - 1] === char) {
+                            stack.pop();
+                        }
+                    }
+                }
+            }
+
+            if (inString) {
+                repaired += '"';
+                console.warn(`[JSON REPAIR] Closed unclosed string`);
+            }
+
+            if (stack.length > 0) {
+                const closers = stack.reverse().join('');
+                console.warn(`[JSON REPAIR] Appending closers: "${closers}"`);
+                repaired += closers;
+            }
+
+            try {
+                const parsed = JSON.parse(repaired) as T;
+                console.log(`[JSON REPAIR] Truncation repair success!`);
+                return normalizeJsonOutput(parsed);
+            } catch (truncationErr) {
+                console.warn(`[JSON REPAIR] Truncation repair failed, trying semantic cleanup...`);
+            }
+
+            // --- LAYER 4: Semantic Cleanup ---
+            try {
+                let semanticRepair = repaired
+                    .replace(/,\s*""\s*}/g, '}')
+                    .replace(/,?\s*""\s*\]/g, ']')
+                    .replace(/,\s*""(\s*[}\]])/g, '$1')
+                    .replace(/,\s*,/g, ',')
+                    .replace(/,\s*}/g, '}')
+                    .replace(/,\s*\]/g, ']');
+
+                const semanticParsed = JSON.parse(semanticRepair);
+                console.log(`[JSON REPAIR] Semantic repair success!`);
+                return normalizeJsonOutput(semanticParsed);
+            } catch (semanticErr) {
+                console.warn(`[JSON REPAIR] Semantic repair also failed`);
+            }
+        }
+
+        // --- LAYER 5: Model-based Repairer (Escalation) ---
+        // As a last resort, use MODEL_SIMPLE with JSON_REPAIRER prompt
+        console.warn(`[JSON REPAIR] All heuristic repairs failed. Escalating to model repairer...`);
+        try {
+            const { runJsonRepair } = await import('./geminiService');
+            const repairedByModel = await runJsonRepair(text, schema, costTracker as any);
+            if (repairedByModel) {
+                console.log(`[JSON REPAIR] Model repairer success!`);
+                return normalizeJsonOutput(repairedByModel);
+            }
+        } catch (modelRepairErr: any) {
+            console.error(`[JSON REPAIR] Model repairer failed:`, modelRepairErr.message);
+        }
+
+        throw new Error(`Failed to parse JSON response after all repair attempts: ${text.substring(0, 200)}`);
+    }
+}
+
+/**
+ * Normalize JSON output with common field fixes.
+ * Applied after successful parse to ensure field consistency.
+ */
+function normalizeJsonOutput<T>(parsed: any): T {
+    if (parsed && typeof parsed === 'object') {
+        // Fix selfCritique if malformed
+        if (parsed.selfCritique) {
+            if (typeof parsed.selfCritique === 'string') {
+                parsed.selfCritique = {
+                    layoutAction: 'keep',
+                    readabilityScore: 0.8,
+                    textDensityStatus: 'optimal'
+                };
+            } else if (typeof parsed.selfCritique === 'object') {
+                parsed.selfCritique.layoutAction = parsed.selfCritique.layoutAction || 'keep';
+                parsed.selfCritique.readabilityScore =
+                    typeof parsed.selfCritique.readabilityScore === 'number'
+                        ? parsed.selfCritique.readabilityScore
+                        : 0.8;
+                parsed.selfCritique.textDensityStatus =
+                    parsed.selfCritique.textDensityStatus || 'optimal';
+            }
+        }
+
+        // Fix speakerNotesLines if missing or contains garbage
+        if (!parsed.speakerNotesLines ||
+            !Array.isArray(parsed.speakerNotesLines) ||
+            parsed.speakerNotesLines.some((n: any) => n === '')) {
+            // Filter garbage if array exists, otherwise create default
+            if (Array.isArray(parsed.speakerNotesLines)) {
+                parsed.speakerNotesLines = parsed.speakerNotesLines.filter(
+                    (line: any) => typeof line === 'string' && line.trim().length > 0
+                );
+                if (parsed.speakerNotesLines.length === 0) {
+                    parsed.speakerNotesLines = ['Generated slide.'];
+                }
+            } else {
+                parsed.speakerNotesLines = ['Generated slide.'];
+            }
         }
     }
+    return parsed as T;
 }
 
 // --- EXPORT DEFAULT CLIENT ---
