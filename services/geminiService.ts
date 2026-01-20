@@ -1,10 +1,52 @@
-
+/**
+ * Gemini Service - Legacy compatibility layer
+ * 
+ * This module now re-exports from the new Interactions API client.
+ * New code should import directly from:
+ * - `./interactionsClient` for Interactions API functionality
+ * - `./slideAgentService` for agent functions
+ * 
+ * @see https://ai.google.dev/api/interactions-api.md.txt
+ */
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { PROMPTS } from "./promptRegistry";
 
+// Re-export Interactions API types for compatibility
+export {
+  InteractionsClient,
+  CostTracker,
+  AgentLogger,
+  runAgentLoop,
+  createInteraction,
+  createJsonInteraction,
+  type InteractionStatus,
+  type InteractionRequest,
+  type InteractionResponse,
+  type Tool,
+  type ToolDefinition,
+  type ThinkingLevel
+} from "./interactionsClient";
+
+// Re-export generateImageFromPrompt from slideAgentService for backward compatibility
+export { generateImageFromPrompt } from "./slideAgentService";
+
 // Helper to create client instance
-const getAiClient = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
+const getAiClient = () => {
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) {
+    const errorMsg = `[GEMINI SERVICE ERROR] API_KEY is not configured.
+
+To fix this:
+1. Create a .env file in the project root
+2. Add: GEMINI_API_KEY=your_api_key_here
+3. Get your key from: https://aistudio.google.com/app/apikey
+4. Restart the dev server`;
+    console.error(errorMsg);
+    throw new Error('API_KEY is required. Check console for setup instructions.');
+  }
+  return new GoogleGenAI({ apiKey });
+};
 
 // --- PROMPT STRATEGIES ---
 
@@ -26,9 +68,9 @@ export interface GeneratedImageResult {
 
 interface ContentPagePlan {
   title: string;
-  content: string; 
-  visualConcept: string; 
-  visualPromptSuggestion: string; 
+  content: string;
+  visualConcept: string;
+  visualPromptSuggestion: string;
   requiresSearch: boolean;
 }
 
@@ -39,8 +81,9 @@ interface GenerationPlan {
 
 export type GenerationMode = 'infographic' | 'presentation' | 'visual-asset' | 'vector-svg' | 'sticker';
 
-const MODEL_SMART = "gemini-3-pro-preview"; 
-const MODEL_FAST = "gemini-3-flash-preview"; 
+const MODEL_SMART = "gemini-3-pro-preview";
+const MODEL_FAST = "gemini-3-flash-preview";
+const MODEL_SIMPLE = "gemini-2.5-flash"; // Added for simple/pattern-matching tasks
 const MODEL_BACKUP = "gemini-2.0-flash";
 const MODEL_LITE = "gemini-2.0-flash-lite-preview-02-05";
 
@@ -60,7 +103,7 @@ const PRICING = {
 
 export class TokenTracker {
   totalCost = 0;
-  
+
   addTokenUsage(model: string, inputTokens: number, outputTokens: number) {
     const rates = PRICING.TOKENS[model as keyof typeof PRICING.TOKENS] || { input: 0, output: 0 };
     const cost = (inputTokens / 1_000_000 * rates.input) + (outputTokens / 1_000_000 * rates.output);
@@ -68,8 +111,8 @@ export class TokenTracker {
   }
 
   addImageCost(model: string) {
-      const cost = PRICING.IMAGES[model as keyof typeof PRICING.IMAGES] || 0.134; 
-      this.totalCost += cost;
+    const cost = PRICING.IMAGES[model as keyof typeof PRICING.IMAGES] || 0.134;
+    this.totalCost += cost;
   }
 }
 
@@ -85,55 +128,55 @@ export class JsonParseError extends Error {
 
 // Helper: robustly extract JSON text from a larger string
 function extractJsonBlock(text: string): string {
-    const match = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/);
-    if (match && match[1]) return match[1].trim();
-    return text.trim();
+  const match = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/);
+  if (match && match[1]) return match[1].trim();
+  return text.trim();
 }
 
 // Robust JSON Repair with Decode Ladder & Auto-Closer
 export function cleanAndParseJson(text: string): any {
   if (!text) throw new JsonParseError('EMPTY', '', "Empty response received.");
-  
+
   // 0. SAFETY: Detect Repetition Loop Hallucination immediately
   // Matches any word (4+ chars) repeated 25+ times with spaces/punctuation
   const repetitionRegex = /(\b\w{4,}\b)(?:[\s,."]*\1){25,}/;
   if (repetitionRegex.test(text)) {
-     throw new JsonParseError('REPETITION', text, "Detected repetition loop hallucination.");
+    throw new JsonParseError('REPETITION', text, "Detected repetition loop hallucination.");
   }
 
   // CIRCUIT BREAKER LOGIC
   if (text.length > 200000) {
-      console.warn(`[JSON SAFETY] Output extremely large (${text.length} chars).`);
+    console.warn(`[JSON SAFETY] Output extremely large (${text.length} chars).`);
   }
 
   let cleaned = extractJsonBlock(text);
-  
+
   // 1. Find Boundaries (Start { or [ and End } or ])
   const firstBrace = cleaned.indexOf('{');
   const firstBracket = cleaned.indexOf('[');
-  
+
   if (firstBrace === -1 && firstBracket === -1) {
-       throw new JsonParseError('MALFORMED', text.substring(0, 1000), "No JSON envelope found.");
+    throw new JsonParseError('MALFORMED', text.substring(0, 1000), "No JSON envelope found.");
   }
 
   // Determine start index
   let startIdx = -1;
   if (firstBracket !== -1 && (firstBrace === -1 || firstBracket < firstBrace)) {
-      startIdx = firstBracket;
+    startIdx = firstBracket;
   } else {
-      startIdx = firstBrace;
+    startIdx = firstBrace;
   }
 
   // Determine end index
   const isArray = cleaned[startIdx] === '[';
   const endChar = isArray ? ']' : '}';
   const lastIdx = cleaned.lastIndexOf(endChar);
-  
+
   // Slice correctly
   if (lastIdx === -1 || lastIdx <= startIdx) {
-      cleaned = cleaned.substring(startIdx); // Truncated, take all we have
+    cleaned = cleaned.substring(startIdx); // Truncated, take all we have
   } else {
-      cleaned = cleaned.substring(startIdx, lastIdx + 1);
+    cleaned = cleaned.substring(startIdx, lastIdx + 1);
   }
 
   // 2. Try Standard Parse First
@@ -149,27 +192,27 @@ export function cleanAndParseJson(text: string): any {
   let escape = false;
 
   for (let i = 0; i < cleaned.length; i++) {
-      const char = cleaned[i];
-      if (escape) { escape = false; continue; }
-      if (char === '\\') { escape = true; continue; }
-      if (char === '"') { inString = !inString; continue; }
-      
-      if (!inString) {
-          if (char === '{') stack.push('}');
-          else if (char === '[') stack.push(']');
-          else if (char === '}' || char === ']') {
-              if (stack.length > 0 && stack[stack.length - 1] === char) {
-                  stack.pop();
-              }
-          }
+    const char = cleaned[i];
+    if (escape) { escape = false; continue; }
+    if (char === '\\') { escape = true; continue; }
+    if (char === '"') { inString = !inString; continue; }
+
+    if (!inString) {
+      if (char === '{') stack.push('}');
+      else if (char === '[') stack.push(']');
+      else if (char === '}' || char === ']') {
+        if (stack.length > 0 && stack[stack.length - 1] === char) {
+          stack.pop();
+        }
       }
+    }
   }
 
   // Append missing closers in reverse order
   if (stack.length > 0) {
-      const closers = stack.reverse().join('');
-      console.warn(`[JSON REPAIR] Detected truncation. Appending: "${closers}"`);
-      cleaned += closers;
+    const closers = stack.reverse().join('');
+    console.warn(`[JSON REPAIR] Detected truncation. Appending: "${closers}"`);
+    cleaned += closers;
   }
 
   // 4. THE DECODE LADDER (Attempt to parse the Auto-Closed string)
@@ -177,16 +220,16 @@ export function cleanAndParseJson(text: string): any {
     return JSON.parse(cleaned);
   } catch (e1) {
     try {
-        const noNewLines = cleaned.replace(/(?<!\\)\n/g, "\\n");
-        return JSON.parse(noNewLines);
+      const noNewLines = cleaned.replace(/(?<!\\)\n/g, "\\n");
+      return JSON.parse(noNewLines);
     } catch (e2) { }
 
     if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
-        try {
-            const firstLayer = JSON.parse(cleaned);
-            if (typeof firstLayer === 'string') return JSON.parse(firstLayer);
-            return firstLayer;
-        } catch (e4) { }
+      try {
+        const firstLayer = JSON.parse(cleaned);
+        if (typeof firstLayer === 'string') return JSON.parse(firstLayer);
+        return firstLayer;
+      } catch (e4) { }
     }
 
     const isTruncated = stack.length > 0;
@@ -196,199 +239,199 @@ export function cleanAndParseJson(text: string): any {
 
 // Fallback Chain Configuration
 const FALLBACK_CHAIN: Record<string, string> = {
-    [MODEL_SMART]: MODEL_FAST,
-    [MODEL_FAST]: MODEL_BACKUP,
-    [MODEL_BACKUP]: MODEL_LITE
+  [MODEL_SMART]: MODEL_FAST,
+  [MODEL_FAST]: MODEL_BACKUP,
+  [MODEL_BACKUP]: MODEL_LITE
 };
 
 // CIRCUIT BREAKER STATE
 const CIRCUIT_BREAKER: Record<string, { failures: number, cooldownUntil: number, threshold: number, duration: number }> = {
-    [MODEL_SMART]: { failures: 0, cooldownUntil: 0, threshold: 2, duration: 60000 } // 60s cooldown for Pro
+  [MODEL_SMART]: { failures: 0, cooldownUntil: 0, threshold: 2, duration: 60000 } // 60s cooldown for Pro
 };
 
 function getHealthyModel(requestedModel: string): string {
-    const breaker = CIRCUIT_BREAKER[requestedModel];
-    if (breaker && Date.now() < breaker.cooldownUntil) {
-        console.warn(`[CIRCUIT BREAKER] ${requestedModel} is cooling down. Downgrading to ${MODEL_FAST}.`);
-        return MODEL_FAST; 
-    }
-    return requestedModel;
+  const breaker = CIRCUIT_BREAKER[requestedModel];
+  if (breaker && Date.now() < breaker.cooldownUntil) {
+    console.warn(`[CIRCUIT BREAKER] ${requestedModel} is cooling down. Downgrading to ${MODEL_FAST}.`);
+    return MODEL_FAST;
+  }
+  return requestedModel;
 }
 
 function reportFailure(model: string, isQuota: boolean) {
-    const breaker = CIRCUIT_BREAKER[model];
-    if (breaker && isQuota) {
-        breaker.failures++;
-        if (breaker.failures >= breaker.threshold) {
-            breaker.cooldownUntil = Date.now() + breaker.duration;
-            breaker.failures = 0; // Reset
-            console.error(`[CIRCUIT BREAKER] ${model} TRIPPED. Downgrading to ${MODEL_FAST} for ${breaker.duration/1000}s.`);
-        }
+  const breaker = CIRCUIT_BREAKER[model];
+  if (breaker && isQuota) {
+    breaker.failures++;
+    if (breaker.failures >= breaker.threshold) {
+      breaker.cooldownUntil = Date.now() + breaker.duration;
+      breaker.failures = 0; // Reset
+      console.error(`[CIRCUIT BREAKER] ${model} TRIPPED. Downgrading to ${MODEL_FAST} for ${breaker.duration / 1000}s.`);
     }
+  }
 }
 
 export async function runJsonRepair(brokenJson: string, schema: any, tracker?: TokenTracker): Promise<any> {
-    try {
-        console.log("[JSON REPAIR] Attempting agentic repair with SMART model...");
-        const safeInput = brokenJson.length > 15000 ? brokenJson.substring(0, 15000) + "...(truncated)" : brokenJson;
-        
-        // Use MODEL_SMART (Pro) for repair because repairing broken JSON requires high reasoning.
-        // We set a high token limit to ensure the repaired JSON isn't truncated again.
-        return await callAI(
-            MODEL_SMART,
-            PROMPTS.JSON_REPAIRER.TASK(safeInput),
-            { mode: 'json', schema: schema, config: { temperature: 0.1, maxOutputTokens: 8192 } },
-            tracker
-        );
-    } catch (e) {
-        console.error("[JSON REPAIR] Repair failed.", e);
-        throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Agent repair failed.");
-    }
+  try {
+    // JSON Repair: Pattern matching task → MODEL_SIMPLE (2.5 Flash)
+    // 95% cheaper than Pro, sufficient for structural repair (not deep synthesis)
+    console.log("[JSON REPAIR] Attempting repair with 2.5 Flash...");
+    const safeInput = brokenJson.length > 15000 ? brokenJson.substring(0, 15000) + "...(truncated)" : brokenJson;
+
+    return await callAI(
+      MODEL_SIMPLE,
+      PROMPTS.JSON_REPAIRER.TASK(safeInput),
+      { mode: 'json', schema: schema, config: { temperature: 0.0, maxOutputTokens: 8192 } }, // temp=0 for deterministic repair
+      tracker
+    );
+  } catch (e) {
+    console.error("[JSON REPAIR] Repair failed.", e);
+    throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Agent repair failed.");
+  }
 }
 
 interface CallAIOptions {
-    mode: 'json' | 'text';
-    config?: any;
-    schema?: any; // The JSON Schema object
-    systemInstruction?: string;
+  mode: 'json' | 'text';
+  config?: any;
+  schema?: any; // The JSON Schema object
+  systemInstruction?: string;
 }
 
 export async function callAI(
-    model: string, 
-    prompt: string, 
-    options: CallAIOptions,
-    tracker?: TokenTracker, 
-    retryCount = 0
+  model: string,
+  prompt: string,
+  options: CallAIOptions,
+  tracker?: TokenTracker,
+  retryCount = 0
 ): Promise<any> {
-    const MAX_RETRIES_SAME_MODEL = 2; 
+  const MAX_RETRIES_SAME_MODEL = 2;
 
-    // 1. Check Circuit Breaker
-    const effectiveModel = getHealthyModel(model);
-    
-    // Adjust config if downgraded
-    const effectiveConfig = { ...options.config };
-    if (effectiveModel !== model) {
-        if (effectiveModel === MODEL_FAST || effectiveModel === MODEL_BACKUP) {
-            // Remove thinking config if downgraded to a model that might not support it well or to save cost
-             if (effectiveConfig.thinkingConfig) delete effectiveConfig.thinkingConfig;
-        }
+  // 1. Check Circuit Breaker
+  const effectiveModel = getHealthyModel(model);
+
+  // Adjust config if downgraded
+  const effectiveConfig = { ...options.config };
+  if (effectiveModel !== model) {
+    if (effectiveModel === MODEL_FAST || effectiveModel === MODEL_BACKUP) {
+      // Remove thinking config if downgraded to a model that might not support it well or to save cost
+      if (effectiveConfig.thinkingConfig) delete effectiveConfig.thinkingConfig;
+    }
+  }
+
+  try {
+    const client = getAiClient();
+
+    // --- PREPARE GENERATE CONTENT REQUEST ---
+    const config: any = {};
+
+    // System Instruction
+    if (options.systemInstruction) {
+      config.systemInstruction = options.systemInstruction;
     }
 
-    try {
-        const client = getAiClient();
-        
-        // --- PREPARE GENERATE CONTENT REQUEST ---
-        const config: any = {};
-        
-        // System Instruction
-        if (options.systemInstruction) {
-            config.systemInstruction = options.systemInstruction;
-        }
-
-        // Response Format
-        if (options.mode === 'json') {
-            config.responseMimeType = "application/json";
-            if (options.schema) {
-                config.responseSchema = options.schema;
-            }
-        }
-
-        // Tools
-        if (effectiveConfig.tools) {
-            config.tools = effectiveConfig.tools;
-        }
-
-        // Map Standard Configs
-        if (effectiveConfig.temperature !== undefined) config.temperature = effectiveConfig.temperature;
-        if (effectiveConfig.topP !== undefined) config.topP = effectiveConfig.topP;
-        if (effectiveConfig.maxOutputTokens !== undefined) config.maxOutputTokens = effectiveConfig.maxOutputTokens;
-        if (effectiveConfig.seed !== undefined) config.seed = effectiveConfig.seed;
-
-        // Map Thinking Config
-        if (effectiveConfig.thinkingConfig) {
-            // Only add Thinking Config for supported models
-            if (effectiveModel.includes('gemini-3') || effectiveModel.includes('gemini-2.5')) {
-                 config.thinkingConfig = effectiveConfig.thinkingConfig;
-            }
-        }
-
-        const req = {
-            model: effectiveModel,
-            contents: prompt,
-            config: config
-        };
-        
-        // Timeout wrapper to prevent hanging indefinitely
-        const generatePromise = client.models.generateContent(req);
-        
-        // 180s timeout (increased for Thinking models which can take time)
-        const timeoutPromise = new Promise((_, reject) => 
-            setTimeout(() => reject(new Error(`Timeout: ${effectiveModel} took too long to respond.`)), 180000)
-        );
-
-        const response: any = await Promise.race([generatePromise, timeoutPromise]);
-
-        if (tracker && response.usageMetadata) {
-            tracker.addTokenUsage(effectiveModel, response.usageMetadata.promptTokenCount || 0, response.usageMetadata.candidatesTokenCount || 0);
-        }
-        
-        const rawText = response.text || "";
-
-        if (options.mode === 'json') {
-             return cleanAndParseJson(rawText || "{}");
-        } else {
-             return rawText;
-        }
-
-    } catch (e: any) {
-        if (e instanceof JsonParseError) {
-             throw e;
-        }
-
-        const errorMessage = e.message || '';
-        const status = e.status;
-        
-        const isQuota = status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
-        const isOverloaded = status === 503 || errorMessage.includes('503') || errorMessage.includes('Overloaded');
-        const isTimeout = status === 499 || errorMessage.includes('cancelled') || errorMessage.includes('timeout') || errorMessage.includes('The operation was cancelled');
-
-        if (effectiveModel === model) {
-            reportFailure(model, isQuota || isOverloaded || isTimeout);
-        }
-
-        if ((isQuota || isOverloaded || isTimeout) && retryCount < MAX_RETRIES_SAME_MODEL) {
-            const delay = Math.pow(2, retryCount + 1) * 1000 + Math.random() * 500; 
-            console.warn(`[AI SERVICE WARN] ${effectiveModel} failed (${status || 'timeout'}). Retrying in ${Math.round(delay)}ms (Attempt ${retryCount + 1})...`);
-            await new Promise(resolve => setTimeout(resolve, delay));
-            return callAI(effectiveModel, prompt, options, tracker, retryCount + 1);
-        }
-
-        // FALLBACK LOGIC
-        const nextModel = FALLBACK_CHAIN[effectiveModel];
-
-        if ((isQuota || isOverloaded || isTimeout) && nextModel) {
-            console.warn(`[AI SERVICE WARN] Exhausted retries for ${effectiveModel}. Falling back to ${nextModel}.`);
-            
-            const newConfig = { ...effectiveConfig };
-            // Strip thinking for basic models
-            if ((nextModel === MODEL_BACKUP || nextModel === MODEL_LITE)) {
-                 if (newConfig.thinkingConfig) delete newConfig.thinkingConfig;
-            }
-            if (nextModel === MODEL_FAST || nextModel === MODEL_BACKUP) {
-                newConfig.temperature = 0.1;
-                newConfig.topP = 0.8; 
-            }
-
-            return callAI(nextModel, prompt, { ...options, config: newConfig }, tracker, 0); 
-        }
-
-        if (isOverloaded) {
-            throw new Error("Service Unavailable (503). All models overloaded. Please try again later.");
-        }
-        
-        console.error(`[AI SERVICE ERROR] Call Failed on ${effectiveModel}`, e);
-        throw new Error(`AI Call Failed: ${errorMessage}`);
+    // Response Format
+    if (options.mode === 'json') {
+      config.responseMimeType = "application/json";
+      if (options.schema) {
+        config.responseSchema = options.schema;
+      }
     }
+
+    // Tools
+    if (effectiveConfig.tools) {
+      config.tools = effectiveConfig.tools;
+    }
+
+    // Map Standard Configs
+    if (effectiveConfig.temperature !== undefined) config.temperature = effectiveConfig.temperature;
+    if (effectiveConfig.topP !== undefined) config.topP = effectiveConfig.topP;
+    if (effectiveConfig.maxOutputTokens !== undefined) config.maxOutputTokens = effectiveConfig.maxOutputTokens;
+    if (effectiveConfig.seed !== undefined) config.seed = effectiveConfig.seed;
+
+    // Map Thinking Config
+    if (effectiveConfig.thinkingConfig) {
+      // Only add Thinking Config for supported models
+      if (effectiveModel.includes('gemini-3') || effectiveModel.includes('gemini-2.5')) {
+        config.thinkingConfig = effectiveConfig.thinkingConfig;
+      }
+    }
+
+    const req = {
+      model: effectiveModel,
+      contents: prompt,
+      config: config
+    };
+
+    // Timeout wrapper to prevent hanging indefinitely
+    const generatePromise = client.models.generateContent(req);
+
+    // 180s timeout (increased for Thinking models which can take time)
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout: ${effectiveModel} took too long to respond.`)), 180000)
+    );
+
+    const response: any = await Promise.race([generatePromise, timeoutPromise]);
+
+    if (tracker && response.usageMetadata) {
+      tracker.addTokenUsage(effectiveModel, response.usageMetadata.promptTokenCount || 0, response.usageMetadata.candidatesTokenCount || 0);
+    }
+
+    const rawText = response.text || "";
+
+    if (options.mode === 'json') {
+      return cleanAndParseJson(rawText || "{}");
+    } else {
+      return rawText;
+    }
+
+  } catch (e: any) {
+    if (e instanceof JsonParseError) {
+      throw e;
+    }
+
+    const errorMessage = e.message || '';
+    const status = e.status;
+
+    const isQuota = status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
+    const isOverloaded = status === 503 || errorMessage.includes('503') || errorMessage.includes('Overloaded');
+    const isTimeout = status === 499 || errorMessage.includes('cancelled') || errorMessage.includes('timeout') || errorMessage.includes('The operation was cancelled');
+
+    if (effectiveModel === model) {
+      reportFailure(model, isQuota || isOverloaded || isTimeout);
+    }
+
+    if ((isQuota || isOverloaded || isTimeout) && retryCount < MAX_RETRIES_SAME_MODEL) {
+      const delay = Math.pow(2, retryCount + 1) * 1000 + Math.random() * 500;
+      console.warn(`[AI SERVICE WARN] ${effectiveModel} failed (${status || 'timeout'}). Retrying in ${Math.round(delay)}ms (Attempt ${retryCount + 1})...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return callAI(effectiveModel, prompt, options, tracker, retryCount + 1);
+    }
+
+    // FALLBACK LOGIC
+    const nextModel = FALLBACK_CHAIN[effectiveModel];
+
+    if ((isQuota || isOverloaded || isTimeout) && nextModel) {
+      console.warn(`[AI SERVICE WARN] Exhausted retries for ${effectiveModel}. Falling back to ${nextModel}.`);
+
+      const newConfig = { ...effectiveConfig };
+      // Strip thinking for basic models
+      if ((nextModel === MODEL_BACKUP || nextModel === MODEL_LITE)) {
+        if (newConfig.thinkingConfig) delete newConfig.thinkingConfig;
+      }
+      if (nextModel === MODEL_FAST || nextModel === MODEL_BACKUP) {
+        newConfig.temperature = 0.1;
+        newConfig.topP = 0.8;
+      }
+
+      return callAI(nextModel, prompt, { ...options, config: newConfig }, tracker, 0);
+    }
+
+    if (isOverloaded) {
+      throw new Error("Service Unavailable (503). All models overloaded. Please try again later.");
+    }
+
+    console.error(`[AI SERVICE ERROR] Call Failed on ${effectiveModel}`, e);
+    throw new Error(`AI Call Failed: ${errorMessage}`);
+  }
 }
 
 
@@ -397,23 +440,23 @@ export async function callAI(
 // Robust JSON Extractor
 const extractJson = (text: string): string => {
   if (!text) return "{}";
-  
+
   let content = text;
-  
+
   // 1. Try to extract from markdown code block first
   const jsonBlockMatch = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (jsonBlockMatch && jsonBlockMatch[1]) {
-    content = jsonBlockMatch[1]; 
+    content = jsonBlockMatch[1];
   }
 
   // 2. Find the first '{' and the last '}'
   const firstBrace = content.indexOf('{');
   const lastBrace = content.lastIndexOf('}');
-  
+
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
     return content.substring(firstBrace, lastBrace + 1);
   }
-  
+
   // If we cannot find a valid JSON envelope, return empty object.
   return "{}";
 };
@@ -421,14 +464,14 @@ const extractJson = (text: string): string => {
 // SVG Extractor
 const extractSvg = (text: string): string => {
   if (!text) return "";
-  
+
   const firstTag = text.indexOf('<svg');
   const lastTag = text.lastIndexOf('</svg>');
-  
+
   if (firstTag !== -1 && lastTag !== -1) {
     return text.substring(firstTag, lastTag + 6);
   }
-  
+
   // Fallback
   return text.replace(/```(?:xml|svg)?/g, "").trim();
 };
@@ -448,26 +491,26 @@ const removeWhiteBackground = (base64Data: string): Promise<string> => {
         resolve(base64Data);
         return;
       }
-      
+
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const data = imageData.data;
-      
+
       // Threshold for "White" (0-255)
       // Since we prompt for "pure white", we can be aggressive.
-      const threshold = 240; 
-      
+      const threshold = 240;
+
       for (let i = 0; i < data.length; i += 4) {
         const r = data[i];
         const g = data[i + 1];
         const b = data[i + 2];
-        
+
         // If pixel is significantly white
         if (r > threshold && g > threshold && b > threshold) {
-           data[i + 3] = 0; // Set Alpha to 0 (Transparent)
+          data[i + 3] = 0; // Set Alpha to 0 (Transparent)
         }
       }
-      
+
       ctx.putImageData(imageData, 0, 0);
       resolve(canvas.toDataURL('image/png'));
     };
@@ -481,23 +524,23 @@ const removeWhiteBackground = (base64Data: string): Promise<string> => {
 
 // Retry utility for transient errors
 const callWithRetry = async <T>(
-  operation: () => Promise<T>, 
+  operation: () => Promise<T>,
   onRetry: (attempt: number, delayMs: number) => void
 ): Promise<T> => {
   const MAX_RETRIES = 3;
   let lastError: any;
-  
+
   for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
     try {
       return await operation();
     } catch (err: any) {
       lastError = err;
       // Check for transient errors
-      const isTransient = 
-        err.status === 503 || 
-        err.status === 429 || 
+      const isTransient =
+        err.status === 503 ||
+        err.status === 429 ||
         (err.message && err.message.toLowerCase().includes('overloaded'));
-      
+
       if (attempt <= MAX_RETRIES && isTransient) {
         // Exponential backoff: 2s, 4s, 8s
         const delayMs = 2000 * Math.pow(2, attempt - 1);
@@ -511,57 +554,9 @@ const callWithRetry = async <T>(
   throw lastError;
 };
 
-// --- SINGLE IMAGE GENERATOR (EXPORTED FOR AGENTIC BUILDER) ---
-// Note: Keeping models.generateContent for images as Interactions API image config support is experimental/sparse.
-export const generateImageFromPrompt = async (
-  prompt: string,
-  aspectRatio: string = "16:9"
-): Promise<{ imageUrl: string, model: string } | null> => {
-  const ai = getAiClient();
-  const models = ['gemini-3-pro-image-preview', 'gemini-2.5-flash-image'];
 
-  // Enrich prompt to ensure high quality background for slides
-  const richPrompt = `
-  SUBJECT: ${prompt}
-  CONTEXT: Professional Presentation Slide Background.
-  STYLE: High-fidelity, cinematic lighting, corporate aesthetic.
-  CONSTRAINT: Ensure substantial negative space or low contrast areas for overlay text. 
-  NEGATIVE: ${NEGATIVE_PROMPT_INFO}
-  `;
-
-  for (const modelName of models) {
-      try {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: { parts: [{ text: richPrompt }] },
-          config: {
-            imageConfig: { aspectRatio },
-            responseModalities: [Modality.IMAGE]
-          }
-        });
-
-        if (response.candidates?.[0]?.content?.parts) {
-            for (const part of response.candidates[0].content.parts) {
-                if (part.inlineData?.data) {
-                    return {
-                      imageUrl: `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`,
-                      model: modelName
-                    };
-                }
-            }
-        }
-      } catch (e: any) {
-          const isQuota = e.status === 429 || (e.message && (e.message.includes('429') || e.message.includes('quota')));
-          if (isQuota && modelName !== models[models.length - 1]) {
-             console.warn(`Quota exceeded for ${modelName}, switching to ${models[models.indexOf(modelName)+1]}`);
-             continue; 
-          }
-          console.error(`Failed to generate single image with ${modelName}`, e);
-          if (modelName === models[models.length - 1]) return null;
-      }
-  }
-  return null;
-};
+// NOTE: generateImageFromPrompt has been moved to slideAgentService.ts
+// and is re-exported from the top of this file for backward compatibility.
 
 
 // --- RLM CORE: THE ROOT ARCHITECT ---
@@ -569,15 +564,15 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
   const ai = getAiClient();
 
   // Truncate input to avoid huge contexts that might cause response truncation
-  const safeMarkdown = markdown.length > MAX_INPUT_CHARS 
+  const safeMarkdown = markdown.length > MAX_INPUT_CHARS
     ? markdown.substring(0, MAX_INPUT_CHARS) + "\n...(truncated source)..."
     : markdown;
 
   const generatePlanWithModel = async (modelName: string, enableThinking: boolean) => {
-    
+
     // RLM STRATEGY: HIERARCHICAL PROMPTING (Using System Instructions)
     let systemInstruction = "";
-    
+
     const baseRole = `You are a world-class Visual Information Architect.`;
 
     if (mode === 'presentation') {
@@ -645,34 +640,34 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
       OUTPUT FORMAT:
       Return a JSON object conforming to the schema, containing 'globalVisualStyle' and a list of 'slides'.
     `;
-    
+
     const responseFormat = {
-        type: Type.OBJECT,
-        properties: {
-          globalVisualStyle: { type: Type.STRING },
-          slides: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                content: { type: Type.STRING },
-                visualConcept: { type: Type.STRING },
-                visualPromptSuggestion: { type: Type.STRING },
-                requiresSearch: { type: Type.BOOLEAN }
-              },
-              required: ["title", "content", "visualConcept", "visualPromptSuggestion", "requiresSearch"]
-            }
+      type: Type.OBJECT,
+      properties: {
+        globalVisualStyle: { type: Type.STRING },
+        slides: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              title: { type: Type.STRING },
+              content: { type: Type.STRING },
+              visualConcept: { type: Type.STRING },
+              visualPromptSuggestion: { type: Type.STRING },
+              requiresSearch: { type: Type.BOOLEAN }
+            },
+            required: ["title", "content", "visualConcept", "visualPromptSuggestion", "requiresSearch"]
           }
-        },
-        required: ["globalVisualStyle", "slides"]
+        }
+      },
+      required: ["globalVisualStyle", "slides"]
     };
 
     try {
       const response = await callWithRetry<any>(
         () => ai.models.generateContent({
           model: modelName,
-          contents: taskPrompt, 
+          contents: taskPrompt,
           config: {
             systemInstruction: systemInstruction,
             responseMimeType: "application/json",
@@ -705,15 +700,15 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
 
 // --- RLM CORE: THE EXECUTOR ---
 export const generateVisualContent = async (
-  markdown: string, 
+  markdown: string,
   mode: GenerationMode,
   onResult: (result: GeneratedImageResult) => void,
   onStatus: (status: string) => void
 ): Promise<void> => {
-  
+
   const ai = getAiClient();
   onStatus(`Analyzing for ${mode}...`);
-  
+
   let plan: GenerationPlan;
   try {
     plan = await analyzeAndPlanContent(markdown, mode);
@@ -751,22 +746,22 @@ export const generateVisualContent = async (
       try {
         const response = await callWithRetry<any>(
           () => ai.models.generateContent({
-             model: 'gemini-3-flash-preview', 
-             contents: svgPrompt,
-             config: {
-                 systemInstruction: svgSystemInstruction,
-                 thinkingConfig: { thinkingBudget: 1024 }
-             }
+            model: 'gemini-3-flash-preview',
+            contents: svgPrompt,
+            config: {
+              systemInstruction: svgSystemInstruction,
+              thinkingConfig: { thinkingBudget: 1024 }
+            }
           }),
           (attempt, delay) => onStatus(`System overloaded. Retrying SVG ${page.title} (Attempt ${attempt})...`)
         );
-        
+
         const rawText = response.text;
         if (rawText) {
           const svgCode = extractSvg(rawText);
           const encodedSvg = encodeURIComponent(svgCode);
           const dataUrl = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-          
+
           onResult({
             imageUrl: dataUrl,
             sectionTitle: page.title,
@@ -774,16 +769,16 @@ export const generateVisualContent = async (
           });
         }
       } catch (err: any) {
-         console.error(`Failed to generate SVG for ${page.title}`, err);
+        console.error(`Failed to generate SVG for ${page.title}`, err);
       }
-      
+
     } else {
       // --- RASTER IMAGE GENERATION PATH (WITH FALLBACK) ---
-      
-      const models = ['gemini-3-pro-image-preview', 'gemini-2.5-flash-image']; 
+
+      const models = ['gemini-3-pro-image-preview', 'gemini-2.5-flash-image'];
       let aspectRatio = "1:1";
       let finalPrompt = "";
-      let tools: any[] = []; 
+      let tools: any[] = [];
 
       // Mode-Specific Prompt Construction
       if (mode === 'visual-asset') {
@@ -820,62 +815,62 @@ export const generateVisualContent = async (
         CONSTRAINT: ISOLATED ON PURE WHITE BACKGROUND (#FFFFFF).
         NEGATIVE: ${NEGATIVE_PROMPT_ART}, photo, realistic, shadow, gradient background, noise, grunge, distressed
         `;
-        tools = [{googleSearch: {}}];
-      } 
+        tools = [{ googleSearch: {} }];
+      }
 
       // Fallback Loop for Raster Images
       let success = false;
       for (const modelName of models) {
-          if (success) break;
-          try {
-              const generateConfig: any = {
-                imageConfig: { aspectRatio },
-                responseModalities: [Modality.TEXT, Modality.IMAGE]
-              };
+        if (success) break;
+        try {
+          const generateConfig: any = {
+            imageConfig: { aspectRatio },
+            responseModalities: [Modality.TEXT, Modality.IMAGE]
+          };
 
-              // Only add tools if model supports it (Pro models mainly)
-              if (tools.length > 0 && modelName.includes('pro')) {
-                generateConfig.tools = tools;
-              }
-
-              const response = await ai.models.generateContent({
-                  model: modelName,
-                  contents: { parts: [{ text: finalPrompt }] },
-                  config: generateConfig
-              });
-
-              if (response.candidates?.[0]?.content?.parts) {
-                  let foundImage = false;
-                  for (const part of response.candidates[0].content.parts) {
-                    if (part.inlineData?.data) {
-                      let base64Image = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
-                      
-                      // Post-Processing for Stickers: Remove Background
-                      if (mode === 'sticker') {
-                          onStatus(`Processing transparency for ${page.title}...`);
-                          base64Image = await removeWhiteBackground(base64Image);
-                      }
-
-                      onResult({ 
-                        imageUrl: base64Image, 
-                        sectionTitle: page.title, 
-                        mode 
-                      });
-                      foundImage = true;
-                      success = true;
-                      break;
-                    }
-                  }
-                  if (!foundImage) console.warn(`No image found for ${page.title} with ${modelName}`);
-              }
-          } catch (err: any) {
-              const isQuota = err.status === 429 || (err.message && (err.message.includes('429') || err.message.includes('quota')));
-              if (isQuota && modelName !== models[models.length - 1]) {
-                  console.warn(`Quota exceeded for ${modelName}, failing over...`);
-                  continue;
-              }
-              console.error(`Failed to generate image for ${page.title} with ${modelName}`, err);
+          // Only add tools if model supports it (Pro models mainly)
+          if (tools.length > 0 && modelName.includes('pro')) {
+            generateConfig.tools = tools;
           }
+
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: { parts: [{ text: finalPrompt }] },
+            config: generateConfig
+          });
+
+          if (response.candidates?.[0]?.content?.parts) {
+            let foundImage = false;
+            for (const part of response.candidates[0].content.parts) {
+              if (part.inlineData?.data) {
+                let base64Image = `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`;
+
+                // Post-Processing for Stickers: Remove Background
+                if (mode === 'sticker') {
+                  onStatus(`Processing transparency for ${page.title}...`);
+                  base64Image = await removeWhiteBackground(base64Image);
+                }
+
+                onResult({
+                  imageUrl: base64Image,
+                  sectionTitle: page.title,
+                  mode
+                });
+                foundImage = true;
+                success = true;
+                break;
+              }
+            }
+            if (!foundImage) console.warn(`No image found for ${page.title} with ${modelName}`);
+          }
+        } catch (err: any) {
+          const isQuota = err.status === 429 || (err.message && (err.message.includes('429') || err.message.includes('quota')));
+          if (isQuota && modelName !== models[models.length - 1]) {
+            console.warn(`Quota exceeded for ${modelName}, failing over...`);
+            continue;
+          }
+          console.error(`Failed to generate image for ${page.title} with ${modelName}`, err);
+        }
       }
     }
   }

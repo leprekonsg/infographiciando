@@ -1,68 +1,142 @@
+# InfographIQ
 
-# InfographIQ - Agentic Slide Builder
+**AI-Powered Slide Deck Generation with Autonomous Agents**
 
-InfographIQ is an advanced Single Page Application (SPA) that uses a swarm of autonomous AI agents to build professional, data-driven slide decks from a simple topic prompt. It leverages Google's Gemini 3 models (Flash, Pro, and Imagen) for research, structural planning, layout routing, and asset generation.
+InfographIQ transforms a simple topic into a professional, data-driven presentation using a coordinated swarm of specialized AI agents. Built on Google's Gemini Interactions API with strategic model tier optimization.
 
-## 🧠 Architecture: The Agent Swarm
+---
 
-The application is built on a "Recursive Language Model" (RLM) architecture where specialized agents hand off context to one another.
+## Architecture
 
-### 1. Researcher Agent (`gemini-3-flash`)
-*   **Role:** Technical Researcher.
-*   **Task:** Uses Google Search grounding to extract 10 verified, high-impact facts and statistics about the user's topic.
-*   **Output:** A structured "Knowledge Sheet" (JSON) containing claims, values, sources, and confidence levels.
+The system employs a multi-agent pipeline where each agent has a focused responsibility:
 
-### 2. Architect Agent (`gemini-3-pro`)
-*   **Role:** Principal System Architect.
-*   **Task:** Analyzes the Knowledge Sheet and structures a narrative flow (Intro -> Problem -> Solution -> Data -> Conclusion).
-*   **Output:** An `OutlineSchema` defining the slide list, purpose of each slide, and specific "Fact Clusters" assigned to each slide to prevent hallucination.
+```
+Topic → Researcher → Architect → Router → Content Planner → Visual Designer → Generator → Renderer → PPTX
+```
 
-### 3. Router Agent (`gemini-3-flash`)
-*   **Role:** Visual Designer.
-*   **Task:** Analyzes the intent of a single slide and assigns a `RenderMode` (e.g., 'data-viz', 'infographic') and `LayoutVariant` (e.g., 'split-left-text', 'bento-grid').
-*   **Output:** A `RouterDecision` payload containing density budgets and layout constraints.
+### Agent Pipeline
 
-### 4. Generator Agent (RLM Loop) (`gemini-3-pro`)
-*   **Role:** Information Designer.
-*   **Task:** Generates the actual JSON content structure for the slide, adhering to the Router's constraints and the Architect's assigned facts.
-*   **Features:**
-    *   **Self-Correction:** Includes a `Repairer` loop that attempts to fix validation errors (text overflow, missing icons, repetition) automatically.
-    *   **Deterministic Repair:** A sanitizer layer aggressively deduplicates content and injects missing assets before validation.
-    *   **Circuit Breaker:** Automatically downgrades to lighter models if rate limits (429) are hit repeatedly.
+| Agent | Model | Role |
+|-------|-------|------|
+| **Researcher** | Gemini 3 Flash | Extracts 8-12 verified facts via Google Search grounding |
+| **Architect** | Gemini 3 Flash | Structures narrative arc, clusters facts, defines style guide |
+| **Router** | Gemini 2.5 Flash | Classifies layout variant and render mode per slide |
+| **Content Planner** | Gemini 3 Flash | Extracts key points and data from assigned fact clusters |
+| **Visual Designer** | Gemini 3 Flash | Creates spatial composition spec with color harmony |
+| **Generator** | Gemini 3 Flash | Produces final slide JSON with component layout |
+| **Image Generator** | Gemini 3 Pro Image | Renders background visuals from composed prompts |
 
-## 🛠 Tech Stack
+### Model Strategy
 
-*   **Frontend:** React 18, TypeScript, Tailwind CSS.
-*   **AI Models:** Google Gemini 3 Pro Preview, Gemini 3 Flash Preview, Gemini 3 Pro Image Preview.
-*   **SDK:** `@google/genai` (Official Google GenAI SDK).
-*   **Validation:** Zod (Runtime schema validation).
-*   **Export:** `pptxgenjs` (Client-side PowerPoint generation).
-*   **Icons:** Lucide React (Rendered to PNG for PPTX export).
+Based on [Phil Schmid's agent best practices](https://www.philschmid.de/building-agents), we use Gemini 3 Flash for most agents—it outperforms Pro on agentic benchmarks (78% vs 76.2% SWE-bench) while being 71% cheaper.
 
-## 🚀 Key Features
+| Tier | Model | Use Case |
+|------|-------|----------|
+| `MODEL_AGENTIC` | gemini-3-flash-preview | Agent workflows, spatial reasoning |
+| `MODEL_SIMPLE` | gemini-2.5-flash | Classification, JSON structuring |
+| `MODEL_REASONING` | gemini-3-pro-preview | Reserved for >1M token context |
 
-*   **Quick Generate:** One-shot generation of infographics, stickers, and assets.
-*   **Agentic Builder:** Full deck generation with live activity feed of agent thoughts.
-*   **High-Fidelity Rendering:** Custom canvas renderer that simulates PowerPoint layouts in the browser.
-*   **PPTX Export:** Native export preserving layouts, images, and speaker notes.
-*   **Robust Error Handling:** 
-    *   Exponential backoff for API calls.
-    *   JSON repair for truncated responses.
-    *   Model circuit breakers for stability.
+---
 
-## 📦 Setup & Usage
+## Features
 
-1.  **Environment:** Ensure you have a valid Google GenAI API Key with access to the Gemini 3 Preview models.
-2.  **Run:** Open the application.
-3.  **API Key:** Click "Connect AI Key" and select your project.
-4.  **Create:** Enter a topic (e.g., "Future of Quantum Computing") and watch the agents work.
+- **Agentic Generation** — Full deck creation with real-time agent activity feed
+- **Spatial Layout Engine** — Zone-based component allocation with affinity matching
+- **Visual Design RLM Loop** — Iterative refinement with validation feedback
+- **Auto-Repair Pipeline** — Deterministic JSON normalization and component type mapping
+- **PPTX Export** — Native PowerPoint output preserving layouts, images, and speaker notes
+- **Cost Optimized** — ~$0.18/deck (60% savings vs naive Pro usage)
 
-## 🛡️ Quality Assurance
+---
 
-The `validateSlide` function acts as a "Delight QA" gate. It checks for:
-*   **Text Density:** Ensures slides aren't walls of text.
-*   **Visual Balance:** Enforces icon usage in grids/cards.
-*   **Repetition:** Detects and rejects hallucinated loops.
-*   **Schema Integrity:** Ensures valid JSON structure.
+## Tech Stack
 
-If validation fails, the RLM loop triggers the **Repairer Agent** to fix the JSON specifically addressing the error codes returned by the validator.
+| Layer | Technology |
+|-------|------------|
+| Frontend | React 18, TypeScript, Vite |
+| AI SDK | `@google/genai` (Interactions API) |
+| Validation | Zod (runtime schema validation) |
+| Export | pptxgenjs (client-side PPTX generation) |
+| Icons | Lucide React |
+
+---
+
+## Quick Start
+
+```bash
+# Install dependencies
+npm install
+
+# Set API key in .env
+echo "GEMINI_API_KEY=your_key_here" > .env
+
+# Start development server
+npm run dev
+```
+
+Open `http://localhost:5173`, enter a topic, and watch the agents work.
+
+---
+
+## Project Structure
+
+```
+├── App.tsx                     # Main application
+├── components/
+│   ├── SlideDeckBuilder.tsx    # Agentic builder UI + PPTX export
+│   ├── BuilderCanvas.tsx       # Slide preview with spatial zones
+│   └── ActivityFeed.tsx        # Real-time agent logs
+├── services/
+│   ├── interactionsClient.ts   # Gemini Interactions API client
+│   ├── slideAgentService.ts    # Agent orchestration
+│   ├── visualDesignAgent.ts    # Visual composition agent
+│   ├── spatialRenderer.ts      # Zone-based layout engine
+│   └── validators.ts           # Schema + alignment validation
+├── types/
+│   └── slideTypes.ts           # Zod schemas
+└── docs/
+    ├── ARCHITECTURE_DIAGRAM.md # Full system blueprint
+    └── MODEL_OPTIMIZATION.md   # Model tier decisions
+```
+
+---
+
+## Component Types
+
+The generator produces slides using these component primitives:
+
+| Type | Description |
+|------|-------------|
+| `text-bullets` | Bulleted list with optional title |
+| `metric-cards` | 2-6 stat cards with value, label, icon |
+| `process-flow` | 3-5 step horizontal flow |
+| `icon-grid` | 2-4 column grid with icons |
+| `chart-frame` | Bar, pie, line, or doughnut chart |
+
+---
+
+## Validation
+
+Each slide passes through:
+
+1. **Schema Validation** — Zod parsing against `SlideNodeSchema`
+2. **Auto-Repair** — Component type normalization, deduplication, garbage removal
+3. **Visual Alignment** — Spatial zone compatibility check
+4. **Density Check** — Text overflow and item count limits
+
+Failed validation triggers the RLM loop for targeted regeneration.
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [Architecture Diagram](docs/ARCHITECTURE_DIAGRAM.md) | Full system blueprint with gap analysis |
+| [Model Optimization](docs/MODEL_OPTIMIZATION.md) | Model tier decisions and cost tracking |
+
+---
+
+## License
+
+MIT

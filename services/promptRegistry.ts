@@ -54,8 +54,8 @@ export const PROMPTS = {
 
   // --- NEW: PHASE 1 CONTENT PLANNER ---
   CONTENT_PLANNER: {
-      ROLE: "Senior Editor",
-      TASK: (title: string, purpose: string, facts: string) => `
+    ROLE: "Senior Editor",
+    TASK: (title: string, purpose: string, facts: string) => `
         TASK: Draft the core semantic content for slide "${title}".
         PURPOSE: ${purpose}
         FACTS: ${facts}
@@ -97,7 +97,10 @@ DESIGN REQUIREMENTS:
 3. COLOR HARMONY:
    - Align with style guide colors
    - Use accent colors to guide viewer attention
-   - Ensure contrast for text readability
+   - CRITICAL: Ensure sufficient contrast (e.g. Dark background + Light text). avoid mid-tone backgrounds.
+
+4. CONTENT ALIGNMENT:
+   - Your 'prompt_with_composition' MUST explicitly include keywords from the Visual Focus ("${context.visualFocus}") to ensure the image matches the topic.
 
 4. SPATIAL ZONES:
    Generate a visual prompt that respects these zones:
@@ -110,7 +113,7 @@ OUTPUT: Return JSON conforming to VisualDesignSpecSchema.
   // --- NEW: PHASE 2 VISUAL DESIGNER (RLM STRICT) ---
   VISUAL_DESIGNER: {
     ROLE: "Information Designer",
-    TASK: (contentPlanJson: string, routerConfig: any) => `
+    TASK: (contentPlanJson: string, routerConfig: any, visualDesignSpec?: any) => `
       You produce structured slide data that must validate against the provided response schema.
 
       Hard rules:
@@ -143,7 +146,8 @@ OUTPUT: Return JSON conforming to VisualDesignSpecSchema.
       INPUTS:
       CONTENT_PLAN: ${contentPlanJson}
       ROUTER_CONFIG: ${JSON.stringify(routerConfig)}
-    `
+      VISUAL_SPEC: ${visualDesignSpec ? JSON.stringify(visualDesignSpec) : 'N/A'}
+    `,
   },
 
   REPAIRER: {
@@ -163,8 +167,8 @@ OUTPUT: Return JSON conforming to VisualDesignSpecSchema.
 
   // --- NEW: DEDICATED JSON REPAIRER ---
   JSON_REPAIRER: {
-      ROLE: "JSON Repair Engine",
-      TASK: (brokenJson: string) => `
+    ROLE: "JSON Repair Engine",
+    TASK: (brokenJson: string) => `
       You are a specialized JSON repair engine.
       The following text contains a malformed or "dirty" JSON object.
       
