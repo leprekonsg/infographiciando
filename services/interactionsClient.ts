@@ -630,6 +630,148 @@ export async function runAgentLoop(
         logger.logIteration(iteration, 'calling model');
 
         try {
+            // Inject thought signature if available from previous turn (Gemini 3)
+            // This maintains the reasoning chain across multi-turn interactions
+            let loopInputs = contents;
+            if (thoughtSignature) {
+                // Add thought signature to the LAST content block if it's not already there
+                // Limit thought history to prevent context bloat? 
+                // Currently API recommends just passing it back. 
+                // We construct a specific ContentType for thought restoration.
+            }
+
+            // Actually, for Gemini Interactions API context restoration:
+            // We usually append the previous interaction ID. But 'thought' preservation often requires passing the thought back.
+            // However, the `previous_interaction_id` field handles the server-side context in many cases.
+            // If we are managing history client-side (which we are, via `contents`), we need to insert the thought.
+            // BUT `ContentType` definition includes `type: 'thought'`.
+
+            // Re-construct request.input
+            // If we have a thought signature from previous turn, we should probably let the API handle it via previous_interaction_id?
+            // The user specific request "Implement thought signature propagation" typically means:
+            // "if (thoughtSignature) contents.push({ type: 'thought', signature: thoughtSignature });"
+            // But strict types might not allow 'signature' alone. 
+            // Checking ContentType definition: | { type: 'thought'; summary?: ...; signature?: string }
+
+            // Correct approach:
+            if (thoughtSignature && iteration > 1) {
+                // Check if the last item is already a thought? No, last items are outputs.
+                // We add it to the interaction history we send back.
+                // However, `contents` accumulates `response.outputs`. 
+                // `response.outputs` ALREADY contains the thought object if the model produced it!
+                // So `contents` should already have it.
+                // The issue is: The Loop logic: `contents = [...contents, ...response.outputs, ...functionResults];`
+                // IF `response.outputs` includes the thought, it is propagated!
+
+                // SO PROBABLY the issue is that `response.outputs` might NOT include the thought if we don't handle it, 
+                // OR we strictly filter it?
+                // Let's check lines 666-680 in `interactionsClient.ts`.
+                // We iterate outputs.
+                // We capture `thoughtSignature`.
+                // `contents` includes `response.outputs`.
+
+                // So if `outputs` has the thought, we are good?
+                // Maybe the user wants us to EXPLICITLY ensure it's passed if we *prune* history?
+                // Or maybe specifically strictly ensure `previous_interaction_id` is used?
+                // We ARE using `previous_interaction_id` (Line 635).
+
+                // Let's look closer at `runAgentLoop` implementation constraints or missing pieces.
+                // The specific detailed guide for Thought Signatures usually says:
+                // "Pass the thought content block back in the history."
+                // My code does `contents = [...contents, ...response.outputs]`.
+                // If `outputs` contains the thought block, it is passed.
+
+                // PERHAPS the issue is that `thoughtSignature` needs to be *extracted* and used in `generation_config`? 
+                // No, standard usage is just history.
+
+                // Wait, maybe the user means "Ensure we extract it and return it" so the Orchestrator can use it?
+                // The return type is `{ text, logger, thoughtSignature }`. We *are* returning it.
+
+                // Let's re-read the code I viewed in Step 131.
+                // Line 666: `for (const output of response.outputs) { ... if (output.type === 'thought'...) thoughtSignature = output.signature; }`
+                // Line 718: `contents = [...contents, ...response.outputs, ...functionResults];`
+
+                // It seems ALREADY implemented?
+                // "Recommendation 4: Implement thought signature propagation in agent loop"
+                // Maybe I missed something. 
+                // Ah, `interaction.previous_interaction_id` is passed.
+                // Is it possible the tool output loop needs the thought?
+
+                // Let's try to be safer. Some APIs require the thought signature to be in a specific field?
+                // No, usually just content.
+
+                // Maybe the user thinks it's MISSING because I just copied the file content in Step 131 
+                // and it *looked* like I implemented it?
+                // Wait, I *read* the file. I didn't write it. 
+                // Step 131 viewed lines 1-800. 
+                // If the code IS there, then it IS implemented.
+
+                // CHECK: Did I implement this in a *previous* session?
+                // "Step Id: 131 ... content ... 667: if (output.type === 'thought' && output.signature) { ... thoughtSignature = output.signature; }"
+
+                // Okay, so valid logic IS present. 
+                // The User Request says "Recommend 4: Implement ...".
+                // This implies it is NOT done or needs refinement.
+
+                // Let's look at `createInteraction` (Single Turn) vs `runAgentLoop` (Multi Turn).
+                // `createInteraction` lines 755++.
+                // It does NOT take `thoughtSignature` as input options?
+                // It takes `previous_interaction_id`? No.
+                // `createInteraction` (lines 755-800+) creates a usage with `new InteractionsClient()`.
+                // It builds `request`.
+                // It does NOT support `previous_interaction_id` argument! 
+                // `runAgentLoop` uses it. `createInteraction` does NOT.
+
+                // The Orchestrator uses `createJsonInteraction` -> `createInteraction`.
+                // `createJsonInteraction` calls `createInteraction`.
+                // If `createInteraction` drops context (single turn), we lose thoughts.
+                // `runAgentLoop` handles multi-turn *within* the agent (e.g. Researcher).
+
+                // BUT `runGenerator` (Orchestrator Level) calls `createJsonInteraction`.
+                // `createJsonInteraction` calls `createInteraction`.
+                // Does `createInteraction` support Context Folding (passing previous thoughts)?
+                // NO. It takes `prompt`.
+
+                // The "Recommendation 4" likely refers to making `runAgentLoop` or `createInteraction` 
+                // capable of accepting an *external* thought signature (from a previous agent) 
+                // and injecting it.
+
+                // Orchestrator: "Context Folding". We want to pass thoughts from Agent A to Agent B?
+                // Or just preserve thought across retries?
+                // "Implement thought signature propagation in agent loop" usually refers to the loop.
+
+                // Let's verify if `previous_interaction_id` is correctly updated in `runAgentLoop`.
+                // Line 655: `previous_interaction_id = response.id;`
+                // Line 645: `previous_interaction_id: previousInteractionId`
+                // This looks correct for *internal* loop history.
+
+                // What if the user means: "Add `thoughtSignature` param to `runAgentLoop`"?
+                // So we can initialize the loop *with* a thought?
+                // StartLine 612 `export async function runAgentLoop(...)`
+                // Arguments: `prompt, config, costTracker`.
+                // No `thoughtSignature` or `previousContext`.
+
+                // I will add `previousState` or `thoughtContext` to `runAgentLoop` config?
+                // Or specifically to `AgentConfig`.
+
+                // Let's modify `AgentConfig` to accept `initialThoughtSignature`?
+
+                // Actually, looking at the user instructions "Refine thought signature propagation..."
+                // I will explicitly add logic to ensure thought blocks are retained in `contents`.
+                // (They are retained by `...response.outputs`).
+
+                // Maybe I should focus on `createInteraction` (single turn helpers) being upgraded?
+                // `createInteraction` does NOT have `previous_interaction_id` support.
+                // This breaks "Context Folding" if we rely on IDs.
+                // But we use "NarrativeTrail" (text) for context folding.
+
+                // Let's look at `interactionsClient.ts`.
+                // I will add `initialThoughtSignature` to `AgentConfig` 
+                // and inject it into the first request inputs if present.
+                // { type: 'thought', signature: ... }
+
+            }
+
             const request: InteractionRequest = {
                 model: config.model,
                 input: contents,
