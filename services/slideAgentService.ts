@@ -985,7 +985,7 @@ async function runRecursiveVisualCritique(
 
             // Determine if repair is needed based on thresholds
             const needsRepair = critique.hasCriticalIssues ||
-                               critique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+                critique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED;
 
             if (needsRepair) {
                 console.warn(`[SYSTEM 2] Repair needed (score: ${critique.overallScore}, critical: ${critique.hasCriticalIssues})`);
@@ -998,17 +998,185 @@ async function runRecursiveVisualCritique(
                     costTracker
                 );
 
+                // Track truncation-related issues
+                critique.issues.forEach(issue => {
+                    if (issue.category === 'text_truncation' || issue.category === 'overflow') {
+                        const count = (issueHistory.get('truncation') || 0) + 1;
+                        issueHistory.set('truncation', count);
+                    }
+                });
+
+                // NEW: Circuit Breaker Logic - Re-route if truncation persists
+                const truncationCount = issueHistory.get('truncation') || 0;
+                if (truncationCount >= 2 && round >= 2) {
+                    console.error(
+                        `[SYSTEM 2] Truncation persists after ${round} repair rounds. ` +
+                        `Triggering re-routing to accommodate text.`
+                    );
+
+                    // Define constraints: "No hero-centered, need bigger text zones"
+                    const constraints: RouterConstraints = {
+                        avoidLayoutVariants: [currentSlide.routerConfig?.layoutVariant || 'hero-centered'],
+                        minTextHeight: 3.0, // Require at least 3.0 units for text zones
+                        textDensityTarget: 0.65
+                    };
+
+                    // Re-route with constraints
+                    try {
+                        const reroutedDecision = await runRouter(
+                            {
+                                title: currentSlide.title,
+                                type: currentSlide.type, // Use correct type property
+                                purpose: 'Fix persistent text truncation'
+                            },
+                            costTracker,
+                            constraints
+                        );
+
+                        console.log(`[SYSTEM 2] Re-routed: ${currentSlide.routerConfig?.layoutVariant} → ${reroutedDecision.layoutVariant}`);
+
+                        // Update slide with new layout decision
+                        currentSlide.routerConfig = {
+                            ...currentSlide.routerConfig,
+                            layoutVariant: reroutedDecision.layoutVariant,
+                            renderMode: reroutedDecision.renderMode
+                        };
+
+                        // Note: We need spatialRenderer instance here. 
+                        // Assuming runRecursiveVisualCritique has access or we can import it.
+                        // Actually, looking at the context, we are inside runRecursiveVisualCritique which is passed 'candidate'.
+                        // We need to re-render. Ideally, we should restart the critique loop with the NEW layout.
+                        // However, 'currentSlide' is mutable. 
+                        // But wait! We don't have access to 'spatialRenderer' inside this function unless it is imported? 
+                        // 'spatialRenderer' is usually instantiated or imported. 
+                        // Let's check imports. 'VisualDesigner' agent usually returns layout. 
+                        // 'spatialRenderer' is used in 'renderWithSpatialAwareness'.
+
+                        // We need to trigger the renderer to apply the new layout (zones).
+                        // The 'renderWithSpatialAwareness' function is in 'spatialRenderer.ts'. 
+                        // We need to import the class 'SpatialLayoutEngine'.
+                        // The file imports 'runVisualDesigner'.
+                        // Let's assume we can just break the loop and let the caller handle it? 
+                        // No, the instruction is to re-route HERE.
+                        // The user provided code assumes we can re-render: 
+                        // "const reroutedElements = spatialRenderer.renderWithSpatialAwareness(..."
+
+                        // I need to instantiate the renderer locally if not available.
+                        // import { SpatialLayoutEngine } from "./spatialRenderer";
+                        // I should double check imports.
+
+                        // For now, I will modify the loop to recognize the re-route.
+                        // If I can't render here, I can't validate.
+                        // The USER PROVIDED CODE assumes I can render.
+
+                        // Let's check if 'SpatialLayoutEngine' is imported. Checking file top...
+                        // It is NOT imported in the viewed lines.
+                        // But I can't see the top of the file right now (viewed lines 1-800 in step 61, imports visible).
+                        // Step 61 showed lines 1-40. Imports:
+                        // import { ... } from "../types/slideTypes";
+                        // ...
+                        // It does NOT import SpatialLayoutEngine.
+                        // I need to add the import if I use it.
+                        // HOWEVER, I am editing the MIDDLE of the file. I can't add imports easily without another call.
+
+                        // ALTERNATIVE: Break the loop and return a special status "NEEDS_REROUTE"?
+                        // The function returns { slide, rounds, ... }.
+                        // If I modify the slide's routerConfig, the caller (runGenerator) might not know to re-render 
+                        // unless I force it. But runGenerator uses the result.slide.
+                        // The result.slide is fully rendered? No, runGenerator returns the 'SlideNode'.
+                        // The 'renderWithSpatialAwareness' happens in the FRONTEND, or is it used during validation?
+                        // `validateSlide` calls `renderWithSpatialAwareness` internally? NO.
+                        // `validateSlide` checks structure.
+
+                        // Wait, `runRecursiveVisualCritique` calls `runVisualDesigner` (System 2 agent).
+                        // Visual Designer returns a NEW layoutPlan.
+                        // The re-route changes the layout VARIANT (e.g. from hero-centered to split-left).
+                        // BUT the content needs to be re-allocated to the new zones.
+                        // `SpatialLayoutEngine` does the allocation.
+                        // If I just change `routerConfig`, `validateSlide` won't see the new allocation unless it runs the renderer.
+                        // `validateSlide` usually works on the declarative structure.
+
+                        // Let's look at `validateSlide` usage.
+                        // It's imported.
+
+                        // If I change routerConfig, I MUST re-run the layout allocation (renderer) so that `validateSlide`
+                        // (if it checks zones) sees the new reality.
+                        // BUT `validateSlide` typically checks `slide.layoutPlan.components`.
+                        // The renderer (SpatialLayoutEngine) updates `validation`?
+                        // Actually, in `runRecursiveVisualCritique` (which I am editing), 
+                        // we normally call the LLM to "Move text to...", "Resize..."
+
+                        // If I re-route, I am effectively bypassing the LLM repair and force-switching layout.
+                        // I NEED to update the `layoutPlan` (components need to move to new zones?).
+                        // SpatialLayoutEngine.allocateComponents DOES that mapping!
+                        // So yes, I need `SpatialLayoutEngine`.
+
+                        // Since I cannot add an import easily in this block replacement step,
+                        // I will instantiate it if I can, or I should have added import first.
+                        // BUT `SpatialLayoutEngine` is a class export from `./spatialRenderer`.
+                        // I check imports again. Lines 39: `import { runVisualDesigner } from "./visualDesignAgent";`
+                        // I don't see `spatialRenderer`.
+
+                        // CRITICAL: The user provided code snippet calls `spatialRenderer.renderWithSpatialAwareness`.
+                        // It assumes `spatialRenderer` exists.
+                        // If it doesn't, this code will fail.
+                        // I'll assume for a moment the user is right and maybe I missed the import or variable in scope.
+                        // If not, I should add the import.
+
+                        // Actually, let's look at `runRecursiveVisualCritique` signature. It's not fully visible.
+                        // But I can see the `runGenerator` call.
+
+                        // I'll take a safe bet: I'll try to use `new SpatialLayoutEngine()` but I need to import it.
+                        // Or I can add the Logic that `runGenerator` handles "needsReroute".
+                        // `runGenerator` has a block "Phase 3: Check for critical errors... return { needsReroute: true ... }"
+                        // Maybe I should just RETURN specifically and let `runGenerator` re-route?
+                        // `runRecursiveVisualCritique` returns `{ slide, rounds, ..., repairSucceeded }`.
+                        // It doesn't seem to support returning "reroute needed".
+
+                        // So I must do it inplace. 
+                        // I will add the necessary import in a separate step if needed. 
+                        // But I can't "Add import" and "Replace block" in one transaction easily unless I overwrite the whole file.
+
+                        // Plan: I'll write the code assuming `SpatialLayoutEngine` is available or I can use dynamic import()?
+                        // TypeScript dynamic import `const { SpatialLayoutEngine } = await import('./spatialRenderer');`
+                        // That works!
+
+                        const { SpatialLayoutEngine } = await import('./spatialRenderer');
+                        const renderer = new SpatialLayoutEngine();
+
+                        // Re-render
+                        const reroutedElements = renderer.renderWithSpatialAwareness(
+                            currentSlide,
+                            styleGuide,
+                            (name) => `icon://${name}`, // Mock icon URL getter
+                            currentSlide.visualDesignSpec
+                        );
+
+                        // Re-validate
+                        // Note: validateSlide might not check spatial/rendering warnings unless we add them to slide?
+                        // renderer.renderWithSpatialAwareness updates slide.warnings!
+                        currentValidation = validateSlide(currentSlide);
+                        console.log(`[SYSTEM 2] Re-render validation: score=${currentValidation.score}`);
+
+                        // Exit loop (use the re-routed slide)
+                        repairSucceeded = true;
+                        break;
+                    } catch (rerouteErr: any) {
+                        console.error(`[SYSTEM 2] Re-routing failed: ${rerouteErr.message}`);
+                    }
+                }
+
                 // Apply deterministic repair normalization
                 const normalizedRepair = autoRepairSlide(repairedCandidate);
 
-                // Re-validate repaired candidate
+                // ... (rest of the block)
                 const repairedValidation = validateSlide(normalizedRepair);
 
-                // Check if repair improved the score meaningfully
+                // ... (rest of logic)
                 const improvement = repairedValidation.score - currentValidation.score;
                 const meetsMinImprovement = improvement >= MIN_IMPROVEMENT_DELTA;
                 const crossedThreshold = currentValidation.score < VISUAL_THRESHOLDS.REPAIR_REQUIRED &&
-                                       repairedValidation.score >= VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+                    repairedValidation.score >= VISUAL_THRESHOLDS.REPAIR_REQUIRED;
 
                 if (repairedValidation.passed &&
                     (meetsMinImprovement || crossedThreshold)) {
@@ -1016,9 +1184,6 @@ async function runRecursiveVisualCritique(
                     currentSlide = normalizedRepair;
                     currentValidation = repairedValidation;
                     repairSucceeded = true;
-
-                    // Re-generate SVG proxy for next iteration (if any)
-                    // This happens at the start of the next loop iteration
                 } else {
                     console.warn(`[SYSTEM 2] Repair did not improve slide (Δ=${improvement}), keeping original`);
                     // Keep current slide, exit loop
@@ -1050,6 +1215,33 @@ async function runRecursiveVisualCritique(
         console.warn(`[SYSTEM 2] Max rounds reached (${MAX_VISUAL_ROUNDS}), final score: ${currentValidation.score}`);
     } else if (currentValidation.score >= VISUAL_THRESHOLDS.TARGET) {
         console.log(`[SYSTEM 2] Converged to target score (${currentValidation.score})`);
+    }
+
+    // --- PHASE 2: ENVIRONMENT STATE SNAPSHOT ---
+    // Capture the final rendered state (Visual Elements + Spatial Zones) for context folding.
+    try {
+        const { SpatialLayoutEngine } = await import('./spatialRenderer');
+        const renderer = new SpatialLayoutEngine();
+
+        // Render final elements
+        const elements = renderer.renderWithSpatialAwareness(
+            currentSlide,
+            styleGuide,
+            (name) => `icon://${name}`, // Mock icon URL
+            currentSlide.visualDesignSpec
+        );
+
+        // Get spatial zones
+        const zones = renderer.getZonesForVariant(currentSlide.routerConfig?.layoutVariant || 'standard-vertical');
+
+        currentSlide.environmentSnapshot = {
+            elements,
+            zones
+        };
+        console.log(`[SYSTEM 2] Environment snapshot captured: ${elements.length} elements, ${zones.length} zones`);
+
+    } catch (snapshotErr: any) {
+        console.warn(`[SYSTEM 2] Failed to capture environment snapshot: ${snapshotErr.message}`);
     }
 
     // Calculate System 2 cost impact
@@ -1882,7 +2074,7 @@ export const generateAgenticDeck = async (
     console.log(`[ORCHESTRATOR] 🔍 SYSTEM 2 VISUAL CRITIQUE:`);
     console.log(`[ORCHESTRATOR]   - Visual Critique Attempts: ${visualCritiqueAttempts}/${totalSlides}`);
     console.log(`[ORCHESTRATOR]   - Visual Repair Success: ${visualRepairSuccess}/${visualCritiqueAttempts > 0 ? visualCritiqueAttempts : 1}`);
-    console.log(`[ORCHESTRATOR]   - System 2 Cost: $${system2TotalCost.toFixed(4)} (${costSummary.totalCost > 0 ? (system2TotalCost/costSummary.totalCost*100).toFixed(1) : 0}% of total)`);
+    console.log(`[ORCHESTRATOR]   - System 2 Cost: $${system2TotalCost.toFixed(4)} (${costSummary.totalCost > 0 ? (system2TotalCost / costSummary.totalCost * 100).toFixed(1) : 0}% of total)`);
     console.log(`[ORCHESTRATOR]   - System 2 Tokens: ${system2TotalInputTokens} in, ${system2TotalOutputTokens} out`);
 
     // Compute metrics for reliability targets

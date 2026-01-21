@@ -283,7 +283,13 @@ export const SlideNodeSchema = z.object({
   selfCritique: SelfCritiqueSchema.optional(),
 
   readabilityCheck: z.enum(['pass', 'warning', 'fail']),
-  warnings: z.array(z.string()).optional()
+  warnings: z.array(z.string()).optional(),
+
+  // Environment State Snapshot (for context propagation)
+  environmentSnapshot: z.object({
+    elements: z.array(z.any()),
+    zones: z.array(z.any())
+  }).optional()
 });
 
 // 4. THE ENVIRONMENT (Critique 2: Context as Environment)
@@ -321,6 +327,9 @@ export interface NarrativeTrail {
  */
 export interface RouterConstraints {
   avoidLayoutVariants?: string[];
+  minTextHeight?: number;
+  textDensityTarget?: number;
+  allowDynamicScaling?: boolean;
 }
 
 /**

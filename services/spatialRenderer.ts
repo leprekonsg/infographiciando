@@ -297,6 +297,30 @@ export class SpatialLayoutEngine {
     return elements;
   }
 
+  /**
+   * Estimate how many lines will be rendered after text wrapping.
+   * Rough heuristic based on zone width and font size.
+   */
+  private estimateWrappedLineCount(
+    lines: string[],
+    zoneWidthUnits: number,
+    fontSizePoints: number
+  ): number {
+    // Empirical: ~2.5 characters per unit width at default font size
+    // At 14pt (standard bullet), ~3.5 chars per unit
+    // Adjust avgCharsPerUnitWidth based on the actual fontSizePoints relative to 14pt
+    const baseCharsPerUnitWidth = 3.5; // For 14pt font
+    const effectiveCharsPerUnitWidth = baseCharsPerUnitWidth * (14 / fontSizePoints);
+
+    const maxCharsPerLine = Math.max(10, Math.floor(zoneWidthUnits * effectiveCharsPerUnitWidth));
+
+    return lines.reduce((wrappedCount, line) => {
+      const visibleText = line.replace(/^•\s*/, ''); // Remove bullet
+      const wrappedLines = Math.ceil(visibleText.length / maxCharsPerLine);
+      return wrappedCount + Math.max(1, wrappedLines);
+    }, 0);
+  }
+
   private renderComponentInZone(
     comp: TemplateComponent,
     zone: SpatialZone,
@@ -317,36 +341,105 @@ export class SpatialLayoutEngine {
     const scale = zone.purpose === 'hero' ? 1.4 : (zone.purpose === 'accent' ? 0.8 : 1.0);
 
     if (comp.type === 'text-bullets') {
+      let contentScale = scale;
+      const lines = comp.content || [];
+      const hasTitle = !!comp.title;
+
+      // Estimate wrapped line count BEFORE calculating fit
+      // Note: We use 14 * scale as approximate point size reference for wrapping
+      const estimatedWrappedLines = this.estimateWrappedLineCount(lines, zone.w, 14 * scale);
+
+      // Calculate required height WITH wrapping
+      const titleHeightFactor = hasTitle ? 0.7 : 0;
+      // Each wrapped line takes space. 
+      // Logic: (TotalWrappedLines - 1) * spacing + height.
+      // Or simply: Sum of lines * height? 
+      // render loop uses: spacing (0.6) for each bullet item start, plus extra for wrapped lines.
+      // Let's approximate: 1 unit per bullet? No, spacing is 0.6.
+      // If 4 lines, 4 * 0.6 + 0.5 (last line height) = 2.9?
+      // With wrapping: 
+      // If we have 'estimatedWrappedLines' total visual lines.
+      // The spacing logic in loop is: curY += advance. 
+      // advance = 0.6 + (extra_wrapped_lines * 0.5).
+      // So total height ~= sum(advance).
+      // If N bullets, K total wrapped lines (where K >= N).
+      // (K - N) extra wrapped lines.
+      // Height = (N * 0.6) + ((K - N) * 0.5) roughly? Plus slight buffer.
+
+      // User's formula: (estimatedWrappedLines - 1) * 0.6 + 0.5
+      // This assumes uniform spacing 0.6 for ALL lines? 
+      // Actually standard spacing for wrapped lines might be tighter than between bullets.
+      // But let's stick to the user's requested formula structure if possible, 
+      // OR use a safe approximation.
+      // User provided: "wrappedLinesHeightFactor = (estimatedWrappedLines - 1) * 0.6 + 0.5"
+      // This is a safe upper bound assuming every line (bullet or wrapped) takes 0.6 spacing.
+      const wrappedLinesHeightFactor = estimatedWrappedLines > 0 ? ((estimatedWrappedLines - 1) * 0.6) + 0.5 : 0;
+
+      const requiredFactor = titleHeightFactor + wrappedLinesHeightFactor;
+
+      const requiredH = requiredFactor * scale;
+      if (requiredH > h) {
+        const fitScale = h / requiredFactor;
+        const minScale = scale * 0.5;
+
+        if (fitScale < minScale) {
+          this.addWarning(
+            `Text truncated in zone '${zone.id}': ` +
+            `${lines.length} bullets (${estimatedWrappedLines} wrapped lines) ` +
+            `requires ${(requiredH).toFixed(2)} units but only ${h} available`
+          );
+          contentScale = minScale;
+        } else {
+          contentScale = fitScale;
+          // console.debug(`[SpatialRenderer] Auto-scaled text in '${zone.id}' from ${scale} to ${contentScale.toFixed(2)}`);
+        }
+      }
+
       let curY = y;
       const maxY = y + h;
 
       if (comp.title) {
-        const titleH = 0.6 * scale;
-        if (curY + titleH <= maxY) {
-          els.push({ type: 'text', content: comp.title, x, y: curY, w, h: titleH, fontSize: 18 * scale, bold: true, color: p.text, zIndex: 10 });
-          curY += (0.7 * scale);
+        const titleH = 0.6 * contentScale;
+        const nextY = curY + (0.7 * contentScale);
+        if (nextY <= maxY) {
+          els.push({ type: 'text', content: comp.title, x, y: curY, w, h: titleH, fontSize: 18 * contentScale, bold: true, color: p.text, zIndex: 10 });
+          curY = nextY;
+        } else {
+          this.addWarning(`Title dropped in zone '${zone.id}' due to space constraints.`);
         }
       }
 
-      const lines = comp.content || [];
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const lineH = 0.5 * scale;
-        const spacing = 0.6 * scale;
 
-        if (curY + lineH > maxY) {
-          // GAP 5: Track truncation with detailed warning
+        const currentFontSize = 14 * contentScale;
+        // Improve heuristic: 3.5 is for 14pt.
+        const baseCharsPerUnitWidth = 3.5; // For 14pt font
+        const effectiveCharsPerUnitWidth = baseCharsPerUnitWidth * (14 / currentFontSize);
+        const maxCharsPerLine = Math.max(10, Math.floor(zone.w * effectiveCharsPerUnitWidth));
+
+        const visibleText = line.replace(/^•\s*/, '');
+        const wrappedLinesCount = Math.ceil(visibleText.length / maxCharsPerLine);
+        const vLines = Math.max(1, wrappedLinesCount);
+
+        const lineH = 0.5 * contentScale;
+        const totalVisualH = vLines * lineH;
+
+        // Advance: 0.6 basis + extra height for wrapped lines
+        const advance = Math.max(0.6 * contentScale, totalVisualH + (0.1 * contentScale));
+
+        if (curY + totalVisualH > maxY) {
           if (i < lines.length) {
             const truncatedCount = lines.length - i;
-            const message = `Text truncated in zone '${zone.id}': ${truncatedCount} of ${lines.length} lines hidden due to space constraints`;
+            const message = `Text truncated in zone '${zone.id}': ${truncatedCount} of ${lines.length} lines hidden.`;
             this.addWarning(message);
-            console.warn(`[SPATIAL RENDERER] ${message}`);
+            console.error(`[SPATIAL RENDERER] ${message}`);
           }
           break;
         }
 
-        els.push({ type: 'text', content: `• ${line}`, x, y: curY, w, h: lineH, fontSize: 14 * scale, color: p.text, zIndex: 10 });
-        curY += spacing;
+        els.push({ type: 'text', content: `• ${line}`, x, y: curY, w, h: totalVisualH, fontSize: 14 * contentScale, color: p.text, zIndex: 10 });
+        curY += advance;
       }
     }
     else if (comp.type === 'metric-cards') {
