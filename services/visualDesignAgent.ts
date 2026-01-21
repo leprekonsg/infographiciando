@@ -1,14 +1,30 @@
 /**
  * Visual Design Agent - Interactions API Migration
- * 
+ *
  * This agent creates spatial and visual composition specifications for slides.
  * Migrated to use the Gemini Interactions API for consistency.
  */
 
-import { SlideNode, RouterDecision, VisualDesignSpec, VisualDesignSpecSchema, ResearchFact, GlobalStyleGuide } from "../types/slideTypes";
+import {
+    SlideNode,
+    RouterDecision,
+    VisualDesignSpec,
+    VisualDesignSpecSchema,
+    ResearchFact
+} from "../types/slideTypes";
 import { PROMPTS } from "./promptRegistry";
-import { createJsonInteraction, CostTracker, ThinkingLevel, MODEL_AGENTIC, MODEL_SIMPLE } from "./interactionsClient";
-import { validateVisualLayoutAlignment, validateCritiqueResponse, validateRepairResponse } from "./validators";
+import {
+    createJsonInteraction,
+    CostTracker,
+    ThinkingLevel,
+    MODEL_AGENTIC,
+    MODEL_SIMPLE
+} from "./interactionsClient";
+import {
+    validateVisualLayoutAlignment,
+    validateCritiqueResponse,
+    validateRepairResponse
+} from "./validators";
 import { SpatialLayoutEngine } from "./spatialRenderer";
 
 // Visual Designer: Spatial reasoning is an agentic task → MODEL_AGENTIC (3 Flash)
@@ -220,222 +236,6 @@ IMPORTANT: No text, no icons, no diagrams, no charts - abstract gradient ONLY.
     };
 };
 
-// --- SYSTEM 2: SYNTHETIC VISUAL CORTEX ---
-
-/**
- * Generate content-aware SVG proxy from SlideNode for visual critique.
- * Compiles slide to VisualElements using the same rendering pipeline as PPTX export.
- * SVG viewBox: 1000x563 for 16:9 aspect ratio (0-10 coordinates × 100).
- *
- * @param slide - SlideNode with layoutPlan and visualDesignSpec
- * @param styleGuide - Global style guide for colors and fonts
- * @returns SVG string with actual text content, shapes, and layout (max 15KB)
- */
-export function generateSvgProxy(
-    slide: SlideNode,
-    styleGuide: GlobalStyleGuide
-): string {
-    const layoutEngine = new SpatialLayoutEngine();
-
-    // Stub icon lookup (icons not rendered in SVG proxy to avoid bloat)
-    const getIconUrl = (name: string) => undefined;
-
-    // Compile slide to VisualElements using the same engine as PPTX export
-    const elements = layoutEngine.renderWithSpatialAwareness(
-        slide,
-        styleGuide,
-        getIconUrl,
-        slide.visualDesignSpec
-    );
-
-    // SVG viewBox: 1000x563 for 16:9 (100x multiplier for 0-10 coordinate system)
-    let svg = `<svg viewBox="0 0 1000 563" xmlns="http://www.w3.org/2000/svg">\n`;
-
-    // Background (use visualDesignSpec color if available)
-    const bgColor = slide.visualDesignSpec?.color_harmony?.background_tone ||
-                    styleGuide.colorPalette.background || '#0f172a';
-    const normalizedBg = bgColor.replace('#', '');
-    svg += `  <rect x="0" y="0" width="1000" height="563" fill="#${normalizedBg}" id="bg"/>\n`;
-
-    // Metadata: component counts and density
-    const componentTypes = (slide.layoutPlan?.components || []).map(c => c.type);
-    const totalTextChars = elements
-        .filter(el => el.type === 'text')
-        .reduce((sum, el) => sum + ((el as any).content?.length || 0), 0);
-
-    svg += `  <!-- Metadata: components=${componentTypes.join(',')} textChars=${totalTextChars} -->\n`;
-
-    // GAP 4: Priority-Based Element Inclusion
-    // Sort elements by visual importance to ensure most critical elements are included
-    const prioritizedElements = [...elements].sort((a, b) => {
-        // Priority scoring (higher = more important)
-        const getPriority = (el: any) => {
-            let priority = 0;
-
-            // Zone purpose priority
-            if (el.zone?.purpose === 'hero') priority += 10;
-            else if (el.zone?.purpose === 'secondary') priority += 5;
-            else if (el.zone?.purpose === 'accent') priority += 2;
-
-            // Element type priority
-            if (el.type === 'text') {
-                priority += 8; // Text content is critical for critique
-                if (el.bold) priority += 2; // Titles and headers
-                if (el.fontSize && el.fontSize > 20) priority += 3; // Large text = important
-            } else if (el.type === 'shape') {
-                priority += 4; // Shapes help show layout
-                if (el.text) priority += 2; // Shapes with text (metrics, etc.)
-            }
-
-            // Size priority (larger elements are more impactful)
-            const size = (el.w || 0) * (el.h || 0);
-            if (size > 2) priority += 3;
-            else if (size > 1) priority += 1;
-
-            return priority;
-        };
-
-        return getPriority(b) - getPriority(a);
-    });
-
-    // Render elements with dynamic size limiting
-    const MAX_SVG_SIZE = 12000; // Leave headroom below 15KB limit
-    let currentSize = svg.length;
-    let renderedCount = 0;
-
-    for (const el of prioritizedElements) {
-
-        // Estimate element SVG size before rendering
-        const x = Math.round(el.x * 100);
-        const y = Math.round(el.y * 100);
-        const w = Math.round(el.w * 100);
-        const h = Math.round(el.h * 100);
-
-        let elementSvg = '';
-
-        if (el.type === 'text') {
-            const fontSize = el.fontSize || 12;
-            const color = el.color?.replace('#', '') || 'F1F5F9';
-            const align = el.align || 'left';
-            const bold = el.bold ? 'bold' : 'normal';
-
-            // Truncate content to 40 chars for high-priority, 25 for others
-            const maxChars = el.zone?.purpose === 'hero' ? 40 : 25;
-            const content = (el.content || '').substring(0, maxChars);
-            const truncated = el.content && el.content.length > maxChars ? '...' : '';
-
-            // Escape XML special characters
-            const escaped = (content + truncated)
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;');
-
-            elementSvg = `  <text x="${x}" y="${y + fontSize}" font-size="${fontSize}" `;
-            elementSvg += `fill="#${color}" font-weight="${bold}" text-anchor="${align === 'center' ? 'middle' : 'start'}">`;
-            elementSvg += escaped;
-            elementSvg += `</text>\n`;
-
-        } else if (el.type === 'shape') {
-            const fillColor = el.fill?.color?.replace('#', '') || '22C55E';
-            const fillAlpha = el.fill?.alpha !== undefined ? el.fill.alpha : 1;
-            const borderColor = el.border?.color?.replace('#', '') || fillColor;
-            const borderWidth = el.border?.width || 0;
-            const radius = (el as any).rectRadius || 0;
-
-            if (el.shapeType === 'rect') {
-                elementSvg = `  <rect x="${x}" y="${y}" width="${w}" height="${h}" `;
-                elementSvg += `fill="#${fillColor}" fill-opacity="${fillAlpha}" `;
-                if (borderWidth > 0) {
-                    elementSvg += `stroke="#${borderColor}" stroke-width="${borderWidth}" `;
-                }
-                if (radius > 0) {
-                    elementSvg += `rx="${radius}" ry="${radius}" `;
-                }
-                elementSvg += `/>\n`;
-            } else if (el.shapeType === 'circle' || el.shapeType === 'ellipse') {
-                const cx = x + w / 2;
-                const cy = y + h / 2;
-                const rx = w / 2;
-                const ry = h / 2;
-                elementSvg = `  <ellipse cx="${cx}" cy="${cy}" rx="${rx}" ry="${ry}" `;
-                elementSvg += `fill="#${fillColor}" fill-opacity="${fillAlpha}" />\n`;
-            }
-
-            // Render shape text if present
-            if (el.text) {
-                const textColor = el.textColor?.replace('#', '') || 'FFFFFF';
-                const textX = x + w / 2;
-                const textY = y + h / 2 + 6; // Approximate vertical center
-                const escaped = el.text
-                    .substring(0, 20) // Reduce from 30 to save space
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
-                elementSvg += `  <text x="${textX}" y="${textY}" font-size="14" `;
-                elementSvg += `fill="#${textColor}" text-anchor="middle">${escaped}</text>\n`;
-            }
-        }
-        // Skip image elements (data URLs would bloat SVG excessively)
-
-        // Check if adding this element would exceed size limit
-        if (currentSize + elementSvg.length > MAX_SVG_SIZE) {
-            // Stop adding elements - size limit reached
-            break;
-        }
-
-        // Add element to SVG and update size counter
-        svg += elementSvg;
-        currentSize += elementSvg.length;
-        renderedCount++;
-    }
-
-    if (elements.length > renderedCount) {
-        svg += `  <!-- ${elements.length - renderedCount} lower-priority elements omitted (size limit: ${MAX_SVG_SIZE}) -->\n`;
-    }
-
-    svg += `</svg>`;
-
-    // GAP 4: With priority-based inclusion, we should always stay under limit
-    // Log warning if we're close to the limit
-    if (svg.length > 13000) {
-        console.warn(`[SVG PROXY] SVG proxy approaching size limit: ${svg.length} chars (${renderedCount}/${elements.length} elements)`);
-    } else {
-        console.log(`[SVG PROXY] Generated content-aware SVG: ${svg.length} chars, ${renderedCount}/${elements.length} elements`);
-    }
-
-    return svg;
-}
-
-/**
- * Fallback simplified SVG proxy (zone boxes only).
- * Used when content-aware SVG exceeds size limit.
- */
-function generateSimplifiedSvgProxy(slide: SlideNode): string {
-    const variant = slide.routerConfig?.layoutVariant || 'standard-vertical';
-    const layoutEngine = new SpatialLayoutEngine();
-    const zones = layoutEngine.getZonesForVariant(variant);
-
-    let svg = `<svg viewBox="0 0 1000 563" xmlns="http://www.w3.org/2000/svg">\n`;
-    svg += `  <rect x="0" y="0" width="1000" height="563" fill="#0f172a" id="bg"/>\n`;
-
-    zones.forEach(zone => {
-        const x = Math.round(zone.x * 100);
-        const y = Math.round(zone.y * 100);
-        const w = Math.round(zone.w * 100);
-        const h = Math.round(zone.h * 100);
-
-        const stroke = zone.purpose === 'hero' ? '#22c55e' :
-                       zone.purpose === 'secondary' ? '#3b82f6' : '#f59e0b';
-
-        svg += `  <rect x="${x}" y="${y}" width="${w}" height="${h}" `;
-        svg += `fill="none" stroke="${stroke}" stroke-width="2" id="${zone.id}"/>\n`;
-    });
-
-    svg += `</svg>`;
-    return svg;
-}
-
 /**
  * Run visual critique agent on a slide.
  * Returns VisualCritiqueReport with issues and overall score.
@@ -584,3 +384,4 @@ export async function runLayoutRepair(
         };
     }
 }
+

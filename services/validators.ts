@@ -20,9 +20,9 @@ const hasGoodContrast = (hex: string): boolean => {
   const g = parseInt(cleanHex.substring(2, 4), 16);
   const b = parseInt(cleanHex.substring(4, 6), 16);
   const yiq = ((r * 299) + (g * 587) + (b * 114)) / 1000;
-  // If YIQ >= 128, it's light (needs dark text). If < 128, it's dark (needs light text).
-  // Assuming white text overlay, we need dark background (< 180 safe margin for readability)
-  return yiq < 180;
+  // Allow very dark or very light backgrounds (text color can adapt)
+  // Flag mid-tone backgrounds that often reduce legibility
+  return yiq < 160 || yiq > 220;
 };
 
 export const validateVisualLayoutAlignment = (
@@ -34,7 +34,7 @@ export const validateVisualLayoutAlignment = (
   let score = 100;
 
   // 1. Check spatial strategy matches layout variant
-  const validLayoutVariants = ['standard-vertical', 'split-left-text', 'split-right-text', 'hero-centered', 'bento-grid', 'timeline-horizontal'];
+  const validLayoutVariants = ['standard-vertical', 'split-left-text', 'split-right-text', 'hero-centered', 'bento-grid', 'timeline-horizontal', 'dashboard-tiles', 'metrics-rail', 'asymmetric-grid'];
   if (!validLayoutVariants.includes(routerConfig.layoutVariant)) {
     score -= 20;
     errors.push({
@@ -67,15 +67,15 @@ export const validateVisualLayoutAlignment = (
     }
   }
 
-  // Validate negative space is in optimal range (10-50%)
-  if (negativeSpacePct < 10) {
+  // Validate negative space is in optimal range (15-35%)
+  if (negativeSpacePct < 15) {
     score -= 10;
     errors.push({
       code: 'POOR_NEGATIVE_SPACE',
       message: `Negative space allocation (${negativeSpacePct}%) is too low for professional design`,
       suggestedFix: 'Increase negative space to at least 15%'
     });
-  } else if (negativeSpacePct > 50) {
+  } else if (negativeSpacePct > 35) {
     score -= 5;
     errors.push({
       code: 'EXCESSIVE_NEGATIVE_SPACE',
@@ -84,17 +84,14 @@ export const validateVisualLayoutAlignment = (
     });
   }
 
-  // 3. Check color contrast with background
-  if (routerConfig.densityBudget.maxChars > 500) {
-    // Heavy text load needs good contrast
-    if (visualDesign.color_harmony?.background_tone && !hasGoodContrast(visualDesign.color_harmony.background_tone)) {
-      score -= 20;
-      errors.push({
-        code: 'POOR_TEXT_CONTRAST',
-        message: 'Background color won\'t provide sufficient contrast for text overlay',
-        suggestedFix: 'Use darker/lighter background treatment'
-      });
-    }
+  // 3. Check color contrast with background (flag mid-tone ambiguity)
+  if (visualDesign.color_harmony?.background_tone && !hasGoodContrast(visualDesign.color_harmony.background_tone)) {
+    score -= 15;
+    errors.push({
+      code: 'POOR_TEXT_CONTRAST',
+      message: 'Background tone is mid-contrast; ensure text color adapts or provide a text-safe zone',
+      suggestedFix: 'Use a darker or lighter background tone, or add a text-safe band with strong contrast'
+    });
   }
 
   // 4. Visual Focus Alignment (Did the agent listen to the router?)
@@ -475,6 +472,20 @@ export function validateGeneratorCompliance(
       requiredTypes: ['metric-cards', 'icon-grid'],
       maxComponents: 6,
       minComponents: 2
+    },
+    'dashboard-tiles': {
+      requiredTypes: ['metric-cards'],
+      minComponents: 2,
+      maxComponents: 3
+    },
+    'metrics-rail': {
+      requiredTypes: ['metric-cards', 'icon-grid'],
+      minComponents: 2,
+      maxComponents: 3
+    },
+    'asymmetric-grid': {
+      minComponents: 1,
+      maxComponents: 3
     },
     'hero-centered': {
       maxComponents: 2,

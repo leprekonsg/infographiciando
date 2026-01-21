@@ -1,522 +1,250 @@
-# InfographIQ - Architecture Blueprint
+﻿# InfographIQ Architecture Blueprint
 
-> **Generated**: 2026-01-20  
-> **Version**: 2.0 (Interactions API Migration)  
-> **Source**: Codebase Analysis
-
----
-
-## High-Level System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                  INFOGRAPHIQ SYSTEM                                      │
-│                        AI-Powered Slide Deck Generation Platform                         │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-                                          │
-          ┌───────────────────────────────┼───────────────────────────────┐
-          ▼                               ▼                               ▼
-   ┌─────────────┐              ┌─────────────────┐              ┌─────────────────┐
-   │   FRONTEND  │              │   AGENT LAYER   │              │    SERVICES     │
-   │   (React)   │◄────────────►│  (5 LLM Agents) │◄────────────►│  (Rendering)    │
-   │             │              │                 │              │                 │
-   │ • App.tsx   │              │ • Researcher    │              │ • Spatial       │
-   │ • Builder   │              │ • Architect     │              │ • Infographic   │
-   │ • Preview   │              │ • Router        │              │ • PPTX Gen      │
-   │ • Canvas    │              │ • Content Plan  │              │ • Validators    │
-   │             │              │ • Generator     │              │                 │
-   │             │              │ • Visual Design │              │                 │
-   └─────────────┘              └─────────────────┘              └─────────────────┘
-          │                               │                               │
-          └───────────────────────────────┼───────────────────────────────┘
-                                          ▼
-                         ┌─────────────────────────────────┐
-                         │     GEMINI INTERACTIONS API     │
-                         │                                 │
-                         │  • Multi-turn Conversations     │
-                         │  • Structured JSON Output       │
-                         │  • Google Search Grounding      │
-                         │  • Image Generation             │
-                         │  • Thinking Capabilities        │
-                         └─────────────────────────────────┘
-```
+> **Updated**: 2026-01-21  
+> **Version**: 2.1 (Node/Browser Separation + Cost Tracking Hardened)  
+> **Source**: Codebase Review + Architectural Fixes
 
 ---
 
-## Model Tier Strategy
+## 1) Executive Overview
 
-Based on [Phil Schmid's Agent Best Practices](https://www.philschmid.de/building-agents):
+InfographIQ is a **client-first, agent-orchestrated** system that generates slide decks via a multi-agent pipeline, then renders them into PPTX with spatially-aware layouts. The 2026-01-21 changes introduce **strict Node/Browser separation** for native modules and **type-safe cost tracking** for Qwen-VL usage.
+
+Key improvements in this version:
+- **Native module isolation** using dynamic import + runtime guards.
+- **Browser-safe bundling** (Vite excludes Node-only modules).
+- **Cost tracking** for Qwen-VL made explicit and type-safe.
+
+---
+
+## 2) System Map (Updated)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           MODEL SELECTION STRATEGY                              │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │  MODEL_AGENTIC                          gemini-3-flash-preview          │   │
-│  │  ───────────────────────────────────────────────────────────────────    │   │
-│  │  • 78% SWE-bench (beats Pro at 76.2%)                                   │   │
-│  │  • Cost: $0.15 / $3.50 per 1M tokens                                    │   │
-│  │  • Used by: Researcher, Architect, Content Planner, Generator,          │   │
-│  │             Visual Designer                                              │   │
-│  │  • Tasks: Agentic workflows, spatial reasoning, coding                  │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │  MODEL_SIMPLE                           gemini-2.5-flash                │   │
-│  │  ───────────────────────────────────────────────────────────────────    │   │
-│  │  • 79% cheaper than Flash                                               │   │
-│  │  • Cost: $0.075 / $0.30 per 1M tokens                                   │   │
-│  │  • Used by: Router, JSON Repairer                                       │   │
-│  │  • Tasks: Classification, JSON structuring, pattern matching            │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │  MODEL_REASONING                        gemini-3-pro-preview            │   │
-│  │  ───────────────────────────────────────────────────────────────────    │   │
-│  │  • Reserved for >1M token context synthesis                             │   │
-│  │  • Cost: $2.00 / $12.00 per 1M tokens                                   │   │
-│  │  • Used by: None (rarely needed for slide generation)                   │   │
-│  │  • ⚠️ WARNING: Pro's reasoning tokens reduce output budget              │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                INFOGRAPHIQ SYSTEM                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                         │
+                         ├───────────────────────────────────┐
+                         │                                   │
+                         ▼                                   ▼
+┌───────────────────────┐              ┌──────────────────────────┐
+│      FRONTEND         │              │       AGENT LAYER        │
+│   React + Vite        │◄────────────►│   Multi-Agent Pipeline   │
+│                       │              │ (Research → Generate)    │
+└───────────────────────┘              └──────────────────────────┘
+                         │                                   │
+                         ▼                                   ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                   SERVICES                                           │
+│  • Spatial Rendering  • Infographic Rendering  • PPTX Export  • Validators           │
+│  • Visual Cortex (Qwen-VL)  • Cost Tracker  • Prompt Registry                         │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                            EXTERNAL MODELS & TOOLS                                    │
+│  • Gemini Interactions API  • Google Search Grounding  • Image Gen                   │
+│  • Qwen3-VL (Visual Critique)                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Agent Pipeline Architecture
+## 3) Runtime Separation: Browser vs Node
+
+The architecture explicitly prevents Node-only native modules from entering the browser bundle.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              AGENTIC DECK BUILDER PIPELINE                               │
-│                                 slideAgentService.ts                                     │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+Browser (Vite)                            Node.js (Server/CLI)
+──────────────────────────────────         ───────────────────────────────────
+UI + Agent Orchestration                   Visual Rasterization
+     • React UI                                • @resvg/resvg-js (native)
+     • Gemini Interactions API                 • SVG → PNG pipeline
+     • Spatial rendering                       • Qwen-VL visual critique
+     • PPTX generation                          
+     • Visual Cortex (guarded)                 Visual Cortex (full feature)
 
-┌──────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                          │
-│   INPUT: topic (string)                                                                  │
-│                                                                                          │
-│   ┌────────────────────────────────────────────────────────────────────────────────┐    │
-│   │                     AGENT 1: RESEARCHER (runResearcher)                         │    │
-│   ├────────────────────────────────────────────────────────────────────────────────┤    │
-│   │  Model: MODEL_AGENTIC (gemini-3-flash-preview)                                 │    │
-│   │  Thinking: 'low'                                                                │    │
-│   │  Temperature: 0.3                                                               │    │
-│   │  Max Iterations: 5                                                              │    │
-│   │                                                                                 │    │
-│   │  Tools:                                                                         │    │
-│   │    • web_search (delegated to Google Search grounding)                          │    │
-│   │                                                                                 │    │
-│   │  Input: topic                                                                   │    │
-│   │  Output: ResearchFact[] (8-12 verified facts with sources)                      │    │
-│   │                                                                                 │    │
-│   │  Schema: [ { id, category, claim, value, source, confidence } ]                 │    │
-│   └────────────────────────────────────────────────────────────────────────────────┘    │
-│                                          │                                               │
-│                                          ▼                                               │
-│   ┌────────────────────────────────────────────────────────────────────────────────┐    │
-│   │                     AGENT 2: ARCHITECT (runArchitect)                           │    │
-│   ├────────────────────────────────────────────────────────────────────────────────┤    │
-│   │  Model: MODEL_AGENTIC (gemini-3-flash-preview)                                 │    │
-│   │  Thinking: 'medium' ✅ (Strategic brain, small output won't truncate)          │    │
-│   │  Temperature: 0.2                                                               │    │
-│   │                                                                                 │    │
-│   │  Input: topic, facts[]                                                          │    │
-│   │  Output: Outline { narrativeGoal, title, factClusters, styleGuide, slides[] }   │    │
-│   │                                                                                 │    │
-│   │  Responsibilities:                                                              │    │
-│   │    • Groups facts into thematic clusters                                        │    │
-│   │    • Plans 5-8 slide narrative arc                                              │    │
-│   │    • Defines global style guide (colors, fonts, layout strategy)                │    │
-│   │    • Assigns slide types: title-slide, section-header, content-main,            │    │
-│   │      data-viz, conclusion                                                       │    │
-│   └────────────────────────────────────────────────────────────────────────────────┘    │
-│                                          │                                               │
-│                                          ▼                                               │
-│   ┌────────────────────────────────────────────────────────────────────────────────┐    │
-│   │                     FOR EACH SLIDE (Parallel Processing)                        │    │
-│   └────────────────────────────────────────────────────────────────────────────────┘    │
-│                                          │                                               │
-│       ┌──────────────────────────────────┼──────────────────────────────────┐           │
-│       ▼                                  ▼                                  ▼           │
-│   ┌────────────┐                  ┌────────────┐                    ┌────────────┐      │
-│   │  3a.ROUTER │                  │ 3b.CONTENT │                    │3c.VISUAL   │      │
-│   │            │                  │   PLANNER  │                    │  DESIGNER  │      │
-│   ├────────────┤                  ├────────────┤                    ├────────────┤      │
-│   │MODEL_SIMPLE│                  │MODEL_AGENTIC                    │MODEL_AGENTIC      │
-│   │2.5-flash   │                  │3-flash     │                    │3-flash     │      │
-│   │            │                  │            │                    │            │      │
-│   │Thinking:   │                  │Thinking:   │                    │Thinking:   │      │
-│   │  None      │                  │  None      │                    │  'low'     │      │
-│   │Temp: 0.1   │                  │Temp: 0.2   │                    │Temp: 0.2   │      │
-│   │            │                  │            │                    │            │      │
-│   │Output:     │                  │Output:     │                    │Output:     │      │
-│   │RouterDecis-│                  │ContentPlan │                    │VisualDesign│      │
-│   │ion {       │                  │{           │                    │Spec {      │      │
-│   │renderMode, │                  │ title,     │                    │ spatial_   │      │
-│   │layoutVar., │                  │ keyPoints, │                    │  strategy, │      │
-│   │densityBudg,│                  │ dataPoints,│                    │ prompt,    │      │
-│   │visualFocus}│                  │ narrative }│                    │ colors }   │      │
-│   └────────────┘                  └────────────┘                    └────────────┘      │
-│       │                                  │                                  │           │
-│       └──────────────────────────────────┼──────────────────────────────────┘           │
-│                                          ▼                                               │
-│   ┌────────────────────────────────────────────────────────────────────────────────┐    │
-│   │                     AGENT 4: GENERATOR (runGenerator)                           │    │
-│   ├────────────────────────────────────────────────────────────────────────────────┤    │
-│   │  Model: MODEL_AGENTIC (gemini-3-flash-preview) ⚠️ NEVER escalates to Pro       │    │
-│   │  Thinking: None (Large output ~3-5KB = thinking causes truncation)             │    │
-│   │  Temperature: 0.1 (0.0 on retry)                                               │    │
-│   │  Max Tokens: 4096 → 6144 on retry                                              │    │
-│   │  Max Retries: 2 + Circuit Breaker                                              │    │
-│   │                                                                                 │    │
-│   │  Input: slideMeta, routerConfig, contentPlan, visualDesignSpec, facts           │    │
-│   │  Output: SlideNode with layoutPlan { title, background, components[] }          │    │
-│   │                                                                                 │    │
-│   │  Component Types (Enforced via Schema):                                         │    │
-│   │    ┌─────────────┬─────────────┬─────────────┬─────────────┬─────────────┐     │    │
-│   │    │text-bullets │metric-cards │process-flow │ icon-grid   │chart-frame  │     │    │
-│   │    └─────────────┴─────────────┴─────────────┴─────────────┴─────────────┘     │    │
-│   │                                                                                 │    │
-│   │  Post-Processing:                                                               │    │
-│   │    • autoRepairSlide() - Normalizes component types, fixes malformed data       │    │
-│   │    • validateSlide() - Schema validation                                        │    │
-│   │    • validateVisualLayoutAlignment() - Checks spatial zones vs layout           │    │
-│   └────────────────────────────────────────────────────────────────────────────────┘    │
-│                                          │                                               │
-│                                          ▼                                               │
-│   ┌────────────────────────────────────────────────────────────────────────────────┐    │
-│   │                     AGENT 5: IMAGE GENERATOR (generateImageFromPrompt)          │    │
-│   ├────────────────────────────────────────────────────────────────────────────────┤    │
-│   │  Model Chain: gemini-3-pro-image-preview → gemini-2.5-flash-image (fallback)   │    │
-│   │  Aspect Ratio: 16:9                                                             │    │
-│   │                                                                                 │    │
-│   │  Input: visualDesignSpec.prompt_with_composition                                │    │
-│   │  Output: backgroundImageUrl (data URL base64)                                   │    │
-│   │                                                                                 │    │
-│   │  Prompt Enhancement:                                                            │    │
-│   │    + "Professional Presentation Slide Background"                               │    │
-│   │    + "High-fidelity, cinematic lighting, corporate aesthetic"                   │    │
-│   │    + "Substantial negative space for overlay text"                              │    │
-│   │    + NEGATIVE_PROMPT (no text, no clutter, no watermarks)                       │    │
-│   └────────────────────────────────────────────────────────────────────────────────┘    │
-│                                          │                                               │
-│                                          ▼                                               │
-│   OUTPUT: EditableSlideDeck { id, topic, meta, slides[], metrics }                       │
-│                                                                                          │
-└──────────────────────────────────────────────────────────────────────────────────────────┘
+Key safety mechanism:
+     visualCortex.ts uses dynamic import → visualRasterizer.ts
+     if (typeof window !== 'undefined') throw (guard)
+```
+
+**Bundling protections**:
+- Vite excludes `@resvg/resvg-js` from optimizeDeps and Rollup externalization.
+- Browser execution path skips rasterization with explicit runtime error.
+
+---
+
+## 4) Agentic Pipeline (Current, Stable)
+
+```
+INPUT: topic (string)
+     │
+     ▼
+AGENT 1: Researcher (MODEL_AGENTIC)
+     └─ outputs ResearchFact[] (8–12 verified facts)
+     │
+     ▼
+AGENT 2: Architect (MODEL_AGENTIC, thinking=medium)
+     └─ outputs Outline (narrativeGoal, styleGuide, slides[])
+     │
+     ▼
+FOR EACH SLIDE (parallel)
+     ├─ Router (MODEL_SIMPLE) → RouterDecision
+     ├─ Content Planner (MODEL_AGENTIC) → ContentPlan
+     └─ Visual Designer (MODEL_AGENTIC, thinking=low) → VisualDesignSpec
+     │
+     ▼
+AGENT 4: Generator (MODEL_AGENTIC, thinking=none)
+     └─ outputs SlideNode (layoutPlan + components)
+     │
+     ▼
+Image Generator (gemini-3-pro-image-preview → fallback)
+     └─ outputs backgroundImageUrl (data URL)
+     │
+     ▼
+OUTPUT: EditableSlideDeck
+```
+
+**Critical constraint**: Generator never escalates to Pro (avoids truncation).
+
+---
+
+## 5) Rendering Pipeline
+
+```
+SlideNode
+     │
+     ▼
+SpatialLayoutEngine
+     ├─ Select layout template (6 variants)
+     ├─ Allocate zones by semantic affinity
+     └─ Enforce negative space rules
+     │
+     ▼
+InfographicRenderer
+     ├─ normalizeColor() (LLM-friendly names → hex)
+     └─ compileSlide() → VisualElement[]
+     │
+     ▼
+SlideDeckBuilder (pptxgenjs)
+     ├─ Background render
+     ├─ Visual elements placement
+     └─ Speaker notes & citations
 ```
 
 ---
 
-## Data Type Flow
+## 6) Visual Cortex (Qwen-VL) — Updated Flow
+
+The visual critique system now runs **only in Node.js** and is guarded in browser contexts.
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                    DATA TYPE FLOW                                        │
-│                                  types/slideTypes.ts                                     │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-
-  topic: string
-       │
-       ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────┐
-  │  ResearchFact[]                                                                     │
-  │  ┌──────────────────────────────────────────────────────────────────────────────┐  │
-  │  │  { id, category, claim, value?, source?, confidence: high|medium|low }       │  │
-  │  └──────────────────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────────────────────────┘
-       │
-       ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────┐
-  │  Outline (OutlineSchema)                                                            │
-  │  ┌──────────────────────────────────────────────────────────────────────────────┐  │
-  │  │  narrativeGoal: string                                                        │  │
-  │  │  title: string                                                                │  │
-  │  │  knowledgeSheet: ResearchFact[]                                               │  │
-  │  │  factClusters: FactCluster[] (id, theme, factIds[])                           │  │
-  │  │  styleGuide: GlobalStyleGuide {                                               │  │
-  │  │      themeName, fontFamilyTitle, fontFamilyBody,                              │  │
-  │  │      colorPalette: { primary, secondary, background, text, accentHighContrast }│  │
-  │  │      imageStyle, layoutStrategy                                               │  │
-  │  │  }                                                                            │  │
-  │  │  slides: SlideMeta[] (order, type, title, purpose, relevantClusterIds)        │  │
-  │  └──────────────────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────────────────────────┘
-       │
-       ├─────────────────────────────┐
-       ▼                             ▼
-  ┌──────────────────────┐    ┌──────────────────────┐    ┌──────────────────────┐
-  │  RouterDecision      │    │  ContentPlan         │    │  VisualDesignSpec    │
-  │  ──────────────────  │    │  ──────────────────  │    │  ──────────────────  │
-  │  renderMode:         │    │  title: string       │    │  spatial_strategy:   │
-  │   statement |        │    │  keyPoints: string[] │    │    zones[], hierarchy│
-  │   infographic |      │    │  dataPoints: []      │    │  prompt_with_composit│
-  │   data-viz |         │    │  narrative: string   │    │  foreground_elements │
-  │   standard           │    │                      │    │  background_treatment│
-  │                      │    │                      │    │  negative_space_alloc│
-  │  layoutVariant:      │    │                      │    │  color_harmony:      │
-  │   standard-vertical  │    │                      │    │    primary, accent,  │
-  │   split-left-text    │    │                      │    │    background_tone   │
-  │   split-right-text   │    │                      │    │                      │
-  │   hero-centered      │    │                      │    │                      │
-  │   bento-grid         │    │                      │    │                      │
-  │   timeline-horizontal│    │                      │    │                      │
-  │                      │    │                      │    │                      │
-  │  densityBudget:      │    │                      │    │                      │
-  │   maxChars, maxItems │    │                      │    │                      │
-  │  visualFocus: string │    │                      │    │                      │
-  └──────────────────────┘    └──────────────────────┘    └──────────────────────┘
-       │                             │                             │
-       └─────────────────────────────┼─────────────────────────────┘
-                                     ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────┐
-  │  SlideNode (SlideNodeSchema)                                                        │
-  │  ┌──────────────────────────────────────────────────────────────────────────────┐  │
-  │  │  order: number                                                                │  │
-  │  │  type: title-slide | section-header | content-main | data-viz | conclusion   │  │
-  │  │  title: string                                                                │  │
-  │  │  purpose: string                                                              │  │
-  │  │  routerConfig: RouterDecision                                                 │  │
-  │  │  validation?: ValidationResult                                                │  │
-  │  │                                                                               │  │
-  │  │  layoutPlan: SlideLayoutPlan {                                                │  │
-  │  │      title, background: solid|gradient|image,                                 │  │
-  │  │      components: TemplateComponent[] (max 3)                                  │  │
-  │  │  }                                                                            │  │
-  │  │                                                                               │  │
-  │  │  visualDesignSpec?: VisualDesignSpec                                          │  │
-  │  │  visualReasoning: string                                                      │  │
-  │  │  visualPrompt: string                                                         │  │
-  │  │  backgroundImageUrl?: string (data URL)                                       │  │
-  │  │                                                                               │  │
-  │  │  speakerNotesLines: string[]                                                  │  │
-  │  │  citations?: Citation[]                                                       │  │
-  │  │  chartSpec?: ChartSpec                                                        │  │
-  │  │  selfCritique?: { readabilityScore, textDensityStatus, layoutAction }         │  │
-  │  │  readabilityCheck: pass | warning | fail                                      │  │
-  │  │  warnings?: string[]                                                          │  │
-  │  └──────────────────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────────────────────────┘
-       │
-       ▼
-  ┌────────────────────────────────────────────────────────────────────────────────────┐
-  │  EditableSlideDeck                                                                  │
-  │  ┌──────────────────────────────────────────────────────────────────────────────┐  │
-  │  │  id: string (UUID)                                                            │  │
-  │  │  topic: string                                                                │  │
-  │  │  meta: Outline                                                                │  │
-  │  │  slides: SlideNode[]                                                          │  │
-  │  │  metrics: { totalDurationMs, retries, totalCost?, avgQualityScore? }          │  │
-  │  └──────────────────────────────────────────────────────────────────────────────┘  │
-  └────────────────────────────────────────────────────────────────────────────────────┘
+SVG Proxy → (Node-only) Rasterizer → PNG → Qwen-VL → Critique JSON
+                ▲                 ▲
+                │                 └── visualRasterizer.ts (@resvg/resvg-js)
+                └── visualCortex.ts (dynamic import + runtime guard)
 ```
+
+Two-tier fidelity contract:
+- **Tier 1**: SVG proxy rendering (fast, default).
+- **Tier 2**: PPTX rendering (slow, escalated).
 
 ---
 
-## Template Component Architecture
+## 7) Cost Tracking (Hardened)
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                            TEMPLATE COMPONENT TYPES                                      │
-│                        (TemplateComponentSchema - Discriminated Union)                   │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+Qwen-VL costs are now first-class tracked fields in `CostTracker`:
+- `qwenVLCost`
+- `qwenVLInputTokens`
+- `qwenVLOutputTokens`
+- `qwenVLCalls`
 
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                                                                                          │
-│  ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐                │
-│  │   text-bullets      │ │   metric-cards      │ │   process-flow      │                │
-│  ├─────────────────────┤ ├─────────────────────┤ ├─────────────────────┤                │
-│  │ title?: string      │ │ intro?: string      │ │ intro?: string      │                │
-│  │ content: string[]   │ │ metrics: Metric[]   │ │ steps: Step[]       │                │
-│  │ style?: standard |  │ │   (2-6 items)       │ │   (3-5 items)       │                │
-│  │   highlight | quote │ │                     │ │                     │                │
-│  │                     │ │ Metric {            │ │ Step {              │                │
-│  │ Example:            │ │   value: string     │ │   number: number    │                │
-│  │ • Point 1           │ │   label: string(40) │ │   title: string(30) │                │
-│  │ • Point 2           │ │   icon?: string     │ │   description(80)   │                │
-│  │ • Point 3           │ │   trend?: up|down|  │ │   icon?: string     │                │
-│  │                     │ │          neutral    │ │ }                   │                │
-│  │                     │ │ }                   │ │                     │                │
-│  └─────────────────────┘ └─────────────────────┘ └─────────────────────┘                │
-│                                                                                          │
-│  ┌─────────────────────┐ ┌─────────────────────┐                                        │
-│  │   icon-grid         │ │   chart-frame       │                                        │
-│  ├─────────────────────┤ ├─────────────────────┤                                        │
-│  │ cols: 2-4           │ │ title: string(80)   │                                        │
-│  │ intro?: string      │ │ chartType: bar |    │                                        │
-│  │ items: Item[]       │ │   pie | line |      │                                        │
-│  │   (3-8 items)       │ │   doughnut          │                                        │
-│  │                     │ │ data: DataPoint[]   │                                        │
-│  │ Item {              │ │                     │                                        │
-│  │   label: string(40) │ │ DataPoint {         │                                        │
-│  │   icon: string      │ │   label: string     │                                        │
-│  │   description?      │ │   value: number     │                                        │
-│  │ }                   │ │ }                   │                                        │
-│  └─────────────────────┘ └─────────────────────┘                                        │
-│                                                                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-```
+This removes `any` casts and improves summary accuracy.
 
 ---
 
-## Rendering Pipeline
+## 8) Data Type Flow (Core Types)
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                              RENDERING PIPELINE                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
-
-  SlideNode
-       │
-       ├───────────────────────────────────────────────────────────────────────────────┐
-       ▼                                                                               │
-  ┌────────────────────────────────────────────────────────────────────────────┐       │
-  │  SpatialLayoutEngine (spatialRenderer.ts)                                   │       │
-  ├────────────────────────────────────────────────────────────────────────────┤       │
-  │                                                                            │       │
-  │  Layout Templates (Zone Configurations):                                   │       │
-  │                                                                            │       │
-  │  ┌─────────────────────────────┐ ┌─────────────────────────────┐          │       │
-  │  │ standard-vertical           │ │ split-left-text             │          │       │
-  │  │ ┌─────────────────────────┐ │ │ ┌──────────┬──────────────┐ │          │       │
-  │  │ │    HERO ZONE (title)    │ │ │ │  TEXT    │   VISUAL     │ │          │       │
-  │  │ │    x:0 y:0 w:10 h:2     │ │ │ │  AREA    │   AREA       │ │          │       │
-  │  │ ├─────────────────────────┤ │ │ │  (hero)  │   (secondary)│ │          │       │
-  │  │ │   CONTENT ZONE          │ │ │ │ x:0 w:5  │   x:5.1 w:4.9│ │          │       │
-  │  │ │   x:0 y:2.2 w:10 h:3    │ │ │ └──────────┴──────────────┘ │          │       │
-  │  │ ├─────────────────────────┤ │ └─────────────────────────────┘          │       │
-  │  │ │   ACCENT ZONE           │ │                                          │       │
-  │  │ │   x:0 y:5 w:10 h:0.625  │ │ ┌─────────────────────────────┐          │       │
-  │  │ └─────────────────────────┘ │ │ hero-centered               │          │       │
-  │  └─────────────────────────────┘ │ ┌─────────────────────────┐ │          │       │
-  │                                  │ │   ┌─────────────────┐   │ │          │       │
-  │  ┌─────────────────────────────┐ │ │   │   HERO TITLE    │   │ │          │       │
-  │  │ bento-grid (4 zones)        │ │ │   │x:1 y:1.5 w:8 h:1.2│ │ │          │       │
-  │  │ ┌──────────┬──────────────┐ │ │ │   └─────────────────┘   │ │          │       │
-  │  │ │ GRID-1   │   GRID-2     │ │ │ │   ┌─────────────────┐   │ │          │       │
-  │  │ │ (hero)   │   (hero)     │ │ │ │   │    SUBTITLE     │   │ │          │       │
-  │  │ ├──────────┼──────────────┤ │ │ │   │x:1 y:2.8 w:8 h:1.5│ │ │          │       │
-  │  │ │ GRID-3   │   GRID-4     │ │ │ │   └─────────────────┘   │ │          │       │
-  │  │ │(secondary)│ (secondary) │ │ │ └─────────────────────────┘ │          │       │
-  │  │ └──────────┴──────────────┘ │ └─────────────────────────────┘          │       │
-  │  └─────────────────────────────┘                                          │       │
-  │                                                                            │       │
-  │  Allocation Algorithm:                                                     │       │
-  │   1. Get layoutVariant → fetch zone template                              │       │
-  │   2. Sort components by semantic importance                               │       │
-  │   3. Assign to zones (Title → hero, Metrics/Bullets → secondary)          │       │
-  │   4. Render respecting zone bounds                                        │       │
-  │   5. Apply visual styling based on zone purpose                           │       │
-  │                                                                            │       │
-  │  Output: spatiallyAwareComponents[] (VisualElement[])                      │       │
-  └────────────────────────────────────────────────────────────────────────────┘       │
-       │                                                                               │
-       ▼                                                                               │
-  ┌────────────────────────────────────────────────────────────────────────────┐       │
-  │  InfographicRenderer (infographicRenderer.ts)                               │◄──────┘
-  ├────────────────────────────────────────────────────────────────────────────┤
-  │                                                                            │
-  │  normalizeColor(color) → Handles LLM creative colors:                      │
-  │    "Slate Grey (708090)" → "708090"                                        │
-  │    "Electric Violet" → "8B00FF"                                            │
-  │    "#10b981" → "10B981"                                                    │
-  │                                                                            │
-  │  compileSlide(slide, styleGuide) → VisualElement[]                         │
-  │                                                                            │
-  │  VisualElement Types:                                                      │
-  │    • shape: { shapeType, x, y, w, h, fill, border, text, rotation }        │
-  │    • text: { content, x, y, w, h, fontSize, color, fontFamily, align }     │
-  │    • image: { data, x, y, w, h, transparency }                             │
-  │                                                                            │
-  └────────────────────────────────────────────────────────────────────────────┘
-       │
-       ▼
-  ┌────────────────────────────────────────────────────────────────────────────┐
-  │  SlideDeckBuilder.tsx (PPTX Generation via pptxgenjs)                       │
-  ├────────────────────────────────────────────────────────────────────────────┤
-  │                                                                            │
-  │  For each SlideNode:                                                       │
-  │    1. Create slide with background (image/gradient/solid)                  │
-  │    2. Add compiled VisualElement[] to slide                                │
-  │    3. Add speaker notes                                                    │
-  │                                                                            │
-  │  Export: .pptx file download                                               │
-  │                                                                            │
-  └────────────────────────────────────────────────────────────────────────────┘
+topic → ResearchFact[] → Outline → { RouterDecision, ContentPlan, VisualDesignSpec }
+           → SlideNode → EditableSlideDeck
 ```
+
+**Schemas** live in [types/slideTypes.ts](../types/slideTypes.ts).
 
 ---
 
-## Error Handling & Resilience
+## 9) Template Component Types
+
+Supported layout components (schema-enforced):
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│                          ERROR HANDLING & RESILIENCE                                     │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+text-bullets | metric-cards | process-flow | icon-grid | chart-frame
+```
 
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│  AUTO-REPAIR LAYER (autoRepairSlide)                                                     │
-├─────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                          │
-│  COMPONENT_TYPE_MAP (100+ mappings):                                                     │
-│    'text-block' → 'text-bullets'                                                         │
-│    'text_block' → 'text-bullets'                                                         │
-│    'bullet-list' → 'text-bullets'                                                        │
-│    'stats' → 'metric-cards'                                                              │
-│    'metrics' → 'metric-cards'                                                            │
-│    'flow' → 'process-flow'                                                               │
-│    'timeline' → 'process-flow'                                                           │
-│    'features' → 'icon-grid'                                                              │
-│    'chart' → 'chart-frame'                                                               │
-│    ... (handles hyphen, underscore, camelCase, abbreviated variants)                     │
-│                                                                                          │
-│  Normalization Functions:                                                                │
-│    • normalizeArrayItem() - Converts strings/JSON strings to proper objects              │
-│    • deepParseJsonStrings() - Recursively parses nested JSON strings                     │
-│    • isGarbage() - Removes malformed text (<2 chars, only numbers, etc.)                 │
-│                                                                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+Adding a new type requires updates in:
+- [types/slideTypes.ts](../types/slideTypes.ts)
+- [services/slideAgentService.ts](../services/slideAgentService.ts)
+- [services/infographicRenderer.ts](../services/infographicRenderer.ts)
+- [services/promptRegistry.ts](../services/promptRegistry.ts)
 
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│  CIRCUIT BREAKER PATTERN                                                                 │
-├─────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                          │
-│  Generator Circuit Breaker:                                                              │
-│    • MAX_RETRIES: 2                                                                      │
-│    • After 2+ failures → Break loop, use text-bullets fallback                           │
-│    • Token budget increases on retry: 4096 → 6144                                        │
-│                                                                                          │
-│  Model Circuit Breaker (geminiService.ts):                                               │
-│    • Tracks failures per model                                                           │
-│    • Cooldown: 60 seconds for Pro model                                                  │
-│    • Threshold: 2 failures                                                               │
-│    • Fallback chain: Pro → Flash → 2.0 Flash → Lite                                      │
-│                                                                                          │
-│  Orchestrator Error Boundary:                                                            │
-│    • Each slide has try/catch                                                            │
-│    • On failure → Create fallback slide, continue deck generation                        │
-│    • Never fails entire deck for single slide error                                      │
-│                                                                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+---
 
-┌─────────────────────────────────────────────────────────────────────────────────────────┐
-│  JSON TRUNCATION MITIGATION                                                              │
-├─────────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                          │
-│  Root Cause: thinkingLevel consumes output tokens                                        │
-│                                                                                          │
-│  Solutions Applied:                                                                      │
-│    ✓ Generator: No thinkingLevel (removed - large output ~3-5KB)                         │
-│    ✓ Architect: thinkingLevel 'medium' (small output ~1KB = safe)                        │
-│    ✓ Pre-truncation: keyPoints limited to 5, dataPoints to 4                             │
-│    ✓ Ultra-simple schema: Reduced nesting from 4+ to 2 levels                            │
-│    ✓ Compact prompts: componentExamples reduced from 400 to ~200 chars                   │
-│    ✓ Never escalate to MODEL_REASONING (Pro uses reasoning tokens)                       │
-│    ✓ String-array fallback: Detects ["item1", "item2"] and converts to text-bullets      │
-│                                                                                          │
-└─────────────────────────────────────────────────────────────────────────────────────────┘
+## 10) Error Handling & Resilience
+
+**Auto-Repair Layer**
+- Component type normalization (100+ mappings)
+- Deep JSON parsing for escaped/nested output
+- Garbage filtering (<2 chars, numeric-only, etc.)
+
+**Circuit Breakers**
+- Generator: MAX_RETRIES=2 then fallback slide
+- Model calls: failover chain with cooldowns
+
+**Truncation Mitigation**
+- Generator thinking disabled
+- Controlled list lengths (keyPoints ≤ 5, dataPoints ≤ 4)
+
+---
+
+## 11) Updated Build & Runtime Guarantees
+
+**Build guarantees**:
+- Vite excludes Node-only modules from browser bundles.
+- Visual rasterization is never imported at top-level in browser.
+
+**Runtime guarantees**:
+- Browser attempts to rasterize SVG throw explicit errors.
+- Node execution loads native modules safely via dynamic import.
+
+---
+
+## 12) Quick Reference (Models)
+
+| Agent | Model | Thinking | Temperature | Notes |
+|------|-------|----------|-------------|------|
+| Researcher | 3 Flash | low | 0.3 | Fact extraction |
+| Architect | 3 Flash | medium | 0.2 | Narrative planning |
+| Router | 2.5 Flash | none | 0.1 | Classification |
+| Content Planner | 3 Flash | none | 0.2 | Key points |
+| Visual Designer | 3 Flash | low | 0.2 | Spatial composition |
+| Generator | 3 Flash | none | 0.1 | Final assembly |
+| Image Gen | 3 Pro Image → 2.5 Flash Image | - | - | Backgrounds |
+
+---
+
+## 13) Architecture Health Summary
+
+**Status**: ✅ Healthy and updated for Node/Browser separation.
+
+**Primary safeguards**:
+- Dynamic imports for native modules.
+- Vite externalization rules.
+- Type-safe cost tracking for Qwen-VL.
+
+**Recommended next step** (optional):
+- Move agent orchestration to a Node backend for production security and full visual cortex coverage.
 ```
 
 ---

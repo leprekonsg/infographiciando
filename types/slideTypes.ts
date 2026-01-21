@@ -24,7 +24,10 @@ export const LayoutVariantSchema = z.enum([
   'split-right-text',  // Visual Left, Text Right
   'hero-centered',     // Big impact text center
   'bento-grid',        // Boxed layout
-  'timeline-horizontal' // Left to right flow
+  'timeline-horizontal', // Left to right flow
+  'dashboard-tiles',   // Title + metric row + split panels
+  'metrics-rail',      // Left rail metrics + right content
+  'asymmetric-grid'    // Large panel + stacked side panels
 ]);
 
 export const DensityBudgetSchema = z.object({
@@ -252,6 +255,54 @@ export const StyleGuideSchema = z.object({
   }),
   imageStyle: z.string(),
   layoutStrategy: z.string(),
+  themeTokens: z.object({
+    typography: z.object({
+      scale: z.object({
+        hero: z.number().optional(),
+        title: z.number().optional(),
+        subtitle: z.number().optional(),
+        body: z.number().optional(),
+        label: z.number().optional(),
+        metric: z.number().optional(),
+        micro: z.number().optional()
+      }).optional(),
+      weights: z.object({
+        hero: z.number().optional(),
+        title: z.number().optional(),
+        subtitle: z.number().optional(),
+        body: z.number().optional(),
+        label: z.number().optional(),
+        metric: z.number().optional()
+      }).optional(),
+      lineHeights: z.object({
+        title: z.number().optional(),
+        body: z.number().optional()
+      }).optional(),
+      letterSpacing: z.object({
+        title: z.number().optional(),
+        body: z.number().optional()
+      }).optional()
+    }).optional(),
+    spacing: z.object({
+      xs: z.number().optional(),
+      sm: z.number().optional(),
+      md: z.number().optional(),
+      lg: z.number().optional()
+    }).optional(),
+    radii: z.object({
+      card: z.number().optional(),
+      pill: z.number().optional()
+    }).optional(),
+    surfaces: z.object({
+      cardStyle: z.enum(['solid', 'outline', 'glass']).optional(),
+      borderWidth: z.number().optional(),
+      opacity: z.number().optional()
+    }).optional(),
+    background: z.object({
+      style: z.enum(['solid', 'gradient', 'mesh', 'textured']).optional(),
+      gradientStops: z.array(z.string()).optional()
+    }).optional()
+  }).optional()
 });
 
 // 3. SLIDE NODE (Recursive Refinement)

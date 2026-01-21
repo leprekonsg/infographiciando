@@ -3,6 +3,25 @@
 import { TemplateComponent, VisualElement, GlobalStyleGuide, SpatialZone, LayoutVariant, SpatialStrategy, SlideNode, VisualDesignSpec, EnvironmentState } from '../types/slideTypes';
 import { InfographicRenderer, normalizeColor } from './infographicRenderer';
 
+const getYiq = (hex: string): number => {
+  const clean = hex.replace('#', '').trim();
+  if (clean.length !== 6) return 0;
+  const r = parseInt(clean.substring(0, 2), 16);
+  const g = parseInt(clean.substring(2, 4), 16);
+  const b = parseInt(clean.substring(4, 6), 16);
+  return ((r * 299) + (g * 587) + (b * 114)) / 1000;
+};
+
+const resolveReadableTextColor = (backgroundHex: string, fallbackTextHex: string): string => {
+  const yiq = getYiq(backgroundHex);
+  // Prefer dark text on light backgrounds, light text on dark backgrounds
+  const preferred = yiq > 180 ? '0F172A' : 'F8FAFC';
+  // If fallback already provides good contrast, keep it
+  const fallbackYiq = getYiq(fallbackTextHex);
+  const hasContrast = Math.abs(yiq - fallbackYiq) >= 80;
+  return hasContrast ? fallbackTextHex : preferred;
+};
+
 // Predefined Spatial Templates for Layout Variants
 // Coordinates are 0-10 (X) and 0-5.625 (Y)
 const LAYOUT_TEMPLATES: Record<string, SpatialZone[]> = {
@@ -39,7 +58,39 @@ const LAYOUT_TEMPLATES: Record<string, SpatialZone[]> = {
     { id: 'title', x: 0.5, y: 0.5, w: 9, h: 0.8, purpose: 'hero', content_suggestion: 'Title' },
     { id: 'timeline-track', x: 0.5, y: 2.8, w: 9, h: 0.1, purpose: 'accent', content_suggestion: 'Timeline Line' },
     { id: 'content-area', x: 0.5, y: 1.5, w: 9, h: 3.5, purpose: 'hero', content_suggestion: 'Timeline Steps' }
+  ],
+  'dashboard-tiles': [
+    { id: 'title', x: 0.5, y: 0.4, w: 9, h: 0.7, purpose: 'hero', content_suggestion: 'Title' },
+    { id: 'card-1', x: 0.5, y: 1.3, w: 2.7, h: 1.2, purpose: 'secondary', content_suggestion: 'Metric Card 1' },
+    { id: 'card-2', x: 3.4, y: 1.3, w: 2.7, h: 1.2, purpose: 'secondary', content_suggestion: 'Metric Card 2' },
+    { id: 'card-3', x: 6.3, y: 1.3, w: 2.7, h: 1.2, purpose: 'secondary', content_suggestion: 'Metric Card 3' },
+    { id: 'left-panel', x: 0.5, y: 2.8, w: 4.2, h: 2.4, purpose: 'hero', content_suggestion: 'Primary Text/Chart' },
+    { id: 'right-panel', x: 5.0, y: 2.8, w: 4.0, h: 2.4, purpose: 'secondary', content_suggestion: 'Secondary Component' }
+  ],
+  'metrics-rail': [
+    { id: 'title', x: 0.5, y: 0.4, w: 9, h: 0.7, purpose: 'hero', content_suggestion: 'Title' },
+    { id: 'rail', x: 0.5, y: 1.3, w: 2.4, h: 3.9, purpose: 'secondary', content_suggestion: 'Metric Rail' },
+    { id: 'rail-divider', x: 3.1, y: 1.3, w: 0.05, h: 3.9, purpose: 'accent', content_suggestion: 'Divider Line' },
+    { id: 'main', x: 3.4, y: 1.3, w: 6.1, h: 3.9, purpose: 'hero', content_suggestion: 'Primary Text/Diagram' }
+  ],
+  'asymmetric-grid': [
+    { id: 'title', x: 0.5, y: 0.4, w: 9, h: 0.7, purpose: 'hero', content_suggestion: 'Title' },
+    { id: 'panel-large', x: 0.5, y: 1.3, w: 5.4, h: 4.0, purpose: 'hero', content_suggestion: 'Primary Component' },
+    { id: 'panel-top', x: 6.2, y: 1.3, w: 3.3, h: 1.85, purpose: 'secondary', content_suggestion: 'Secondary Component' },
+    { id: 'panel-bottom', x: 6.2, y: 3.45, w: 3.3, h: 1.85, purpose: 'secondary', content_suggestion: 'Secondary Component' }
   ]
+};
+
+const DEFAULT_THEME_TOKENS = {
+  typography: {
+    scale: { hero: 42, title: 32, subtitle: 20, body: 14, label: 10, metric: 24, micro: 9 },
+    weights: { hero: 700, title: 700, subtitle: 600, body: 400, label: 600, metric: 700 },
+    lineHeights: { title: 1.1, body: 1.25 },
+    letterSpacing: { title: 0.2, body: 0 }
+  },
+  spacing: { xs: 0.08, sm: 0.12, md: 0.2, lg: 0.32 },
+  radii: { card: 0.18, pill: 0.4 },
+  surfaces: { cardStyle: 'glass', borderWidth: 1.2, opacity: 0.65 }
 };
 
 export class SpatialLayoutEngine {
@@ -74,12 +125,12 @@ export class SpatialLayoutEngine {
     // --- COMPONENT-ZONE AFFINITY MAPPING ---
     // Prevents text components from landing in visual zones and vice versa
     const componentZoneAffinity: Record<string, string[]> = {
-      'text-bullets': ['text-main', 'content-top', 'content-bottom', 'hero-content', 'content-area'],
-      'chart-frame': ['visual-right', 'visual-left', 'content-top', 'content-area', 'grid-1', 'grid-2'],
-      'metric-cards': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'content-top', 'content-bottom', 'visual-right'],
-      'process-flow': ['content-area', 'content-top', 'content-bottom', 'visual-right', 'visual-left'],
-      'icon-grid': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'content-top', 'content-bottom'],
-      'diagram-svg': ['visual-right', 'visual-left', 'content-top', 'content-area'],
+      'text-bullets': ['text-main', 'content-top', 'content-bottom', 'hero-content', 'content-area', 'left-panel', 'main', 'panel-large', 'panel-top', 'panel-bottom'],
+      'chart-frame': ['visual-right', 'visual-left', 'content-top', 'content-area', 'grid-1', 'grid-2', 'right-panel', 'main', 'panel-large'],
+      'metric-cards': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'card-1', 'card-2', 'card-3', 'rail', 'content-top', 'content-bottom', 'visual-right'],
+      'process-flow': ['content-area', 'content-top', 'content-bottom', 'visual-right', 'visual-left', 'main', 'panel-large'],
+      'icon-grid': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'rail', 'content-top', 'content-bottom', 'panel-top', 'panel-bottom'],
+      'diagram-svg': ['visual-right', 'visual-left', 'content-top', 'content-area', 'main', 'panel-large', 'right-panel'],
       'title-section': ['title', 'hero-title'] // Title sections go in title zones
     };
 
@@ -134,6 +185,46 @@ export class SpatialLayoutEngine {
           } else {
             unplaced.push(comp);
           }
+        }
+      });
+    } else if (variant === 'dashboard-tiles') {
+      // Metric row + split panels
+      const cardZones = ['card-1', 'card-2', 'card-3'];
+      let cardIndex = 0;
+
+      // Place metric cards into the top row
+      components.forEach(comp => {
+        if (comp.type === 'metric-cards') {
+          (comp.metrics || []).forEach(m => {
+            const zid = cardZones[cardIndex];
+            const zone = zones.find(z => z.id === zid);
+            if (zone) {
+              allocation.set(zid, {
+                type: 'component-part',
+                component: {
+                  type: 'metric-cards',
+                  metrics: [m],
+                  intro: ''
+                }
+              });
+              cardIndex++;
+            }
+          });
+        }
+      });
+
+      // Place remaining components into bottom panels
+      const remaining = components.filter(c => c.type !== 'metric-cards');
+      const panelZones = ['left-panel', 'right-panel'];
+      let panelIndex = 0;
+      remaining.forEach(comp => {
+        const zid = panelZones[panelIndex];
+        const zone = zones.find(z => z.id === zid);
+        if (zone) {
+          allocation.set(zid, { type: 'component-full', component: comp });
+          panelIndex++;
+        } else {
+          unplaced.push(comp);
         }
       });
     } else {
@@ -213,6 +304,12 @@ export class SpatialLayoutEngine {
 
     // --- APPLY VISUAL DESIGN SPEC OVERRIDES ---
     // If visualDesignSpec has color_harmony, use it to override styleGuide colors
+    const baseBackground = normalizeColor(
+      visualDesignSpec?.color_harmony?.background_tone || styleGuide.colorPalette.background
+    );
+    const baseText = normalizeColor(styleGuide.colorPalette.text);
+    const contrastText = resolveReadableTextColor(baseBackground, baseText);
+
     const effectiveStyleGuide: GlobalStyleGuide = visualDesignSpec?.color_harmony
       ? {
         ...styleGuide,
@@ -221,10 +318,18 @@ export class SpatialLayoutEngine {
           // Override with VisualDesignSpec colors if provided
           primary: normalizeColor(visualDesignSpec.color_harmony.primary || styleGuide.colorPalette.primary),
           accentHighContrast: normalizeColor(visualDesignSpec.color_harmony.accent || styleGuide.colorPalette.accentHighContrast),
-          background: normalizeColor(visualDesignSpec.color_harmony.background_tone || styleGuide.colorPalette.background)
+          background: baseBackground,
+          text: contrastText
         }
       }
-      : styleGuide;
+      : {
+        ...styleGuide,
+        colorPalette: {
+          ...styleGuide.colorPalette,
+          background: baseBackground,
+          text: contrastText
+        }
+      };
 
     // Parse negative space allocation if provided (e.g., "20%", "25 percent", etc.)
     let negativeSpaceMultiplier = 1.0;
@@ -233,10 +338,10 @@ export class SpatialLayoutEngine {
       if (negMatch) {
         const pct = parseInt(negMatch[1], 10);
         // Apply slight zone size reduction for higher negative space values
-        if (pct > 25) {
-          negativeSpaceMultiplier = 0.95; // Introduce 5% reduction for zone sizes
-        } else if (pct > 35) {
+        if (pct > 35) {
           negativeSpaceMultiplier = 0.90; // 10% reduction for very high negative space
+        } else if (pct > 25) {
+          negativeSpaceMultiplier = 0.95; // Introduce 5% reduction for zone sizes
         }
       }
     }
@@ -245,13 +350,15 @@ export class SpatialLayoutEngine {
       console.warn(`[SpatialRenderer] Unplaced components for slide ${slide.title}:`, unplaced.map(c => c.type));
     }
 
+    const themeTokens = this.resolveThemeTokens(effectiveStyleGuide);
+
     zones.forEach(zone => {
       const allocated = allocation.get(zone.id);
 
       if (!allocated) {
         // Render static accents
         if (zone.purpose === 'accent') {
-          if (zone.id === 'divider' || zone.id === 'accent-bar' || zone.id === 'timeline-track') {
+          if (zone.id === 'divider' || zone.id === 'accent-bar' || zone.id === 'timeline-track' || zone.id === 'rail-divider') {
             elements.push({
               type: 'shape', shapeType: 'rect',
               x: zone.x, y: zone.y, w: zone.w, h: zone.h,
@@ -271,20 +378,22 @@ export class SpatialLayoutEngine {
       }
 
       if (allocated.type === 'title') {
-        const fontSize = zone.purpose === 'hero' ? (variant === 'hero-centered' ? 42 : 32) : 24;
+        const fontSize = zone.purpose === 'hero'
+          ? (variant === 'hero-centered' ? themeTokens.typography.scale.hero : themeTokens.typography.scale.title)
+          : themeTokens.typography.scale.subtitle;
         elements.push({
           type: 'text',
           content: allocated.content,
           x: zone.x, y: zone.y, w: zone.w, h: zone.h,
           fontSize,
-          bold: true,
+          bold: this.isBold(themeTokens.typography.weights.title),
           color: normalizeColor(effectiveStyleGuide.colorPalette.text),
           fontFamily: effectiveStyleGuide.fontFamilyTitle,
           align: variant === 'hero-centered' ? 'center' : 'left',
           zIndex: 10
         });
       } else if (allocated.type === 'component-full' || allocated.type === 'component-part') {
-        const els = this.renderComponentInZone(allocated.component, zone, effectiveStyleGuide, getIconUrl, getDiagramUrl);
+        const els = this.renderComponentInZone(allocated.component, zone, effectiveStyleGuide, themeTokens, getIconUrl, getDiagramUrl);
         elements.push(...els);
       }
     });
@@ -327,6 +436,7 @@ export class SpatialLayoutEngine {
     comp: TemplateComponent,
     zone: SpatialZone,
     styleGuide: GlobalStyleGuide,
+    themeTokens: typeof DEFAULT_THEME_TOKENS,
     getIconUrl: (name: string) => string | undefined,
     getDiagramUrl?: (comp: any) => string | undefined
   ): VisualElement[] {
@@ -340,8 +450,24 @@ export class SpatialLayoutEngine {
     const { x, y, w, h } = zone;
     const els: VisualElement[] = [];
 
+    const spacing = themeTokens.spacing;
+    const cardRadius = themeTokens.radii.card;
+    const cardStyle = themeTokens.surfaces.cardStyle;
+    const cardBorderWidth = themeTokens.surfaces.borderWidth;
+    const cardOpacity = themeTokens.surfaces.opacity;
+
+    const resolveCardFill = () => {
+      if (cardStyle === 'outline') return { color: p.background, alpha: 0.05 };
+      if (cardStyle === 'glass') return { color: p.background, alpha: 0.35 };
+      return { color: p.background, alpha: Math.min(0.9, cardOpacity) };
+    };
+    const resolveCardBorder = () => {
+      if (cardStyle === 'solid') return { color: p.accent, width: cardBorderWidth, alpha: 0.75 };
+      return { color: p.accent, width: cardBorderWidth + 0.3, alpha: 0.9 };
+    };
+
     // Scale fonts based on zone purpose (Hierarchy)
-    const scale = zone.purpose === 'hero' ? 1.4 : (zone.purpose === 'accent' ? 0.8 : 1.0);
+    const scale = zone.purpose === 'hero' ? 1.2 : (zone.purpose === 'accent' ? 0.85 : 1.0);
 
     if (comp.type === 'text-bullets') {
       let contentScale = scale;
@@ -405,7 +531,16 @@ export class SpatialLayoutEngine {
         const titleH = 0.6 * contentScale;
         const nextY = curY + (0.7 * contentScale);
         if (nextY <= maxY) {
-          els.push({ type: 'text', content: comp.title, x, y: curY, w, h: titleH, fontSize: 18 * contentScale, bold: true, color: p.text, zIndex: 10 });
+          els.push({
+            type: 'text',
+            content: comp.title,
+            x, y: curY, w, h: titleH,
+            fontSize: themeTokens.typography.scale.subtitle * contentScale,
+            bold: this.isBold(themeTokens.typography.weights.subtitle),
+            color: p.text,
+            fontFamily: styleGuide.fontFamilyTitle,
+            zIndex: 10
+          });
           curY = nextY;
         } else {
           this.addWarning(`Title dropped in zone '${zone.id}' due to space constraints.`);
@@ -415,7 +550,7 @@ export class SpatialLayoutEngine {
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
 
-        const currentFontSize = 14 * contentScale;
+        const currentFontSize = themeTokens.typography.scale.body * contentScale;
         // Improve heuristic: 3.5 is for 14pt.
         const baseCharsPerUnitWidth = 3.5; // For 14pt font
         const effectiveCharsPerUnitWidth = baseCharsPerUnitWidth * (14 / currentFontSize);
@@ -441,7 +576,15 @@ export class SpatialLayoutEngine {
           break;
         }
 
-        els.push({ type: 'text', content: `• ${line}`, x, y: curY, w, h: totalVisualH, fontSize: 14 * contentScale, color: p.text, zIndex: 10 });
+        els.push({
+          type: 'text',
+          content: `• ${line}`,
+          x, y: curY, w, h: totalVisualH,
+          fontSize: themeTokens.typography.scale.body * contentScale,
+          color: p.text,
+          fontFamily: styleGuide.fontFamilyBody,
+          zIndex: 10
+        });
         curY += advance;
       }
     }
@@ -451,31 +594,59 @@ export class SpatialLayoutEngine {
 
       const count = metrics.length;
       const isHorizontal = w > h;
-      const cardW = isHorizontal ? (w / count) - 0.2 : w;
-      const cardH = isHorizontal ? h : (h / count) - 0.2;
+      const cardW = isHorizontal ? (w / count) - spacing.md : w;
+      const cardH = isHorizontal ? h : (h / count) - spacing.md;
 
       metrics.forEach((m, i) => {
-        const cardX = isHorizontal ? x + (i * (cardW + 0.2)) : x;
-        const cardY = isHorizontal ? y : y + (i * (cardH + 0.2));
+        const cardX = isHorizontal ? x + (i * (cardW + spacing.md)) : x;
+        const cardY = isHorizontal ? y : y + (i * (cardH + spacing.md));
 
         // Skip if out of bounds (though less likely for fixed grid except huge counts)
         if (cardX + cardW > x + w + 0.1 || cardY + cardH > y + h + 0.1) return;
 
-        // Professional card design: semi-opaque dark background with accent border
-        els.push({ type: 'shape', shapeType: 'roundRect', x: cardX, y: cardY, w: cardW, h: cardH, fill: { color: p.background, alpha: 0.75 }, border: { color: p.accent, width: 1.5, alpha: 0.9 }, rectRadius: 0.2, zIndex: 5 });
+        // Modern card surface
+        els.push({
+          type: 'shape',
+          shapeType: 'roundRect',
+          x: cardX, y: cardY, w: cardW, h: cardH,
+          fill: resolveCardFill(),
+          border: resolveCardBorder(),
+          rectRadius: cardRadius,
+          zIndex: 5
+        });
 
         // Icon
         if (m.icon) {
           const iconUrl = getIconUrl(m.icon);
           if (iconUrl) {
-            els.push({ type: 'image', data: iconUrl, x: cardX + 0.2, y: cardY + 0.2, w: 0.5, h: 0.5, zIndex: 11 });
+            els.push({ type: 'image', data: iconUrl, x: cardX + spacing.sm, y: cardY + spacing.sm, w: 0.5, h: 0.5, zIndex: 11 });
           }
         }
 
         // Value
-        els.push({ type: 'text', content: m.value, x: cardX + 0.1, y: cardY + (cardH * 0.3), w: cardW - 0.2, h: cardH * 0.4, fontSize: 24 * scale, bold: true, color: p.text, align: 'center', zIndex: 10 });
+        els.push({
+          type: 'text',
+          content: m.value,
+          x: cardX + spacing.xs, y: cardY + (cardH * 0.28), w: cardW - spacing.sm, h: cardH * 0.4,
+          fontSize: themeTokens.typography.scale.metric * scale,
+          bold: this.isBold(themeTokens.typography.weights.metric),
+          color: p.text,
+          fontFamily: styleGuide.fontFamilyTitle,
+          align: 'center',
+          zIndex: 10
+        });
         // Label
-        els.push({ type: 'text', content: m.label, x: cardX + 0.1, y: cardY + (cardH * 0.7), w: cardW - 0.2, h: cardH * 0.3, fontSize: 10 * scale, color: p.text, align: 'center', zIndex: 10 });
+        els.push({
+          type: 'text',
+          content: m.label,
+          x: cardX + spacing.xs, y: cardY + (cardH * 0.7), w: cardW - spacing.sm, h: cardH * 0.3,
+          fontSize: themeTokens.typography.scale.label * scale,
+          bold: this.isBold(themeTokens.typography.weights.label),
+          color: p.text,
+          fontFamily: styleGuide.fontFamilyBody,
+          align: 'center',
+          zIndex: 10
+        });
       });
     }
     else if (comp.type === 'process-flow') {
@@ -490,7 +661,7 @@ export class SpatialLayoutEngine {
         if (stepX + stepW > x + w + 0.1) return;
 
         // Arrow/Box - More opaque for professional look
-        els.push({ type: 'shape', shapeType: 'rightArrow', x: stepX, y, w: stepW, h: h * 0.6, fill: { color: p.accent, alpha: 0.6 }, border: { color: p.accent, width: 1.5, alpha: 0.9 }, zIndex: 5 });
+        els.push({ type: 'shape', shapeType: 'rightArrow', x: stepX, y, w: stepW, h: h * 0.6, fill: { color: p.accent, alpha: 0.6 }, border: { color: p.accent, width: cardBorderWidth, alpha: 0.9 }, zIndex: 5 });
 
         // Icon inside arrow
         if (s.icon) {
@@ -501,8 +672,8 @@ export class SpatialLayoutEngine {
         }
 
         // Content
-        els.push({ type: 'text', content: s.title, x: stepX + 0.1, y: y + (h * 0.35), w: stepW - 0.2, h: 0.3, fontSize: 10, bold: true, color: p.text, align: 'center', zIndex: 10 });
-        els.push({ type: 'text', content: s.description, x: stepX + 0.1, y: y + (h * 0.65), w: stepW - 0.2, h: 0.5, fontSize: 8, color: p.text, align: 'center', zIndex: 10 });
+        els.push({ type: 'text', content: s.title, x: stepX + spacing.xs, y: y + (h * 0.35), w: stepW - spacing.sm, h: 0.3, fontSize: themeTokens.typography.scale.label, bold: this.isBold(themeTokens.typography.weights.label), color: p.text, fontFamily: styleGuide.fontFamilyTitle, align: 'center', zIndex: 10 });
+        els.push({ type: 'text', content: s.description, x: stepX + spacing.xs, y: y + (h * 0.65), w: stepW - spacing.sm, h: 0.5, fontSize: themeTokens.typography.scale.micro, color: p.text, fontFamily: styleGuide.fontFamilyBody, align: 'center', zIndex: 10 });
       });
     }
     else if (comp.type === 'icon-grid') {
@@ -513,27 +684,80 @@ export class SpatialLayoutEngine {
       // Simple 2-col or 3-col grid logic based on width
       const cols = w > 4 ? 3 : 2;
       const rows = Math.ceil(count / cols);
-      const itemW = (w / cols) - 0.2;
-      const itemH = (h / rows) - 0.2;
+      const itemW = (w / cols) - spacing.md;
+      const itemH = (h / rows) - spacing.md;
+
+      const baseIconScale = count <= 3 ? 0.38 : 0.32;
+      const getEmphasisScale = (item: any, index: number) => {
+        const raw = (item?.emphasis || item?.size || item?.importance || '').toString().toLowerCase();
+        if (['primary', 'featured', 'high', 'large', 'lg', 'xl'].includes(raw)) return 1.2;
+        if (['secondary', 'medium', 'md'].includes(raw)) return 1.0;
+        if (['low', 'small', 'sm'].includes(raw)) return 0.85;
+        if (index === 0 && count <= 3) return 1.15; // default hierarchy
+        return 1.0;
+      };
 
       items.forEach((item, i) => {
         const col = i % cols;
         const row = Math.floor(i / cols);
-        const ix = x + (col * (itemW + 0.2));
-        const iy = y + (row * (itemH + 0.2));
+        const ix = x + (col * (itemW + spacing.md));
+        const iy = y + (row * (itemH + spacing.md));
 
         if (iy + itemH > y + h + 0.1) return;
+
+        // Subtle card to improve visual quality
+        if (itemW > 1.0 && itemH > 0.8) {
+          els.push({
+            type: 'shape',
+            shapeType: 'roundRect',
+            x: ix, y: iy, w: itemW, h: itemH,
+            fill: resolveCardFill(),
+            border: resolveCardBorder(),
+            rectRadius: cardRadius,
+            zIndex: 5
+          });
+        }
+
+        const iconScale = getEmphasisScale(item, i);
+        const iconSize = Math.min(itemW, itemH) * baseIconScale * iconScale;
+        const iconX = ix + (itemW / 2) - (iconSize / 2);
+        const iconY = iy + spacing.sm;
 
         if (item.icon) {
           const iconUrl = getIconUrl(item.icon);
           if (iconUrl) {
-            els.push({ type: 'image', data: iconUrl, x: ix + (itemW / 2) - 0.3, y: iy, w: 0.6, h: 0.6, zIndex: 11 });
+            els.push({ type: 'image', data: iconUrl, x: iconX, y: iconY, w: iconSize, h: iconSize, zIndex: 11 });
           }
         }
-        els.push({ type: 'text', content: item.label, x: ix, y: iy + 0.7, w: itemW, h: 0.3, fontSize: 10, bold: true, color: p.text, align: 'center', zIndex: 10 });
+
+        const labelY = iconY + iconSize + spacing.xs;
+        els.push({
+          type: 'text',
+          content: item.label,
+          x: ix + spacing.xs, y: labelY, w: itemW - spacing.sm, h: 0.3,
+          fontSize: themeTokens.typography.scale.label,
+          bold: this.isBold(themeTokens.typography.weights.label),
+          color: p.text,
+          fontFamily: styleGuide.fontFamilyBody,
+          align: 'center',
+          zIndex: 10
+        });
+
+        if (item.description) {
+          els.push({
+            type: 'text',
+            content: item.description,
+            x: ix + spacing.xs, y: labelY + 0.32, w: itemW - spacing.sm, h: 0.35,
+            fontSize: themeTokens.typography.scale.micro,
+            color: p.text,
+            fontFamily: styleGuide.fontFamilyBody,
+            align: 'center',
+            zIndex: 10
+          });
+        }
       });
     } else if (comp.type === 'chart-frame') {
-      els.push(...this.renderChartFrame(comp, p, x, y, w, h));
+      els.push(...this.renderChartFrame(comp, p, x, y, w, h, styleGuide, themeTokens));
     } else if (comp.type === 'diagram-svg') {
       // Render diagram as image from cache
       if (getDiagramUrl) {
@@ -550,9 +774,10 @@ export class SpatialLayoutEngine {
               type: 'text',
               content: comp.title,
               x, y, w, h: titleH,
-              fontSize: 18 * scale,
-              bold: true,
+              fontSize: themeTokens.typography.scale.subtitle * scale,
+              bold: this.isBold(themeTokens.typography.weights.subtitle),
               color: p.text,
+              fontFamily: styleGuide.fontFamilyTitle,
               zIndex: 10
             });
             diagramY = y + titleH + 0.2;
@@ -580,7 +805,7 @@ export class SpatialLayoutEngine {
             type: 'text',
             content: 'Diagram (requires Node.js)',
             x, y: y + (h / 2) - 0.3, w, h: 0.6,
-            fontSize: 14,
+            fontSize: themeTokens.typography.scale.body,
             color: p.text,
             align: 'center',
             zIndex: 10
@@ -596,15 +821,30 @@ export class SpatialLayoutEngine {
   private renderChartFrame(
     comp: TemplateComponent,
     p: any,
-    x: number, y: number, w: number, h: number
+    x: number, y: number, w: number, h: number,
+    styleGuide: GlobalStyleGuide,
+    themeTokens: typeof DEFAULT_THEME_TOKENS
   ): VisualElement[] {
     const els: VisualElement[] = [];
 
     // Background Frame
-    els.push({ type: 'shape', shapeType: 'rect', x, y, w, h, fill: { color: p.background, alpha: 0.1 }, border: { color: p.secondary, width: 1, alpha: 0.3 }, zIndex: 5 });
+    const frameFill = themeTokens.surfaces.cardStyle === 'outline'
+      ? { color: p.background, alpha: 0.05 }
+      : { color: p.background, alpha: 0.15 };
+    els.push({ type: 'shape', shapeType: 'rect', x, y, w, h, fill: frameFill, border: { color: p.secondary, width: themeTokens.surfaces.borderWidth, alpha: 0.35 }, zIndex: 5 });
 
     // Title
-    els.push({ type: 'text', content: (comp as any).title || 'Data Visualization', x: x + 0.2, y: y + 0.2, w: w - 0.4, h: 0.5, fontSize: 14, bold: true, color: p.text, align: 'center', zIndex: 10 });
+    els.push({
+      type: 'text',
+      content: (comp as any).title || 'Data Visualization',
+      x: x + themeTokens.spacing.sm, y: y + themeTokens.spacing.sm, w: w - themeTokens.spacing.md, h: 0.5,
+      fontSize: themeTokens.typography.scale.subtitle,
+      bold: this.isBold(themeTokens.typography.weights.subtitle),
+      color: p.text,
+      fontFamily: styleGuide.fontFamilyTitle,
+      align: 'center',
+      zIndex: 10
+    });
 
     // Chart Area (Schematic Bar Chart)
     const chartArea = { x: x + 0.5, y: y + 1.2, w: w - 1.0, h: h - 1.5 };
@@ -630,15 +870,15 @@ export class SpatialLayoutEngine {
         // Value
         els.push({
           type: 'text', content: d.value.toString(),
-          x: barX - 0.2, y: barY - 0.3, w: barWidth + 0.4, h: 0.3,
-          fontSize: 10, color: p.text, align: 'center', zIndex: 7
+          x: barX - themeTokens.spacing.sm, y: barY - 0.3, w: barWidth + themeTokens.spacing.md, h: 0.3,
+          fontSize: themeTokens.typography.scale.micro, color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
         });
 
         // Label
         els.push({
           type: 'text', content: d.label,
-          x: barX - 0.2, y: chartArea.y + chartArea.h + 0.1, w: barWidth + 0.4, h: 0.4,
-          fontSize: 10, color: p.text, align: 'center', zIndex: 7
+          x: barX - themeTokens.spacing.sm, y: chartArea.y + chartArea.h + 0.1, w: barWidth + themeTokens.spacing.md, h: 0.4,
+          fontSize: themeTokens.typography.scale.label, color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
         });
       });
 
@@ -646,10 +886,29 @@ export class SpatialLayoutEngine {
       els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y, w: 0.05, h: chartArea.h, fill: { color: p.text, alpha: 0.5 }, zIndex: 5 }); // Y Axis
       els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y + chartArea.h, w: chartArea.w, h: 0.05, fill: { color: p.text, alpha: 0.5 }, zIndex: 5 }); // X Axis
     } else {
-      els.push({ type: 'text', content: 'No Data Available', x: x, y: y + (h / 2), w, h: 0.5, fontSize: 12, color: p.text, align: 'center', zIndex: 10 });
+      els.push({ type: 'text', content: 'No Data Available', x: x, y: y + (h / 2), w, h: 0.5, fontSize: themeTokens.typography.scale.body, color: p.text, fontFamily: styleGuide.fontFamilyBody, align: 'center', zIndex: 10 });
     }
 
     return els;
+  }
+
+  private resolveThemeTokens(styleGuide: GlobalStyleGuide) {
+    const tokens = styleGuide.themeTokens || {};
+    return {
+      typography: {
+        scale: { ...DEFAULT_THEME_TOKENS.typography.scale, ...(tokens.typography?.scale || {}) },
+        weights: { ...DEFAULT_THEME_TOKENS.typography.weights, ...(tokens.typography?.weights || {}) },
+        lineHeights: { ...DEFAULT_THEME_TOKENS.typography.lineHeights, ...(tokens.typography?.lineHeights || {}) },
+        letterSpacing: { ...DEFAULT_THEME_TOKENS.typography.letterSpacing, ...(tokens.typography?.letterSpacing || {}) }
+      },
+      spacing: { ...DEFAULT_THEME_TOKENS.spacing, ...(tokens.spacing || {}) },
+      radii: { ...DEFAULT_THEME_TOKENS.radii, ...(tokens.radii || {}) },
+      surfaces: { ...DEFAULT_THEME_TOKENS.surfaces, ...(tokens.surfaces || {}) }
+    };
+  }
+
+  private isBold(weight?: number): boolean {
+    return (weight ?? 600) >= 600;
   }
 }
 

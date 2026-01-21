@@ -28,8 +28,8 @@ export {
   type ThinkingLevel
 } from "./interactionsClient";
 
-// Re-export generateImageFromPrompt from slideAgentService for backward compatibility
-export { generateImageFromPrompt } from "./slideAgentService";
+// Re-export generateImageFromPrompt from image module for backward compatibility
+export { generateImageFromPrompt } from "./image/imageGeneration";
 
 // Helper to create client instance
 const getAiClient = () => {

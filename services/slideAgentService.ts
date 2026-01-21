@@ -14,10 +14,9 @@
  * - Thought signature preservation (Gemini 3)
  */
 
-import { GoogleGenAI, Type, Modality } from "@google/genai";
 import {
-    EditableSlideDeck, SlideNode, OutlineSchema, SLIDE_TYPES, GlobalStyleGuide,
-    ResearchFact, RouterDecision, RouterDecisionSchema, SlideNodeSchema, LayoutVariantSchema, RenderModeSchema,
+    EditableSlideDeck, SlideNode, SLIDE_TYPES, GlobalStyleGuide,
+    ResearchFact, RouterDecision,
     FactClusterSchema, VisualDesignSpec, ValidationResult,
     // Level 3 Agentic Stack Types
     NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics,
@@ -25,20 +24,21 @@ import {
     VISUAL_THRESHOLDS
 } from "../types/slideTypes";
 import {
-    InteractionsClient,
-    runAgentLoop,
     createJsonInteraction,
-    CostTracker,
-    AgentLogger,
-    Tool,
-    ToolDefinition,
-    ThinkingLevel
+    CostTracker
 } from "./interactionsClient";
 import { PROMPTS } from "./promptRegistry";
 import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence } from "./validators";
 import { runVisualDesigner } from "./visualDesignAgent";
 import { SpatialLayoutEngine, createEnvironmentSnapshot } from "./spatialRenderer";
-import { InfographicRenderer, normalizeColor } from "./infographicRenderer";
+import { autoRepairSlide } from "./repair/autoRepair";
+import { generateImageFromPrompt } from "./image/imageGeneration";
+import { generateSvgProxy } from "./visual/svgProxy";
+import { runResearcher } from "./agents/researcher";
+import { runArchitect } from "./agents/architect";
+import { runRouter } from "./agents/router";
+import { runContentPlanner } from "./agents/contentPlanner";
+import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
 import { z } from "zod";
 
 // --- CONSTANTS ---
@@ -48,1144 +48,9 @@ import { z } from "zod";
 // - Simple tasks: 2.5 Flash (classification, JSON structuring)
 // - Reasoning: 3 Pro (reserved for >1M context, rarely needed)
 
-import { MODEL_AGENTIC, MODEL_SIMPLE, MODEL_REASONING } from "./interactionsClient";
-
-// Backward compatibility aliases
-const MODEL_SMART = MODEL_REASONING;
-const MODEL_FAST = MODEL_AGENTIC;
-const MODEL_BACKUP = MODEL_SIMPLE;
+import { MODEL_AGENTIC } from "./interactionsClient";
 
 const MAX_AGENT_ITERATIONS = 10; // Global escape hatch per Phil Schmid's recommendation (reduced from 15 for faster convergence)
-
-// Helper to get AI client for image generation (still uses generateContent)
-const getAiClient = () => {
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) {
-        const errorMsg = `[SLIDE AGENT ERROR] API_KEY is not configured for image generation.
-
-To fix this:
-1. Create a .env file in the project root
-2. Add: GEMINI_API_KEY=your_api_key_here
-3. Get your key from: https://aistudio.google.com/app/apikey
-4. Restart the dev server`;
-        console.error(errorMsg);
-        throw new Error('API_KEY is required for image generation. Check console for setup instructions.');
-    }
-    return new GoogleGenAI({ apiKey });
-};
-
-// --- TOOL DEFINITIONS (Following Phil Schmid's Ergonomics Guidelines) ---
-
-const webSearchTool: ToolDefinition = {
-    name: "web_search",
-    description: "Search the web for current, verified information about a topic. Use this when you need real-time data, statistics, market trends, or facts that require up-to-date sources. Returns structured search results with URLs and snippets.",
-    parameters: {
-        type: "object",
-        properties: {
-            query: {
-                type: "string",
-                description: "The search query to execute. Be specific and include relevant keywords for better results."
-            }
-        },
-        required: ["query"]
-    }
-};
-
-const extractFactsTool: ToolDefinition = {
-    name: "extract_facts",
-    description: "Extract and structure verified facts from search results or provided text. Use this after web_search to organize raw information into validated, citable facts with confidence scores.",
-    parameters: {
-        type: "object",
-        properties: {
-            raw_content: {
-                type: "string",
-                description: "The raw content or search results to extract facts from."
-            },
-            focus_area: {
-                type: "string",
-                description: "The specific domain or topic focus for fact extraction (e.g., 'market statistics', 'technical specifications')."
-            }
-        },
-        required: ["raw_content", "focus_area"]
-    }
-};
-
-// --- DETERMINISTIC AUTO-REPAIR ---
-
-// Component type mapping for unsupported -> supported types
-// Includes hyphen, underscore, camelCase, and abbreviated variants
-const COMPONENT_TYPE_MAP: Record<string, string> = {
-    // Text-based components -> text-bullets
-    'text-block': 'text-bullets',
-    'text_block': 'text-bullets',
-    'textblock': 'text-bullets',
-    'text': 'text-bullets',
-    'paragraph': 'text-bullets',
-    'bullet-list': 'text-bullets',
-    'bullet_list': 'text-bullets',
-    'bulletlist': 'text-bullets',
-    'bullets': 'text-bullets',
-    'list': 'text-bullets',
-    'content': 'text-bullets',
-    'body': 'text-bullets',
-    'key-points': 'text-bullets',
-    'key_points': 'text-bullets',
-    'keypoints': 'text-bullets',
-    'visual_list': 'text-bullets', // Also could be icon-grid, defaulting to text
-    'visual-list': 'text-bullets',
-    'visuallist': 'text-bullets',
-
-    // Metric components -> metric-cards
-    'metrics': 'metric-cards',
-    'stats': 'metric-cards',
-    'kpis': 'metric-cards',
-    'cards': 'metric-cards',
-    'metric-group': 'metric-cards',
-    'metric_group': 'metric-cards',
-    'metricgroup': 'metric-cards',
-    'stat-cards': 'metric-cards',
-    'stat_cards': 'metric-cards',
-    'statcards': 'metric-cards',
-    'kpi-cards': 'metric-cards',
-    'kpi_cards': 'metric-cards',
-    'numbers': 'metric-cards',
-    'statistics': 'metric-cards',
-    'data-points': 'metric-cards',
-    'data_points': 'metric-cards',
-    'datapoints': 'metric-cards',
-
-    // Process components -> process-flow
-    'flow': 'process-flow',
-    'timeline': 'process-flow',
-    'steps': 'process-flow',
-    'process': 'process-flow',
-    'workflow': 'process-flow',
-    'sequence': 'process-flow',
-    'step-flow': 'process-flow',
-    'step_flow': 'process-flow',
-    'stepflow': 'process-flow',
-
-    // Icon components -> icon-grid
-    'icon': 'icon-grid', // Common abbreviation the model generates
-    'icons': 'icon-grid',
-    'grid': 'icon-grid',
-    'features': 'icon-grid',
-    'benefits': 'icon-grid',
-    'capabilities': 'icon-grid',
-    'icon-list': 'icon-grid',
-    'icon_list': 'icon-grid',
-    'iconlist': 'icon-grid',
-
-    // Chart components -> chart-frame
-    'chart': 'chart-frame',
-    'graph': 'chart-frame',
-    'data': 'chart-frame',
-    'visualization': 'chart-frame',
-    'viz': 'chart-frame',
-    'bar-chart': 'chart-frame',
-    'bar_chart': 'chart-frame',
-    'barchart': 'chart-frame',
-    'pie-chart': 'chart-frame',
-    'pie_chart': 'chart-frame',
-    'piechart': 'chart-frame',
-    'line-chart': 'chart-frame',
-    'line_chart': 'chart-frame',
-    'linechart': 'chart-frame',
-
-    // Diagram components -> diagram-svg
-    'diagram': 'diagram-svg',
-    'infographic': 'diagram-svg',
-    'visual-diagram': 'diagram-svg',
-    'visual_diagram': 'diagram-svg',
-    'visualdiagram': 'diagram-svg',
-    'ecosystem-diagram': 'diagram-svg',
-    'ecosystem_diagram': 'diagram-svg',
-    'ecosystemdiagram': 'diagram-svg',
-    'circular-diagram': 'diagram-svg',
-    'circular_diagram': 'diagram-svg',
-    'circulardiagram': 'diagram-svg',
-    'cycle': 'diagram-svg',
-    'ecosystem': 'diagram-svg'
-};
-
-const SUPPORTED_COMPONENT_TYPES = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
-
-/**
- * Normalizes an array item that might be a string, JSON string, or object.
- * Returns a proper object with expected properties.
- */
-function normalizeArrayItem(item: any, idx: number, expectedType: 'metric' | 'step' | 'item'): any {
-    // If already a valid object with expected properties, return as-is
-    if (typeof item === 'object' && item !== null) {
-        return item;
-    }
-
-    // If it's a string, try to parse as JSON first
-    if (typeof item === 'string') {
-        // Try parsing as JSON (handles '{"value": ">300%", "label": "..."}')
-        try {
-            const parsed = JSON.parse(item);
-            if (typeof parsed === 'object' && parsed !== null) {
-                return parsed;
-            }
-        } catch {
-            // Not valid JSON, treat as plain text
-        }
-
-        // Convert plain string to appropriate object based on expected type
-        const text = item.trim();
-
-        if (expectedType === 'metric') {
-            return {
-                value: text.length > 20 ? text.substring(0, 10) + '...' : text,
-                label: `Metric ${idx + 1}`,
-                icon: null // Will be filled by repair
-            };
-        } else if (expectedType === 'step') {
-            return {
-                number: idx + 1,
-                title: text.length > 30 ? text.substring(0, 30) : text,
-                description: text.length > 30 ? text : '',
-                icon: null
-            };
-        } else { // item (icon-grid)
-            return {
-                label: text.length > 40 ? text.substring(0, 40) : text,
-                icon: null
-            };
-        }
-    }
-
-    // Fallback for any other type
-    return {
-        label: `Item ${idx + 1}`,
-        value: String(item ?? ''),
-        icon: null
-    };
-}
-
-/**
- * Deep-repairs JSON strings that might be nested in component data
- */
-function deepParseJsonStrings(obj: any): any {
-    if (typeof obj === 'string') {
-        try {
-            const parsed = JSON.parse(obj);
-            return deepParseJsonStrings(parsed);
-        } catch {
-            return obj;
-        }
-    }
-    if (Array.isArray(obj)) {
-        return obj.map(item => deepParseJsonStrings(item));
-    }
-    if (typeof obj === 'object' && obj !== null) {
-        const result: any = {};
-        for (const [key, value] of Object.entries(obj)) {
-            result[key] = deepParseJsonStrings(value);
-        }
-        return result;
-    }
-    return obj;
-}
-
-export function autoRepairSlide(slide: SlideNode): SlideNode {
-    // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
-
-    const CONTENT_LIMITS = {
-        title: 70,
-        bullet: 120,
-        metricValue: 10,
-        metricLabel: 20,
-        stepTitle: 15,
-        stepDescription: 70,
-        iconLabel: 20,
-        iconDescription: 60,
-        chartLabel: 18
-    };
-
-    const LIST_LIMITS = {
-        textBullets: 4,
-        metricCards: 3,
-        processSteps: 4,
-        iconGrid: 5
-    };
-
-    const ensureWarnings = () => {
-        if (!slide.warnings) slide.warnings = [];
-    };
-
-    const addWarning = (msg: string) => {
-        ensureWarnings();
-        if (!slide.warnings!.includes(msg)) slide.warnings!.push(msg);
-    };
-
-    const truncateText = (text: string, max: number, label?: string) => {
-        if (!text || typeof text !== 'string') return text;
-        if (text.length <= max) return text;
-        const trimmed = text.substring(0, Math.max(0, max - 1)).trimEnd() + '…';
-        if (label) addWarning(`Auto-trimmed ${label} to ${max} chars`);
-        return trimmed;
-    };
-
-    const capList = <T>(list: T[], max: number, label?: string): T[] => {
-        if (!Array.isArray(list)) return list;
-        if (list.length <= max) return list;
-        if (label) addWarning(`Auto-trimmed ${label} to ${max} items`);
-        return list.slice(0, max);
-    };
-
-    // Fix malformed selfCritique (model outputs prose in layoutAction instead of enum)
-    if (slide.selfCritique) {
-        if (typeof slide.selfCritique === 'string') {
-            // Model returned string instead of object
-            console.warn(`[AUTO-REPAIR] selfCritique was string, converting to object`);
-            slide.selfCritique = {
-                layoutAction: 'keep',
-                readabilityScore: 8,
-                textDensityStatus: 'optimal' as any
-            };
-        } else {
-            // Validate/normalize fields
-            const sc = slide.selfCritique as any;
-
-            // layoutAction: If prose text, extract intent or default to 'keep'
-            if (sc.layoutAction && typeof sc.layoutAction === 'string') {
-                const action = sc.layoutAction.toLowerCase();
-                if (action.includes('simplif')) sc.layoutAction = 'simplify' as any;
-                else if (action.includes('shrink') || action.includes('reduce')) sc.layoutAction = 'shrink_text' as any;
-                else if (action.includes('visual') || action.includes('add')) sc.layoutAction = 'add_visuals' as any;
-                else if (!['keep', 'simplify', 'shrink_text', 'add_visuals'].includes(action)) {
-                    console.warn(`[AUTO-REPAIR] layoutAction was prose: "${sc.layoutAction.slice(0, 50)}...", defaulting to 'keep'`);
-                    sc.layoutAction = 'keep' as any;
-                }
-            } else {
-                sc.layoutAction = 'keep' as any;
-            }
-
-            // readabilityScore: Ensure number 0-10
-            if (typeof sc.readabilityScore !== 'number' || sc.readabilityScore < 0 || sc.readabilityScore > 10) {
-                sc.readabilityScore = 8;
-            }
-
-            // textDensityStatus: Normalize to enum
-            if (sc.textDensityStatus && typeof sc.textDensityStatus === 'string') {
-                const status = sc.textDensityStatus.toLowerCase();
-                if (status.includes('optim')) sc.textDensityStatus = 'optimal' as any;
-                else if (status.includes('high') || status.includes('dens')) sc.textDensityStatus = 'high' as any;
-                else if (status.includes('over')) sc.textDensityStatus = 'overflow' as any;
-                else sc.textDensityStatus = 'optimal' as any;
-            } else {
-                sc.textDensityStatus = 'optimal' as any;
-            }
-        }
-    }
-
-    // Fix missing/malformed speakerNotesLines (model sometimes outputs "" or garbage)
-    if (!slide.speakerNotesLines || !Array.isArray(slide.speakerNotesLines)) {
-        console.warn(`[AUTO-REPAIR] speakerNotesLines missing or invalid, generating default`);
-        slide.speakerNotesLines = [`Slide: ${slide.title || 'Content'}`];
-    } else {
-        // Filter out empty strings and garbage entries
-        slide.speakerNotesLines = slide.speakerNotesLines
-            .filter((line: any) => typeof line === 'string' && line.trim().length > 0)
-            .slice(0, 5); // Limit to 5 notes
-
-        if (slide.speakerNotesLines.length === 0) {
-            slide.speakerNotesLines = [`Slide: ${slide.title || 'Content'}`];
-        }
-    }
-
-    const components = slide.layoutPlan?.components || [];
-    const SAFE_ICONS = ['Activity', 'Zap', 'BarChart3', 'Box', 'Layers', 'PieChart', 'TrendingUp', 'Target', 'CheckCircle', 'Lightbulb'];
-
-    const isGarbage = (text: string) => {
-        if (!text || typeof text !== 'string' || text.length < 20) return false;
-        const words = text.split(/\s+/);
-        if (words.length > 5) {
-            const uniqueWords = new Set(words.map(w => w.toLowerCase()));
-            if (uniqueWords.size < words.length * 0.5) return true;
-        }
-        return false;
-    };
-
-    // STEP 1: Normalize component types (FIX: Handle undefined/null types)
-    components.forEach((c: any, idx: number) => {
-        // FIX: Handle undefined, null, or missing type
-        if (!c.type || typeof c.type !== 'string') {
-            console.warn(`[AUTO-REPAIR] Component ${idx} has undefined/invalid type, defaulting to 'text-bullets'`);
-            c.type = 'text-bullets';
-
-            // Try to extract content from any available property
-            if (!c.content) {
-                c.content = [];
-                // Check common property names that might contain content
-                const contentSources = ['text', 'body', 'paragraph', 'items', 'value', 'label', 'description'];
-                for (const prop of contentSources) {
-                    if (c[prop]) {
-                        if (Array.isArray(c[prop])) {
-                            c.content.push(...c[prop].map((x: any) => typeof x === 'string' ? x : JSON.stringify(x)));
-                        } else if (typeof c[prop] === 'string') {
-                            c.content.push(c[prop]);
-                        }
-                    }
-                }
-                if (c.content.length === 0) {
-                    c.content = [`Content from component ${idx + 1}`];
-                }
-            }
-        } else if (!SUPPORTED_COMPONENT_TYPES.includes(c.type)) {
-            const mapped = COMPONENT_TYPE_MAP[c.type.toLowerCase()];
-            if (mapped) {
-                console.warn(`[AUTO-REPAIR] Mapping component type '${c.type}' -> '${mapped}'`);
-                c.type = mapped;
-            } else {
-                // Unknown type - default to text-bullets and try to salvage content
-                console.warn(`[AUTO-REPAIR] Unknown component type '${c.type}', converting to 'text-bullets'`);
-                const oldType = c.type;
-                c.type = 'text-bullets';
-
-                // Try to extract content from various possible properties
-                if (!c.content) {
-                    c.content = [];
-                    if (c.text) c.content.push(String(c.text));
-                    if (c.body) c.content.push(String(c.body));
-                    if (c.paragraph) c.content.push(String(c.paragraph));
-                    if (c.content.length === 0) {
-                        c.content = [`Content from ${oldType} component`];
-                    }
-                }
-            }
-        }
-    });
-
-    // STEP 1.5: Cap components to layout capacity (prevents unplaced components)
-    const layoutVariant = slide.routerConfig?.layoutVariant || 'standard-vertical';
-    const layoutComponentCaps: Record<string, number> = {
-        'hero-centered': 1,
-        'timeline-horizontal': 1,
-        'split-left-text': 2,
-        'split-right-text': 2,
-        'standard-vertical': 2,
-        'bento-grid': 3
-    };
-    const maxComponents = layoutComponentCaps[layoutVariant] ?? 2;
-    if (components.length > maxComponents) {
-        const priorityOrder = layoutVariant === 'bento-grid'
-            ? ['metric-cards', 'icon-grid', 'chart-frame', 'text-bullets', 'process-flow', 'diagram-svg']
-            : ['text-bullets', 'chart-frame', 'metric-cards', 'process-flow', 'icon-grid', 'diagram-svg'];
-
-        const priorityRank = (type: string) => {
-            const idx = priorityOrder.indexOf(type);
-            return idx >= 0 ? idx : priorityOrder.length + 1;
-        };
-
-        const trimmed = [...components]
-            .sort((a: any, b: any) => priorityRank(a.type) - priorityRank(b.type))
-            .slice(0, maxComponents);
-
-        slide.layoutPlan!.components = trimmed;
-        addWarning(`Auto-trimmed components to ${maxComponents} for layout ${layoutVariant}`);
-    }
-
-    // STEP 2: Normalize and repair component data
-    components.forEach((c: any) => {
-        // Deep-parse any JSON strings in the component
-        if (c.metrics) c.metrics = deepParseJsonStrings(c.metrics);
-        if (c.steps) c.steps = deepParseJsonStrings(c.steps);
-        if (c.items) c.items = deepParseJsonStrings(c.items);
-        if (c.data) c.data = deepParseJsonStrings(c.data);
-
-        if (c.type === 'metric-cards') {
-            // Model might use 'items' or 'metrics' - normalize to 'metrics'
-            let list: any[] = c.metrics || c.items || c.cards || [];
-            if (!Array.isArray(list)) list = [list];
-
-            // CRITICAL FIX: If array is empty, create placeholder metrics
-            if (list.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty metric-cards array, injecting placeholder metrics`);
-                list = [
-                    { value: 'N/A', label: 'Metric 1', icon: 'Activity' },
-                    { value: 'N/A', label: 'Metric 2', icon: 'TrendingUp' }
-                ];
-            }
-
-            // Normalize each item
-            list = list.map((item, idx) => normalizeArrayItem(item, idx, 'metric'));
-
-            // Repair icons and garbage
-            list.forEach((item, idx) => {
-                if (typeof item === 'object' && item !== null) {
-                    if (!item.icon || item.icon === '' || item.icon === 'N/A') {
-                        item.icon = SAFE_ICONS[idx % SAFE_ICONS.length];
-                    }
-                    if (item.label && isGarbage(item.label)) {
-                        item.label = "Metric " + (idx + 1);
-                    }
-                    // Ensure value exists
-                    if (!item.value) {
-                        item.value = 'N/A';
-                    }
-
-                    item.value = truncateText(String(item.value), CONTENT_LIMITS.metricValue, 'metric value');
-                    item.label = truncateText(String(item.label || ''), CONTENT_LIMITS.metricLabel, 'metric label');
-                }
-            });
-
-            const maxItems = Math.min(LIST_LIMITS.metricCards, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.metricCards);
-            list = capList(list, maxItems, 'metric cards');
-
-            c.metrics = list;
-            // Clean up alternative property names
-            delete c.items;
-            delete c.cards;
-        }
-
-        if (c.type === 'process-flow') {
-            let list: any[] = c.steps || [];
-            if (!Array.isArray(list)) list = [list];
-
-            list = list.map((item, idx) => normalizeArrayItem(item, idx, 'step'));
-
-            list.forEach((item, idx) => {
-                if (typeof item === 'object' && item !== null) {
-                    if (!item.icon || item.icon === '') {
-                        item.icon = SAFE_ICONS[idx % SAFE_ICONS.length];
-                    }
-                    if (!item.number) item.number = idx + 1;
-                    if (item.title && isGarbage(item.title)) {
-                        item.title = "Step " + (idx + 1);
-                    }
-
-                    if (item.title) {
-                        item.title = truncateText(String(item.title), CONTENT_LIMITS.stepTitle, 'step title');
-                    }
-                    if (item.description) {
-                        item.description = truncateText(String(item.description), CONTENT_LIMITS.stepDescription, 'step description');
-                    }
-                }
-            });
-
-            const maxItems = Math.min(LIST_LIMITS.processSteps, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.processSteps);
-            list = capList(list, maxItems, 'process steps');
-
-            c.steps = list;
-        }
-
-        if (c.type === 'icon-grid') {
-            // Model might use 'icons' or 'features' - normalize to 'items'
-            let list: any[] = c.items || c.icons || c.features || [];
-            if (!Array.isArray(list)) list = [list];
-
-            // CRITICAL FIX: If array is empty, create placeholder items
-            if (list.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty icon-grid array, injecting placeholder items`);
-                list = [
-                    { label: 'Feature 1', icon: 'Star' },
-                    { label: 'Feature 2', icon: 'Zap' },
-                    { label: 'Feature 3', icon: 'Shield' }
-                ];
-            }
-
-            list = list.map((item, idx) => normalizeArrayItem(item, idx, 'item'));
-
-            list.forEach((item, idx) => {
-                if (typeof item === 'object' && item !== null) {
-                    if (!item.icon || item.icon === '' || item.icon === 'N/A') {
-                        item.icon = SAFE_ICONS[idx % SAFE_ICONS.length];
-                    }
-                    if (item.label && isGarbage(item.label)) {
-                        item.label = "Feature " + (idx + 1);
-                    }
-                    // Ensure label exists
-                    if (!item.label) {
-                        item.label = "Feature " + (idx + 1);
-                    }
-
-                    if (item.label) {
-                        item.label = truncateText(String(item.label), CONTENT_LIMITS.iconLabel, 'icon label');
-                    }
-                    if (item.description) {
-                        item.description = truncateText(String(item.description), CONTENT_LIMITS.iconDescription, 'icon description');
-                    }
-                }
-            });
-
-            const maxItems = Math.min(LIST_LIMITS.iconGrid, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.iconGrid);
-            list = capList(list, maxItems, 'icon grid items');
-
-            c.items = list;
-            // Clean up alternative property names
-            delete c.icons;
-            delete c.features;
-        }
-
-        if (c.type === 'text-bullets') {
-            // Ensure content is an array of strings
-            if (!Array.isArray(c.content)) {
-                if (typeof c.content === 'string') {
-                    c.content = [c.content];
-                } else {
-                    c.content = [];
-                }
-            }
-
-            if (c.title && typeof c.title === 'string') {
-                c.title = truncateText(c.title, CONTENT_LIMITS.title, 'text-bullets title');
-            }
-
-            const unique = new Set();
-            const cleanContent: string[] = [];
-            c.content.forEach((s: any) => {
-                // Convert non-strings to strings
-                let text = typeof s === 'string' ? s : JSON.stringify(s);
-                let norm = text.trim();
-                if (isGarbage(norm)) {
-                    norm = norm.substring(0, 50) + "...";
-                }
-                norm = truncateText(norm, CONTENT_LIMITS.bullet, 'bullet text');
-                const key = norm.toLowerCase();
-                if (!unique.has(key) && norm.length > 0) {
-                    unique.add(key);
-                    cleanContent.push(norm);
-                }
-            });
-            const maxItems = Math.min(LIST_LIMITS.textBullets, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.textBullets);
-            c.content = capList(cleanContent, maxItems, 'bullet items');
-        }
-
-        if (c.type === 'chart-frame' && c.data) {
-            // Normalize chart data
-            if (!Array.isArray(c.data)) c.data = [];
-            c.data = c.data.map((d: any, idx: number) => {
-                if (typeof d === 'string') {
-                    try {
-                        return JSON.parse(d);
-                    } catch {
-                        return { label: d, value: (idx + 1) * 10 };
-                    }
-                }
-                return d;
-            }).filter((d: any) => d && typeof d.value === 'number')
-                .map((d: any) => ({
-                    ...d,
-                    label: truncateText(String(d.label || ''), CONTENT_LIMITS.chartLabel, 'chart label')
-                }));
-        }
-    });
-
-    return slide;
-}
-
-// --- AGENT 1: RESEARCHER (with Tool Execution Loop) ---
-
-async function runResearcher(topic: string, costTracker: CostTracker): Promise<ResearchFact[]> {
-    console.log("[RESEARCHER] Starting research agent with Interactions API...");
-
-    // Define tool implementations
-    const tools: Record<string, Tool> = {
-        web_search: {
-            definition: webSearchTool,
-            execute: async (args: { query: string }) => {
-                // In production, this would call a real search API
-                // For now, we use Google Search grounding in the model call
-                return {
-                    status: "delegated_to_model",
-                    query: args.query,
-                    note: "Search executed via Google Search grounding in model call"
-                };
-            }
-        }
-    };
-
-    try {
-        const result = await runAgentLoop(
-            `Perform deep research on "${topic}".
-      
-      RESEARCH OBJECTIVES:
-      1. Find 8-12 verified, high-impact facts and statistics
-      2. Focus on: Market data, technical specifications, trends, and expert insights
-      3. Prioritize recent information (last 2 years) when available
-      
-      OUTPUT REQUIREMENTS:
-      Return a JSON array of research facts with this structure:
-      [
-        {
-          "id": "fact-1",
-          "category": "Market Trend | Technical Spec | Statistic | Expert Opinion",
-          "claim": "The main factual claim",
-          "value": "Specific numeric value if applicable",
-          "source": "Source name or URL",
-          "confidence": "high | medium | low"
-        }
-      ]
-      
-      CRITICAL: Return ONLY the JSON array. No preamble or markdown.`,
-            {
-                model: MODEL_FAST,
-                systemInstruction: `You are a Lead Technical Researcher with expertise in finding and validating information.
-        
-        Your research must be:
-        - ACCURATE: Only include verified facts from reliable sources
-        - CURRENT: Prefer recent data when possible
-        - SPECIFIC: Include concrete numbers, not vague claims
-        - ATTRIBUTABLE: Always note the source
-        
-        Use Google Search grounding when you need current information.`,
-                tools: {}, // Using built-in Google Search via grounding instead
-                maxIterations: 5,
-                thinkingLevel: 'low' as ThinkingLevel,
-                temperature: 0.3,
-                onToolCall: (name, args, result) => {
-                    console.log(`[RESEARCHER] Tool called: ${name}`, args);
-                }
-            },
-            costTracker
-        );
-
-        // Parse the JSON response
-        try {
-            const parsed = JSON.parse(result.text);
-            if (Array.isArray(parsed)) return parsed;
-            if (parsed.facts && Array.isArray(parsed.facts)) return parsed.facts;
-            return [];
-        } catch (parseErr) {
-            console.warn("[RESEARCHER] JSON parse failed, attempting extraction...");
-            // Try to extract JSON from the response
-            const jsonMatch = result.text.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-                try {
-                    return JSON.parse(jsonMatch[0]);
-                } catch {
-                    console.error("[RESEARCHER] Extraction failed");
-                }
-            }
-            return [];
-        }
-    } catch (e: any) {
-        console.error("[RESEARCHER] Agent failed:", e.message);
-        return [];
-    }
-}
-
-// --- AGENT 2: ARCHITECT ---
-
-async function runArchitect(
-    topic: string,
-    facts: ResearchFact[],
-    costTracker: CostTracker
-): Promise<z.infer<typeof OutlineSchema>> {
-    console.log("[ARCHITECT] Starting structure planning with Interactions API...");
-
-    const factContext = facts.map(f => `[${f.id}] ${f.claim}`).join('\n');
-
-    // NOTE: Schema flattened to comply with Gemini Interactions API 4-level nesting limit.
-    const architectSchema = {
-        type: "object",
-        properties: {
-            narrativeGoal: { type: "string" },
-            title: { type: "string" },
-            // Fact clusters simplified - inner structure via prompt
-            factClusters: { type: "array" },
-            styleGuide: {
-                type: "object",
-                properties: {
-                    themeName: { type: "string" },
-                    fontFamilyTitle: { type: "string" },
-                    fontFamilyBody: { type: "string" },
-                    // Color palette flattened to avoid depth issues
-                    colorPalette: { type: "object" },
-                    imageStyle: { type: "string" },
-                    layoutStrategy: { type: "string" }
-                },
-                required: ["themeName", "colorPalette"]
-            },
-            // Slides array simplified - inner structure via prompt
-            slides: { type: "array" }
-        },
-        required: ["narrativeGoal", "title", "styleGuide", "slides"]
-    };
-
-    try {
-        // Architect: Structure planning is an agentic workflow → MODEL_AGENTIC (3 Flash)
-        // Phil Schmid: Flash beats Pro on agentic benchmarks (78% vs 76.2% SWE-bench)
-        const result = await createJsonInteraction(
-            MODEL_AGENTIC,
-            `TASK: Structure a comprehensive slide deck about "${topic}".
-      
-      AVAILABLE FACTS:
-      ${factContext}
-      
-      REQUIREMENTS:
-      1. Group facts into "Fact Clusters" by theme (each cluster has: id, theme, factIds)
-      2. Create a 5-8 slide flow with clear narrative arc
-      3. Follow structure: Intro → Problem/Context → Solution/Analysis → Data/Evidence → Conclusion
-      
-      EACH SLIDE MUST HAVE:
-      - "order": number (1, 2, 3...)
-      - "type": one of "title-slide", "section-header", "content-main", "data-viz", "conclusion"
-      - "title": string (THE SLIDE TITLE - REQUIRED)
-      - "purpose": string describing what the slide communicates
-      - "relevantClusterIds": array of cluster IDs this slide uses
-      
-      OUTPUT: JSON matching the provided schema. Ensure every slide has a "title" field.`,
-            architectSchema,
-            {
-                systemInstruction: PROMPTS.ARCHITECT.ROLE,
-                // Architect is the strategic brain - it benefits from thinking
-                // Output is small (~1KB), so thinking tokens won't cause truncation
-                thinkingLevel: 'medium' as ThinkingLevel,
-                temperature: 0.2
-            },
-            costTracker
-        );
-
-        // DEBUG: Log the actual result structure to diagnose undefined titles
-        console.log("[ARCHITECT] Raw result slides sample:", JSON.stringify(result.slides?.[0] || {}, null, 2));
-
-        if (!result || !result.slides) {
-            throw new Error("Missing slides in architect output");
-        }
-
-        // SAFETY: Ensure all slides have required fields with fallbacks
-        result.slides = result.slides.map((slide: any, idx: number) => ({
-            order: slide.order ?? idx + 1,
-            type: slide.type ?? (idx === 0 ? SLIDE_TYPES.TITLE : SLIDE_TYPES.CONTENT),
-            title: slide.title ?? slide.name ?? slide.heading ?? `Slide ${idx + 1}`,
-            purpose: slide.purpose ?? slide.description ?? 'Content',
-            relevantClusterIds: slide.relevantClusterIds ?? slide.clusterIds ?? []
-        }));
-
-        return result;
-    } catch (e: any) {
-        console.error("[ARCHITECT] Agent failed. Using fallback.", e.message);
-        return {
-            narrativeGoal: topic,
-            title: topic,
-            knowledgeSheet: facts,
-            factClusters: [],
-            styleGuide: {
-                themeName: "Default",
-                fontFamilyTitle: "Inter",
-                fontFamilyBody: "Inter",
-                colorPalette: {
-                    primary: "#10b981",
-                    secondary: "#3b82f6",
-                    background: "#0f172a",
-                    text: "#f8fafc",
-                    accentHighContrast: "#f59e0b"
-                },
-                imageStyle: "Clean",
-                layoutStrategy: "Standard"
-            },
-            slides: [{ order: 1, type: SLIDE_TYPES.TITLE, title: topic, purpose: "Title", relevantClusterIds: [] }]
-        };
-    }
-}
-
-// --- AGENT 3: ROUTER (Phase 3: Circuit Breaker Support) ---
-
-/**
- * Router with Circuit Breaker Constraints
- * @param slideMeta - Slide metadata from architect
- * @param costTracker - Cost tracking
- * @param constraints - Optional constraints for rerouting (avoidLayoutVariants)
- */
-async function runRouter(
-    slideMeta: any,
-    costTracker: CostTracker,
-    constraints?: RouterConstraints
-): Promise<RouterDecision> {
-    console.log(`[ROUTER] Routing slide: "${slideMeta.title}"...`);
-    if (constraints?.avoidLayoutVariants?.length) {
-        console.log(`[ROUTER] Avoiding layouts: ${constraints.avoidLayoutVariants.join(', ')}`);
-    }
-
-    const routerSchema = {
-        type: "object",
-        properties: {
-            renderMode: { type: "string", enum: RenderModeSchema.options },
-            layoutVariant: { type: "string", enum: LayoutVariantSchema.options },
-            layoutIntent: { type: "string" },
-            visualFocus: { type: "string" },
-            densityBudget: {
-                type: "object",
-                properties: {
-                    maxChars: { type: "number" },
-                    maxItems: { type: "number" },
-                    minVisuals: { type: "number" }
-                },
-                required: ["maxChars", "maxItems"]
-            }
-        },
-        required: ["renderMode", "layoutVariant", "densityBudget"]
-    };
-
-    try {
-        // Router: Simple enum classification → MODEL_SIMPLE (2.5 Flash)
-        // 79% cheaper than Flash, sufficient for layout variant selection
-        // Thinking: None (classification task, no reasoning needed)
-        const result = await createJsonInteraction<RouterDecision>(
-            MODEL_SIMPLE,
-            PROMPTS.ROUTER.TASK(slideMeta, constraints),
-            routerSchema,
-            {
-                systemInstruction: PROMPTS.ROUTER.ROLE,
-                temperature: 0.1, // Reduced for more deterministic routing
-                thinkingLevel: undefined // No thinking for simple classification
-            },
-            costTracker
-        );
-
-        // Validate that the chosen layout isn't in the avoid list
-        if (constraints?.avoidLayoutVariants?.includes(result.layoutVariant)) {
-            console.warn(`[ROUTER] Model chose avoided layout ${result.layoutVariant}, falling back to standard-vertical`);
-            return {
-                ...result,
-                layoutVariant: 'standard-vertical',
-                layoutIntent: 'Fallback (avoided layout)'
-            };
-        }
-
-        return result.renderMode
-            ? result
-            : {
-                renderMode: 'standard',
-                layoutVariant: 'standard-vertical',
-                layoutIntent: 'Fallback',
-                densityBudget: { maxChars: 500, maxItems: 5, minVisuals: 0 },
-                visualFocus: 'Content'
-            };
-    } catch (e: any) {
-        console.warn("[ROUTER] Agent failed, using default layout.", e.message);
-        return {
-            renderMode: 'standard',
-            layoutVariant: 'standard-vertical',
-            layoutIntent: 'Fallback (Recovery)',
-            densityBudget: { maxChars: 500, maxItems: 5, minVisuals: 0 },
-            visualFocus: 'Content'
-        };
-    }
-}
-
-// --- QWEN LAYOUT SELECTOR (Visual QA-driven layout choice) ---
-
-function buildMockComponentsFromContentPlan(contentPlan: any): any[] {
-    const components: any[] = [];
-    const keyPoints = Array.isArray(contentPlan?.keyPoints) ? contentPlan.keyPoints : [];
-    const dataPoints = Array.isArray(contentPlan?.dataPoints) ? contentPlan.dataPoints : [];
-
-    if (keyPoints.length > 0) {
-        components.push({
-            type: 'text-bullets',
-            title: 'Key Points',
-            content: keyPoints.slice(0, 4)
-        });
-    }
-
-    if (dataPoints.length > 0) {
-        const metrics = dataPoints.slice(0, 4).map((dp: any, idx: number) => {
-            if (typeof dp === 'string') {
-                return { value: dp, label: `Metric ${idx + 1}`, icon: 'TrendingUp' };
-            }
-            if (dp && typeof dp === 'object') {
-                return {
-                    value: dp.value ?? dp.amount ?? dp.metric ?? `M${idx + 1}`,
-                    label: dp.label ?? dp.name ?? `Metric ${idx + 1}`,
-                    icon: dp.icon ?? 'TrendingUp'
-                };
-            }
-            return { value: `M${idx + 1}`, label: `Metric ${idx + 1}`, icon: 'TrendingUp' };
-        });
-
-        components.push({
-            type: 'metric-cards',
-            metrics
-        });
-    }
-
-    if (components.length === 0) {
-        components.push({
-            type: 'text-bullets',
-            title: 'Summary',
-            content: [contentPlan?.title || 'Overview']
-        });
-    }
-
-    return components;
-}
-
-function pickCandidateLayoutVariants(
-    slideMeta: any,
-    contentPlan: any,
-    constraints?: RouterConstraints
-): string[] {
-    const variants = new Set<string>();
-    const avoid = new Set(constraints?.avoidLayoutVariants || []);
-
-    const keyPoints = Array.isArray(contentPlan?.keyPoints) ? contentPlan.keyPoints : [];
-    const dataPoints = Array.isArray(contentPlan?.dataPoints) ? contentPlan.dataPoints : [];
-
-    if (slideMeta?.type === SLIDE_TYPES.TITLE || slideMeta?.order === 1) {
-        variants.add('hero-centered');
-    }
-
-    if (dataPoints.length >= 3) {
-        variants.add('bento-grid');
-    }
-
-    if (keyPoints.length >= 4) {
-        variants.add('standard-vertical');
-    }
-
-    if (keyPoints.length <= 2) {
-        variants.add('split-left-text');
-    }
-
-    const fallbackPool = LayoutVariantSchema.options.filter(v => !variants.has(v));
-    for (const v of fallbackPool) {
-        if (variants.size >= 3) break;
-        variants.add(v);
-    }
-
-    const filtered = Array.from(variants).filter(v => !avoid.has(v));
-    return filtered.slice(0, 3);
-}
-
-async function runQwenLayoutSelector(
-    slideMeta: any,
-    contentPlan: any,
-    baseRouterConfig: RouterDecision,
-    styleGuide: GlobalStyleGuide,
-    costTracker: CostTracker,
-    constraints?: RouterConstraints
-): Promise<RouterDecision> {
-    const { isQwenVLAvailable, getVisualCritiqueFromSvg } = await import('./visualCortex');
-    const { generateSvgProxy } = await import('./visualDesignAgent');
-
-    if (!isQwenVLAvailable()) {
-        return baseRouterConfig;
-    }
-
-    const candidateVariants = pickCandidateLayoutVariants(slideMeta, contentPlan, constraints);
-    if (candidateVariants.length === 0) {
-        return baseRouterConfig;
-    }
-
-    console.log(`[QWEN LAYOUT SELECTOR] Evaluating variants: ${candidateVariants.join(', ')}`);
-
-    const components = buildMockComponentsFromContentPlan(contentPlan);
-    let bestVariant = baseRouterConfig.layoutVariant;
-    let bestScore = -1;
-
-    for (const variant of candidateVariants) {
-        const mockSlide: SlideNode = autoRepairSlide({
-            order: slideMeta?.order ?? 0,
-            type: slideMeta?.type ?? SLIDE_TYPES.CONTENT,
-            title: contentPlan?.title || slideMeta?.title || 'Slide',
-            purpose: slideMeta?.purpose || 'Content',
-            routerConfig: { ...baseRouterConfig, layoutVariant: variant },
-            layoutPlan: {
-                title: contentPlan?.title || slideMeta?.title || 'Slide',
-                components
-            },
-            visualReasoning: 'Qwen layout selector mock',
-            visualPrompt: '',
-            visualDesignSpec: undefined,
-            speakerNotesLines: [],
-            citations: [],
-            chartSpec: undefined,
-            selfCritique: undefined,
-            readabilityCheck: 'pass',
-            validation: undefined,
-            warnings: []
-        });
-
-        try {
-            const svgProxy = generateSvgProxy(mockSlide, styleGuide);
-            const critique = await getVisualCritiqueFromSvg(svgProxy, costTracker);
-            const score = critique?.overall_score ?? -1;
-
-            console.log(`[QWEN LAYOUT SELECTOR] Variant ${variant} score: ${score}`);
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestVariant = variant;
-            }
-        } catch (err: any) {
-            console.warn(`[QWEN LAYOUT SELECTOR] Failed to score variant ${variant}: ${err.message}`);
-        }
-    }
-
-    if (bestVariant !== baseRouterConfig.layoutVariant) {
-        console.log(`[QWEN LAYOUT SELECTOR] Selected layout: ${bestVariant} (score: ${bestScore})`);
-        return {
-            ...baseRouterConfig,
-            layoutVariant: bestVariant,
-            layoutIntent: `Qwen visual selector (score: ${bestScore})`
-        };
-    }
-
-    return baseRouterConfig;
-}
-
-// --- AGENT 4: CONTENT PLANNER (Phase 1: Context Folding) ---
-
-/**
- * Content Planner with Narrative History
- * @param meta - Slide metadata
- * @param factsContext - Relevant facts for this slide
- * @param costTracker - Cost tracking
- * @param recentHistory - Last 2 slides for narrative arc awareness (Phase 1 Context Folding)
- */
-async function runContentPlanner(
-    meta: any,
-    factsContext: string,
-    costTracker: CostTracker,
-    recentHistory?: NarrativeTrail[]
-) {
-    console.log(`[CONTENT PLANNER] Planning content for: "${meta.title}"...`);
-    if (recentHistory?.length) {
-        console.log(`[CONTENT PLANNER] Narrative context: ${recentHistory.length} previous slides`);
-    }
-
-    // NOTE: Schema flattened for consistency with Gemini Interactions API nesting limits.
-    const contentPlanSchema = {
-        type: "object",
-        properties: {
-            title: { type: "string" },
-            keyPoints: { type: "array", items: { type: "string" } },
-            // dataPoints array simplified - structure defined via prompt
-            dataPoints: { type: "array" },
-            narrative: { type: "string" }
-        },
-        required: ["title", "keyPoints"]
-    };
-
-    try {
-        // Content Planner: Moderate reasoning for keyPoints extraction → MODEL_AGENTIC (3 Flash)
-        // Thinking: Low (extraction task with moderate reasoning)
-        return await createJsonInteraction(
-            MODEL_AGENTIC,
-            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, factsContext, recentHistory),
-            contentPlanSchema,
-            {
-                systemInstruction: PROMPTS.CONTENT_PLANNER.ROLE,
-                temperature: 0.2,
-                maxOutputTokens: 2048,
-                thinkingLevel: 'low' as ThinkingLevel // Optimized for planning task
-            },
-            costTracker
-        );
-    } catch (e: any) {
-        console.warn("[CONTENT PLANNER] Failed. Using basic fallback.", e.message);
-        return {
-            title: meta.title,
-            keyPoints: ["Content generation failed. Please edit manually."],
-            narrative: "Fallback due to agent error."
-        };
-    }
-}
 
 // --- SYSTEM 2: RECURSIVE VISUAL CRITIQUE ---
 
@@ -1239,7 +104,7 @@ async function runRecursiveVisualCritique(
     const preSystem2OutputTokens = preSystem2Summary.totalOutputTokens;
 
     // Import visual cortex functions
-    const { generateSvgProxy, runVisualCritique, runLayoutRepair } = await import('./visualDesignAgent');
+    const { runVisualCritique, runLayoutRepair } = await import('./visualDesignAgent');
     const { getVisualCritiqueFromSvg, isQwenVLAvailable } = await import('./visualCortex');
 
     let currentSlide = candidate;
@@ -1262,7 +127,7 @@ async function runRecursiveVisualCritique(
             // --- QWEN-VL VISUAL CRITIQUE (External Visual Cortex) ---
             // Fast Path: SVG proxy → PNG (resvg) → Qwen-VL
             // This provides real bounding box detection and spatial analysis
-            let externalCritique = null;
+            let externalCritique: any = null;
             if (isQwenVLAvailable()) {
                 try {
                     console.log(`[SYSTEM 2] Qwen-VL external visual critique (SVG proxy → PNG path)...`);
@@ -1301,14 +166,62 @@ async function runRecursiveVisualCritique(
             // Run internal visual critique (always run as fallback)
             const critique = await runVisualCritique(currentSlide, svgProxy, costTracker);
 
+            // Merge Qwen-VL issues to guide repair (richer than binary verdict)
+            const mapQwenCategory = (cat: string) => {
+                switch (cat) {
+                    case 'text_overlap':
+                        return 'overlap';
+                    case 'contrast':
+                        return 'contrast';
+                    case 'alignment':
+                        return 'alignment';
+                    case 'density':
+                        return 'density';
+                    case 'spacing':
+                        return 'density';
+                    default:
+                        return 'density';
+                }
+            };
+
+            const mappedExternalIssues = (externalCritique?.issues || []).map((issue: any) => ({
+                severity: issue.severity === 'critical' ? 'critical' : issue.severity === 'warning' ? 'major' : 'minor',
+                category: mapQwenCategory(issue.category),
+                zone: issue.location ? `x:${issue.location.x.toFixed(2)},y:${issue.location.y.toFixed(2)}` : undefined,
+                description: issue.description || 'External visual issue detected',
+                suggestedFix: issue.suggested_fix || 'Adjust spacing or move content'
+            }));
+
+            const emptyRegionHints = (externalCritique?.empty_regions || [])
+                .filter((r: any) => r.label === 'safe_for_text')
+                .slice(0, 2)
+                .map((r: any) => ({
+                    severity: 'minor',
+                    category: 'density',
+                    zone: `empty_region x:${r.bbox.x.toFixed(2)},y:${r.bbox.y.toFixed(2)},w:${r.bbox.w.toFixed(2)},h:${r.bbox.h.toFixed(2)}`,
+                    description: 'Text-safe empty region detected by Qwen-VL',
+                    suggestedFix: 'Relocate dense text into this region to reduce truncation/overlap'
+                }));
+
+            const mergedCritique = (mappedExternalIssues.length > 0 || emptyRegionHints.length > 0)
+                ? {
+                    ...critique,
+                    issues: [...critique.issues, ...mappedExternalIssues, ...emptyRegionHints],
+                    overallScore: externalCritique?.overall_score
+                        ? Math.min(critique.overallScore, externalCritique.overall_score)
+                        : critique.overallScore,
+                    hasCriticalIssues: critique.hasCriticalIssues || mappedExternalIssues.some(i => i.severity === 'critical')
+                }
+                : critique;
+
             // Check if critique score meets target
-            if (critique.overallScore >= VISUAL_THRESHOLDS.TARGET) {
-                console.log(`[SYSTEM 2] Critique passed (score: ${critique.overallScore}), exiting loop`);
+            if (mergedCritique.overallScore >= VISUAL_THRESHOLDS.TARGET) {
+                console.log(`[SYSTEM 2] Critique passed (score: ${mergedCritique.overallScore}), exiting loop`);
                 break;
             }
 
             // GAP 9: Track issue persistence
-            critique.issues.forEach(issue => {
+            mergedCritique.issues.forEach(issue => {
                 const count = issueHistory.get(issue.category) || 0;
                 issueHistory.set(issue.category, count + 1);
             });
@@ -1330,22 +243,23 @@ async function runRecursiveVisualCritique(
             }
 
             // Determine if repair is needed based on thresholds
-            const needsRepair = critique.hasCriticalIssues ||
-                critique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+            const needsRepair = mergedCritique.hasCriticalIssues ||
+                mergedCritique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED ||
+                externalCritique?.overall_verdict === 'requires_repair';
 
             if (needsRepair) {
-                console.warn(`[SYSTEM 2] Repair needed (score: ${critique.overallScore}, critical: ${critique.hasCriticalIssues})`);
+                console.warn(`[SYSTEM 2] Repair needed (score: ${mergedCritique.overallScore}, critical: ${mergedCritique.hasCriticalIssues})`);
 
                 // Run layout repair
                 const repairedCandidate = await runLayoutRepair(
                     currentSlide,
-                    critique,
+                    mergedCritique,
                     svgProxy,
                     costTracker
                 );
 
                 // Track truncation-related issues
-                critique.issues.forEach(issue => {
+                mergedCritique.issues.forEach(issue => {
                     if (issue.category === 'text_truncation' || issue.category === 'overflow') {
                         const count = (issueHistory.get('truncation') || 0) + 1;
                         issueHistory.set('truncation', count);
@@ -1667,11 +581,7 @@ async function runGenerator(
                 },
                 required: ["title", "components"]
             },
-            speakerNotesLines: {
-                type: "array",
-                items: { type: "string" },
-                maxItems: 3
-            }
+            // Removed speakerNotesLines - generated automatically in autoRepairSlide
             // Removed selfCritique - not critical for generation, added by autoRepairSlide
         },
         required: ["layoutPlan"]
@@ -1982,6 +892,8 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             }
 
             // --- QWEN VISUAL QA (always inspect slide if available) ---
+            let qwenQaScore: number | null = null;
+            let qwenQaVerdict: string | null = null;
             try {
                 const { isQwenVLAvailable, getVisualCritiqueFromSvg } = await import('./visualCortex');
 
@@ -1991,6 +903,8 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
 
                     if (qaCritique) {
                         console.log(`[QWEN QA] Score=${qaCritique.overall_score}, Verdict=${qaCritique.overall_verdict}, Fidelity=${qaCritique.renderFidelity}`);
+                        qwenQaScore = qaCritique.overall_score ?? null;
+                        qwenQaVerdict = qaCritique.overall_verdict ?? null;
 
                         if (qaCritique.overall_verdict === 'requires_repair') {
                             candidate.warnings = [
@@ -2051,6 +965,27 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                     system2InputTokens,
                     system2OutputTokens
                 };
+            }
+
+            // Qwen QA-weighted reroute (high priority)
+            if (attempt === MAX_RETRIES && qwenQaScore !== null) {
+                const QWEN_MIN_SCORE = 70;
+                const qwenFailed = qwenQaVerdict === 'requires_repair' || qwenQaScore < QWEN_MIN_SCORE;
+                if (qwenFailed) {
+                    console.warn(`[CIRCUIT BREAKER] Qwen QA score ${qwenQaScore} below ${QWEN_MIN_SCORE} or requires repair. Signaling reroute.`);
+                    return {
+                        slide: candidate,
+                        needsReroute: true,
+                        rerouteReason: `Qwen QA score ${qwenQaScore}`,
+                        avoidLayoutVariants: [routerConfig.layoutVariant],
+                        visualCritiqueRan,
+                        visualRepairAttempted,
+                        visualRepairSucceeded,
+                        system2Cost,
+                        system2InputTokens,
+                        system2OutputTokens
+                    };
+                }
             }
 
             if (validation.passed) {
@@ -2154,164 +1089,6 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
     };
 }
 
-// --- IMAGE GENERATION (Still uses generateContent for image modality) ---
-
-// CRITICAL: Background images must NOT contain any content elements.
-// Text, icons, diagrams, charts are rendered separately by SpatialLayoutEngine.
-const NEGATIVE_PROMPT_INFO = `
-photorealistic, 3d render, messy, clutter, blurry, low resolution, 
-distorted text, bad layout, sketch, hand drawn, organic textures, grunge,
-footer text, copyright notice, watermark, template borders, frame, mock-up, 
-padding, margins,
-TEXT, WORDS, LETTERS, LABELS, NUMBERS, CAPTIONS, TITLES, HEADINGS,
-DIAGRAMS, CHARTS, GRAPHS, PIE CHARTS, BAR CHARTS, FLOWCHARTS, ARROWS,
-ICONS, SYMBOLS, LOGOS, UI ELEMENTS, BUTTONS, BOXES, RECTANGLES WITH TEXT,
-INFOGRAPHICS, DATA VISUALIZATIONS, PROCESS FLOWS, TIMELINES,
-PEOPLE, FACES, HANDS, HUMANS, FIGURES
-`.trim().replace(/\n/g, ' ');
-
-// Image model configuration:
-// - Default to 2.5 Flash Image: 71% cheaper ($0.039 vs $0.134 per image)
-// - Visual prompts are short (no long text generation), Flash is sufficient
-// - Pro is fallback for quota/quality issues
-const IMAGE_MODELS = {
-    DEFAULT: 'gemini-2.5-flash-image',      // 71% cheaper, sufficient for visual prompts
-    FALLBACK: 'gemini-3-pro-image-preview'  // Higher quality fallback
-};
-
-interface ImageGenerationError {
-    type: 'quota' | 'content_filter' | 'timeout' | 'network' | 'unknown';
-    model: string;
-    message: string;
-    retryable: boolean;
-}
-
-function classifyImageError(error: any, model: string): ImageGenerationError {
-    const message = error?.message || String(error);
-    const status = error?.status;
-
-    // Quota/Rate limit
-    if (status === 429 || message.includes('429') || message.includes('quota') || message.includes('RESOURCE_EXHAUSTED')) {
-        return { type: 'quota', model, message: 'Rate limit exceeded', retryable: true };
-    }
-
-    // Content filter (safety)
-    if (message.includes('SAFETY') || message.includes('blocked') || message.includes('content filter')) {
-        return { type: 'content_filter', model, message: 'Content blocked by safety filter', retryable: false };
-    }
-
-    // Timeout
-    if (status === 499 || message.includes('timeout') || message.includes('cancelled') || message.includes('DEADLINE')) {
-        return { type: 'timeout', model, message: 'Request timed out', retryable: true };
-    }
-
-    // Network issues
-    if (status === 503 || message.includes('503') || message.includes('Overloaded') || message.includes('UNAVAILABLE')) {
-        return { type: 'network', model, message: 'Service temporarily unavailable', retryable: true };
-    }
-
-    return { type: 'unknown', model, message: message.slice(0, 100), retryable: false };
-}
-
-export async function generateImageFromPrompt(
-    prompt: string,
-    aspectRatio: string = "16:9",
-    costTracker?: CostTracker
-): Promise<{ imageUrl: string, model: string } | null> {
-    const ai = getAiClient();
-
-    // Order: 2.5 Flash first (cheaper), Pro as fallback
-    const models = [IMAGE_MODELS.DEFAULT, IMAGE_MODELS.FALLBACK];
-
-    // Background-only prompt: NO text, diagrams, icons, or content elements
-    // All content is rendered separately by SpatialLayoutEngine
-    const richPrompt = `
-TASK: Generate an ABSTRACT BACKGROUND IMAGE only.
-
-SUBJECT THEME: ${prompt}
-
-STRICT RULES:
-- This is a BACKGROUND TEXTURE/GRADIENT only
-- Text, icons, charts, and diagrams will be overlaid SEPARATELY by another system
-- DO NOT generate any readable text, words, letters, or numbers
-- DO NOT generate any diagrams, flowcharts, arrows, or process flows
-- DO NOT generate any icons, symbols, logos, or UI elements
-- ONLY generate: gradients, lighting effects, abstract shapes, textures, color fields
-
-STYLE: Cinematic lighting, subtle gradients, professional corporate aesthetic.
-COMPOSITION: Large areas of low contrast or dark tones for text overlay.
-MOOD: Modern, premium, sophisticated.
-
-NEGATIVE (DO NOT INCLUDE): ${NEGATIVE_PROMPT_INFO}
-`.trim();
-
-    // Log prompt length to verify it's short
-    console.log(`[IMAGE GEN] Prompt length: ${richPrompt.length} chars, starting with ${models[0]}...`);
-
-    const errors: ImageGenerationError[] = [];
-
-    for (const modelName of models) {
-        try {
-            console.log(`[IMAGE GEN] Attempting ${modelName}...`);
-
-            const response = await ai.models.generateContent({
-                model: modelName,
-                contents: { parts: [{ text: richPrompt }] },
-                config: {
-                    imageConfig: { aspectRatio },
-                    responseModalities: [Modality.IMAGE]
-                }
-            });
-
-            if (response.candidates?.[0]?.content?.parts) {
-                for (const part of response.candidates[0].content.parts) {
-                    if (part.inlineData?.data) {
-                        if (costTracker) {
-                            costTracker.addImageCost(modelName);
-                        }
-                        console.log(`[IMAGE GEN] ✅ Success with ${modelName}`);
-                        return {
-                            imageUrl: `data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`,
-                            model: modelName
-                        };
-                    }
-                }
-            }
-
-            // No image data in response
-            console.warn(`[IMAGE GEN] ${modelName} returned no image data`);
-            errors.push({ type: 'unknown', model: modelName, message: 'No image data in response', retryable: true });
-
-        } catch (e: any) {
-            const classifiedError = classifyImageError(e, modelName);
-            errors.push(classifiedError);
-
-            console.warn(`[IMAGE GEN] ${modelName} failed: ${classifiedError.type} - ${classifiedError.message}`);
-
-            // For retryable errors, try next model
-            if (classifiedError.retryable && modelName !== models[models.length - 1]) {
-                console.log(`[IMAGE GEN] Falling back to ${models[models.indexOf(modelName) + 1]}...`);
-                continue;
-            }
-
-            // Content filter: Don't try other models (same prompt will fail)
-            if (classifiedError.type === 'content_filter') {
-                console.error(`[IMAGE GEN] ⚠️ Content blocked by safety filter. Prompt may need adjustment.`);
-                break;
-            }
-
-            // Last model failed
-            if (modelName === models[models.length - 1]) {
-                console.error(`[IMAGE GEN] ❌ All models failed. Errors:`, errors.map(e => `${e.model}: ${e.type}`));
-                break;
-            }
-        }
-    }
-
-    // Graceful null return - caller will handle missing image
-    console.warn(`[IMAGE GEN] Returning null. Slide will render without background image.`);
-    return null;
-}
 
 // --- ORCHESTRATOR (Level 3: Context Folding + Self-Healing Circuit Breaker) ---
 
@@ -2745,111 +1522,3 @@ export const regenerateSingleSlide = async (
     return newSlide;
 };
 
-/**
- * Generate an SVG proxy of the slide for visual critique
- * This runs on the server (Node.js) and produces a string for Qwen-VL analysis.
- */
-export async function generateSvgProxy(slide: SlideNode, styleGuide: GlobalStyleGuide): Promise<string> {
-    const renderer = new InfographicRenderer();
-
-    // Prepare icons overlay if needed
-    await renderer.prepareIconsForDeck([slide], styleGuide.colorPalette);
-
-    // Prepare diagrams
-    await renderer.prepareDiagramsForDeck([slide], styleGuide);
-
-    const elements = renderer.compileSlide(slide, styleGuide);
-
-    // Standard PPTX canvas size (scaled up for high-res analysis)
-    // 10 "units" x 5.625 "units" (16:9)
-    // Scale factor 100 -> 1000 x 562.5
-    // Use standard 1920x1080 viewBox or similar? 
-    // Qwen-VL prefers higher res. Let's map to 1920x1080.
-    // 1 unit = 192 pixels.
-    const UNIT_SCALE = 192;
-    const WIDTH = 1920;
-    const HEIGHT = 1080;
-
-    const escapeXmlText = (value: string) =>
-        value
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;');
-
-    const escapeXmlAttr = (value: string) =>
-        value
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&apos;');
-
-    let svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${WIDTH} ${HEIGHT}" width="${WIDTH}" height="${HEIGHT}">`;
-
-    // Background
-    const bgHex = normalizeColor(styleGuide.colorPalette.background);
-    svg += `<rect x="0" y="0" width="${WIDTH}" height="${HEIGHT}" fill="#${bgHex}" />`;
-
-    elements.forEach(el => {
-        const x = ("x" in el ? el.x : 0) * UNIT_SCALE;
-        const y = ("y" in el ? el.y : 0) * UNIT_SCALE;
-        const w = ("w" in el ? el.w : 0) * UNIT_SCALE;
-        const h = ("h" in el ? el.h : 0) * UNIT_SCALE;
-
-        if (el.type === 'shape') {
-            const fill = el.fill ? `fill="#${normalizeColor(el.fill.color)}" fill-opacity="${el.fill.alpha ?? 1}"` : 'fill="none"';
-            const stroke = el.border ? `stroke="#${normalizeColor(el.border.color)}" stroke-width="${(el.border.width || 1) * 2}" stroke-opacity="${el.border.alpha ?? 1}"` : '';
-
-            if (el.shapeType === 'rect') {
-                svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" ${fill} ${stroke} />`;
-            } else if (el.shapeType === 'roundRect') {
-                const r = (el.rectRadius || 0.1) * UNIT_SCALE;
-                svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${r}" ry="${r}" ${fill} ${stroke} />`;
-            } else {
-                svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" ${fill} ${stroke} />`;
-            }
-        }
-        else if (el.type === 'text') {
-            const color = normalizeColor(el.color);
-            const fontSize = (el.fontSize || 14) * 2.5; // Tuned for visibility
-
-            const fontFamily = escapeXmlAttr(el.fontFamily || "Arial, sans-serif");
-            const weight = el.bold ? "bold" : "normal";
-            const align = el.align === 'center' ? 'middle' : (el.align === 'right' ? 'end' : 'start');
-            const anchorX = el.align === 'center' ? x + w / 2 : (el.align === 'right' ? x + w : x + 10);
-
-            // Text Wrapping Logic
-            const content = el.content || "";
-            const charWidth = fontSize * 0.6;
-            const maxChars = Math.max(10, Math.floor(w / charWidth));
-
-            const words = content.split(/\s+/);
-            const lines: string[] = [];
-            let currentLine = words[0] || "";
-
-            for (let i = 1; i < words.length; i++) {
-                if ((currentLine + " " + words[i]).length < maxChars) {
-                    currentLine += " " + words[i];
-                } else {
-                    lines.push(currentLine);
-                    currentLine = words[i];
-                }
-            }
-            lines.push(currentLine);
-
-            svg += `<text x="${anchorX}" y="${y + fontSize}" font-family="${fontFamily}" font-size="${fontSize}" fill="#${color}" font-weight="${weight}" text-anchor="${align}">`;
-            lines.forEach((line, i) => {
-                svg += `<tspan x="${anchorX}" dy="${i === 0 ? 0 : fontSize * 1.2}">${escapeXmlText(line)}</tspan>`;
-            });
-            svg += `</text>`;
-        }
-        else if (el.type === 'image') {
-            if (el.data) {
-                svg += `<image href="${escapeXmlAttr(el.data)}" x="${x}" y="${y}" width="${w}" height="${h}" />`;
-            }
-        }
-    });
-
-    svg += '</svg>';
-    return svg;
-}

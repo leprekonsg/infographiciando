@@ -799,7 +799,7 @@ export async function runQwenVisualArchitectLoop(
         try {
             // Step 1: Generate SVG proxy from current slide state
             console.log('[VISUAL ARCHITECT] Generating SVG proxy...');
-            const { generateSvgProxy } = await import('./slideAgentService');
+            const { generateSvgProxy } = await import('./visual/svgProxy');
             const svgString = await generateSvgProxy(currentSlide, styleGuide);
 
             const components = currentSlide.layoutPlan?.components || [];
