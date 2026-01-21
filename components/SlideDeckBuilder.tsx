@@ -128,6 +128,7 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
         });
 
         await renderer.prepareIconsForDeck(deck.slides, deck.meta.styleGuide.colorPalette);
+        await renderer.prepareDiagramsForDeck(deck.slides, deck.meta.styleGuide);
 
         for (const slide of deck.slides) {
             const pSlide = pres.addSlide({ masterName: "MASTER" });
@@ -136,7 +137,7 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
                 pSlide.addImage({
                     data: slide.backgroundImageUrl,
                     x: 0, y: 0, w: 10, h: 5.625,
-                    transparency: 60
+                    transparency: 15  // Reduced from 60 to show background properly (85% opacity)
                 });
             }
             await renderer.renderSlideFromPlan({ slide, styleGuide: deck.meta.styleGuide, pptSlide: pSlide, pres });

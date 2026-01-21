@@ -214,6 +214,17 @@ export const TemplateComponentSchema = z.discriminatedUnion('type', [
       value: z.number(),
     })),
   }),
+  z.object({
+    type: z.literal('diagram-svg'),
+    title: z.string().max(60).optional(),
+    diagramType: z.literal('circular-ecosystem'),
+    elements: z.array(z.object({
+      id: z.string(),
+      label: z.string().max(30),
+      icon: z.string().optional()
+    })).min(3).max(8),
+    centralTheme: z.string().max(40).optional()
+  }),
 ]);
 
 export type TemplateComponent = z.infer<typeof TemplateComponentSchema>;
@@ -316,10 +327,17 @@ export type SlideNode = z.infer<typeof SlideNodeSchema>;
 /**
  * NarrativeTrail: Context Folding for orchestrator-level memory.
  * Allows Generator to know narrative arc without verbose fact re-injection.
+ * Enhanced with design decisions and visual themes for better coherence.
  */
 export interface NarrativeTrail {
   title: string;
   mainPoint: string; // First 100 chars of speaker notes
+  // Enhanced fields for better context
+  layoutVariant?: string; // Layout used (e.g., 'split-left-text')
+  renderMode?: string; // Render mode (e.g., 'infographic')
+  componentTypes?: string[]; // Component types used (e.g., ['text-bullets', 'metric-cards'])
+  visualTheme?: string; // Visual design theme or color harmony
+  designDecisions?: string; // Key design choices made
 }
 
 /**
@@ -375,6 +393,8 @@ export interface DeckMetrics {
   // GAP 2: Deck-Wide Narrative Coherence
   coherenceScore?: number;
   coherenceIssues?: number;
+  // Visual Architect Metrics
+  visualArchitectMetrics?: VisualArchitectMetrics;
 }
 
 export type EditableSlideDeck = {
@@ -394,6 +414,45 @@ export type FactCluster = z.infer<typeof FactClusterSchema>;
 export type VisualDesignSpec = z.infer<typeof VisualDesignSpecSchema>;
 export type SpatialZone = z.infer<typeof SpatialZoneSchema>;
 export type SpatialStrategy = z.infer<typeof SpatialStrategySchema>;
+
+// --- ENVIRONMENT STATE (Shadow State Pattern for Agent Visibility) ---
+
+/**
+ * EnvironmentState: Lightweight JSON snapshot of spatial layout health.
+ * This is the "shadow state" that allows agents to see spatial issues and
+ * make informed decisions about rerouting or accepting a layout.
+ *
+ * Implements the "Context-as-Environment" pattern from the Level 3 architecture.
+ */
+export interface EnvironmentState {
+  slideId: string;
+
+  // Layout health metrics (0-1 normalized scores)
+  fit_score: number; // 1 = perfect, 0.5 = tight, <0.5 = critical
+  text_density: number; // Ratio of text content to available space
+  visual_utilization: number; // How much of visual zones are filled
+
+  // Zone-level details for granular analysis
+  zones: Array<{
+    id: string;
+    capacity_used: number; // 0-1 ratio
+    warnings: string[];
+    content_type?: string;
+    is_critical_overflow: boolean;
+  }>;
+
+  // Overall health assessment
+  health_level: 'perfect' | 'good' | 'tight' | 'critical';
+  needs_reroute: boolean;
+  reroute_reason?: string;
+  suggested_action?: 'keep' | 'scale_down' | 'reroute_layout' | 'simplify_content';
+
+  // Metadata for debugging and agent logging
+  render_timestamp: number;
+  render_duration_ms: number;
+  warnings_count: number;
+  errors_count: number;
+}
 
 export type VisualElement =
   | {
@@ -437,3 +496,45 @@ export type VisualElement =
     zIndex?: number;
     transparency?: number;
   };
+
+// --- VISUAL ARCHITECT SCHEMAS (Qwen-VL3 Integration) ---
+
+/**
+ * RepairAction: Structured repair instructions from Qwen-VL3 Visual Architect
+ * Each action targets a specific component and describes a spatial/visual modification
+ */
+export interface RepairAction {
+  component_id: string; // Format: "{type}-{index}" (e.g., "text-bullets-0")
+  action: 'resize' | 'reposition' | 'adjust_color' | 'adjust_spacing' | 'simplify_content';
+  params: Record<string, any>; // Action-specific parameters (width, height, x, y, color, etc.)
+  reason: string; // Why this repair is needed (for logging)
+}
+
+/**
+ * VisualArchitectResult: Result of Qwen-VL3 Visual Architect iterative loop
+ * Tracks convergence, repair history, and final slide state
+ */
+export interface VisualArchitectResult {
+  slide: SlideNode; // Final repaired slide
+  rounds: number; // Number of critique-repair rounds executed
+  finalScore: number; // Final visual quality score (0-100)
+  repairs: RepairAction[]; // All repairs applied across rounds
+  converged: boolean; // True if score >= 85 or explicit acceptance
+  totalCost?: number; // Total cost of Visual Architect loop
+  totalInputTokens?: number;
+  totalOutputTokens?: number;
+}
+
+/**
+ * Enhanced DeckMetrics with Visual Architect tracking
+ */
+export interface VisualArchitectMetrics {
+  enabled: boolean;
+  totalRounds: number;
+  avgRoundsPerSlide: number;
+  convergenceRate: number; // % slides that converged
+  avgInitialScore: number;
+  avgFinalScore: number;
+  totalRepairs: number;
+  repairsByType: Record<string, number>; // resize: 5, reposition: 3, etc.
+}

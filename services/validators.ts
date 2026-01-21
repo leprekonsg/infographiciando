@@ -144,6 +144,18 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
   let score = 100;
   let isCriticalFailure = false;
 
+  const CONTENT_LIMITS = {
+    title: 70,
+    bullet: 120,
+    metricValue: 10,
+    metricLabel: 20,
+    stepTitle: 15,
+    stepDescription: 70,
+    iconLabel: 20,
+    iconDescription: 60,
+    chartLabel: 18
+  };
+
   const components = slide.layoutPlan?.components || [];
   const routerConfig = slide.routerConfig;
 
@@ -192,7 +204,7 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
 
   // 1.5. CHECK: Unsupported or Unknown Components
   // Note: autoRepairSlide should have already mapped these, but we still check as a safety net
-  const SUPPORTED_TYPES = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame'];
+  const SUPPORTED_TYPES = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
   components.forEach((c, idx) => {
     if (!SUPPORTED_TYPES.includes(c.type)) {
       // Reduced severity - autoRepairSlide should handle this, but log a warning
@@ -205,7 +217,49 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
     }
   });
 
-  // 1.6. CHECK: Layout Compatibility
+  // 1.6. CHECK: Diagram-specific validation
+  components.forEach((c, idx) => {
+    if (c.type === 'diagram-svg') {
+      const elements = (c as any).elements || [];
+      if (elements.length < 3) {
+        score -= 20;
+        errors.push({
+          code: "ERR_DIAGRAM_INSUFFICIENT_ELEMENTS",
+          message: `Diagram at index ${idx} has only ${elements.length} elements (min: 3)`,
+          suggestedFix: "Add more elements or use icon-grid instead"
+        });
+      }
+      if (elements.length > 8) {
+        score -= 15;
+        errors.push({
+          code: "WARN_DIAGRAM_TOO_COMPLEX",
+          message: `Diagram at index ${idx} has ${elements.length} elements (max: 8)`,
+          suggestedFix: "Split into multiple slides or reduce to 8 elements"
+        });
+      }
+      // Check element structure
+      elements.forEach((el: any, elIdx: number) => {
+        if (!el.id || !el.label) {
+          score -= 10;
+          errors.push({
+            code: "ERR_DIAGRAM_INVALID_ELEMENT",
+            message: `Diagram element ${elIdx} missing required id or label`,
+            suggestedFix: "Ensure all elements have id and label fields"
+          });
+        }
+        if (el.label && el.label.length > 30) {
+          score -= 5;
+          errors.push({
+            code: "WARN_DIAGRAM_LABEL_TOO_LONG",
+            message: `Diagram element "${el.label}" exceeds 30 characters`,
+            suggestedFix: "Shorten label to max 30 characters"
+          });
+        }
+      });
+    }
+  });
+
+  // 1.7. CHECK: Layout Compatibility
   if (routerConfig?.layoutVariant === 'hero-centered') {
     // Hero centered prefers text-bullets or metric-cards
     // It *can* render others via fallback, but best practice is strictly text-bullets for the "Hero" look.
@@ -243,6 +297,87 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
       errors.push({ code: "WARN_TEXT_OVERFLOW", message: `Text length ${totalText} exceeds budget.`, suggestedFix: "Summarize." });
     }
   }
+
+  // 2.5. CHECK: Content Quality (Per-item length limits)
+  const addLengthIssue = (code: string, message: string, critical = false) => {
+    score -= critical ? 10 : 5;
+    if (critical) isCriticalFailure = true;
+    errors.push({ code, message, suggestedFix: "Shorten text to meet layout constraints" });
+  };
+
+  if (slide.layoutPlan?.title && slide.layoutPlan.title.length > CONTENT_LIMITS.title) {
+    const critical = slide.layoutPlan.title.length > CONTENT_LIMITS.title * 1.8;
+    addLengthIssue(critical ? 'ERR_TITLE_TOO_LONG' : 'WARN_TITLE_TOO_LONG',
+      `Slide title exceeds ${CONTENT_LIMITS.title} chars (${slide.layoutPlan.title.length})`,
+      critical);
+  }
+
+  components.forEach((c, idx) => {
+    if (c.type === 'text-bullets') {
+      if (c.title && c.title.length > CONTENT_LIMITS.title) {
+        addLengthIssue('WARN_COMPONENT_TITLE_TOO_LONG',
+          `Text-bullets title exceeds ${CONTENT_LIMITS.title} chars (index ${idx})`);
+      }
+      (c.content || []).forEach((b: any, i: number) => {
+        if (typeof b === 'string' && b.length > CONTENT_LIMITS.bullet) {
+          const critical = b.length > CONTENT_LIMITS.bullet * 1.6;
+          addLengthIssue(critical ? 'ERR_BULLET_TOO_LONG' : 'WARN_BULLET_TOO_LONG',
+            `Bullet ${i + 1} exceeds ${CONTENT_LIMITS.bullet} chars (index ${idx})`,
+            critical);
+        }
+      });
+    }
+
+    if (c.type === 'metric-cards') {
+      (c.metrics || []).forEach((m: any, i: number) => {
+        if (m?.value && String(m.value).length > CONTENT_LIMITS.metricValue) {
+          addLengthIssue('WARN_METRIC_VALUE_TOO_LONG',
+            `Metric value too long (${String(m.value).length} chars) at index ${idx}.${i}`);
+        }
+        if (m?.label && String(m.label).length > CONTENT_LIMITS.metricLabel) {
+          addLengthIssue('WARN_METRIC_LABEL_TOO_LONG',
+            `Metric label too long (${String(m.label).length} chars) at index ${idx}.${i}`);
+        }
+      });
+    }
+
+    if (c.type === 'process-flow') {
+      (c.steps || []).forEach((s: any, i: number) => {
+        if (s?.title && String(s.title).length > CONTENT_LIMITS.stepTitle) {
+          addLengthIssue('WARN_STEP_TITLE_TOO_LONG',
+            `Step title too long (${String(s.title).length} chars) at index ${idx}.${i}`);
+        }
+        if (s?.description && String(s.description).length > CONTENT_LIMITS.stepDescription) {
+          const critical = String(s.description).length > CONTENT_LIMITS.stepDescription * 1.6;
+          addLengthIssue(critical ? 'ERR_STEP_DESC_TOO_LONG' : 'WARN_STEP_DESC_TOO_LONG',
+            `Step description too long (${String(s.description).length} chars) at index ${idx}.${i}`,
+            critical);
+        }
+      });
+    }
+
+    if (c.type === 'icon-grid') {
+      (c.items || []).forEach((it: any, i: number) => {
+        if (it?.label && String(it.label).length > CONTENT_LIMITS.iconLabel) {
+          addLengthIssue('WARN_ICON_LABEL_TOO_LONG',
+            `Icon label too long (${String(it.label).length} chars) at index ${idx}.${i}`);
+        }
+        if (it?.description && String(it.description).length > CONTENT_LIMITS.iconDescription) {
+          addLengthIssue('WARN_ICON_DESC_TOO_LONG',
+            `Icon description too long (${String(it.description).length} chars) at index ${idx}.${i}`);
+        }
+      });
+    }
+
+    if (c.type === 'chart-frame') {
+      (c.data || []).forEach((d: any, i: number) => {
+        if (d?.label && String(d.label).length > CONTENT_LIMITS.chartLabel) {
+          addLengthIssue('WARN_CHART_LABEL_TOO_LONG',
+            `Chart label too long (${String(d.label).length} chars) at index ${idx}.${i}`);
+        }
+      });
+    }
+  });
 
   // 3. CHECK: Visual Density
   let iconCount = 0;

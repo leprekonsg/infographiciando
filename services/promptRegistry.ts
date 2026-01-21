@@ -145,6 +145,8 @@ OUTPUT: Return JSON with:
       ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}
       Continue the story - don't repeat previous slide content.` : ''}
 
+      ${routerConfig?.visualFocus ? `VISUAL FOCUS REQUIREMENT: Your content MUST incorporate the theme: "${routerConfig.visualFocus}". Include relevant terminology in component text.` : ''}
+
       Hard rules:
       - Output ONLY the JSON object. No preamble ("Here is…"), no markdown fences.
       - Every string value must be a single line. Do not include literal newline characters inside any string.
@@ -165,17 +167,43 @@ OUTPUT: Return JSON with:
       - bento-grid: prefer metric-cards (max 4) or icon-grid.
       - Default: stack 1–2 components vertically.
 
-      Text limits:
+      Component type selection:
+      - text-bullets: Lists, key points, standard text content
+      - metric-cards: Statistics, KPIs, numeric data with labels
+      - process-flow: Sequential steps, workflows, timelines
+      - icon-grid: Features, benefits, categories (2-4 columns)
+      - chart-frame: Bar, pie, line, or doughnut charts
+      - diagram-svg: Circular ecosystems, closed-loop systems, integration diagrams
+        * Use when visualFocus suggests: "ecosystem", "cycle", "integration", "closed-loop", "sovereignty", "interconnected"
+        * Diagram type: circular-ecosystem (center theme + outer ring of 3-8 elements)
+        * Each element needs: id, label (max 30 chars), optional icon
+        * Best in split layouts (split-left-text or split-right-text) in visual zones
+
+      Text limits (STRICTLY ENFORCED):
       - Slide title: ≤60 characters
-      - Bullet line: ≤90 characters
-      - Metric label: ≤20 characters
-      - Step title: ≤18 characters
-      - Step description: ≤80 characters
+      - Bullet line: ≤80 characters (reduce to fit)
+      - Metric label: ≤18 characters
+      - Metric value: ≤10 characters
+      - Step title: ≤15 characters
+      - Step description: ≤70 characters
+      - Icon grid label: ≤20 characters
+      - Icon grid description: ≤60 characters
+
+      Array limits (CRITICAL):
+      - content array: max 4 items
+      - metrics array: max 3 items
+      - steps array: max 4 items
+      - items array: max 5 items
+      - elements array (diagram-svg): min 3, max 8 items
 
       INPUTS:
       CONTENT_PLAN: ${contentPlanJson}
       ROUTER_CONFIG: ${JSON.stringify(routerConfig)}
-      VISUAL_SPEC: ${visualDesignSpec ? JSON.stringify(visualDesignSpec) : 'N/A'}
+
+      ${visualDesignSpec ? `VISUAL DESIGN SPEC AVAILABLE: YES
+      Use the following visual guidance for color harmony and composition:
+      VISUAL_SPEC: ${JSON.stringify(visualDesignSpec)}` : `VISUAL DESIGN SPEC AVAILABLE: NO
+      Use layout zones from Router decision directly. Apply style guide colors from ROUTER_CONFIG.`}
     `,
   },
 

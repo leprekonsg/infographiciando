@@ -1,6 +1,6 @@
 
 
-import { TemplateComponent, VisualElement, GlobalStyleGuide, SpatialZone, LayoutVariant, SpatialStrategy, SlideNode, VisualDesignSpec } from '../types/slideTypes';
+import { TemplateComponent, VisualElement, GlobalStyleGuide, SpatialZone, LayoutVariant, SpatialStrategy, SlideNode, VisualDesignSpec, EnvironmentState } from '../types/slideTypes';
 import { InfographicRenderer, normalizeColor } from './infographicRenderer';
 
 // Predefined Spatial Templates for Layout Variants
@@ -79,6 +79,7 @@ export class SpatialLayoutEngine {
       'metric-cards': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'content-top', 'content-bottom', 'visual-right'],
       'process-flow': ['content-area', 'content-top', 'content-bottom', 'visual-right', 'visual-left'],
       'icon-grid': ['grid-1', 'grid-2', 'grid-3', 'grid-4', 'content-top', 'content-bottom'],
+      'diagram-svg': ['visual-right', 'visual-left', 'content-top', 'content-area'],
       'title-section': ['title', 'hero-title'] // Title sections go in title zones
     };
 
@@ -199,7 +200,8 @@ export class SpatialLayoutEngine {
     slide: SlideNode,
     styleGuide: GlobalStyleGuide,
     getIconUrl: (name: string) => string | undefined,
-    visualDesignSpec?: VisualDesignSpec // NEW: Accept visual design spec for color overrides
+    visualDesignSpec?: VisualDesignSpec, // NEW: Accept visual design spec for color overrides
+    getDiagramUrl?: (comp: any) => string | undefined // NEW: Diagram cache callback
   ): VisualElement[] {
     // GAP 5: Clear warnings from previous renders
     this.clearWarnings();
@@ -282,7 +284,7 @@ export class SpatialLayoutEngine {
           zIndex: 10
         });
       } else if (allocated.type === 'component-full' || allocated.type === 'component-part') {
-        const els = this.renderComponentInZone(allocated.component, zone, effectiveStyleGuide, getIconUrl);
+        const els = this.renderComponentInZone(allocated.component, zone, effectiveStyleGuide, getIconUrl, getDiagramUrl);
         elements.push(...els);
       }
     });
@@ -325,7 +327,8 @@ export class SpatialLayoutEngine {
     comp: TemplateComponent,
     zone: SpatialZone,
     styleGuide: GlobalStyleGuide,
-    getIconUrl: (name: string) => string | undefined
+    getIconUrl: (name: string) => string | undefined,
+    getDiagramUrl?: (comp: any) => string | undefined
   ): VisualElement[] {
     const p = {
       text: normalizeColor(styleGuide.colorPalette.text),
@@ -458,7 +461,8 @@ export class SpatialLayoutEngine {
         // Skip if out of bounds (though less likely for fixed grid except huge counts)
         if (cardX + cardW > x + w + 0.1 || cardY + cardH > y + h + 0.1) return;
 
-        els.push({ type: 'shape', shapeType: 'roundRect', x: cardX, y: cardY, w: cardW, h: cardH, fill: { color: p.secondary, alpha: 0.1 }, border: { color: p.secondary, width: 1, alpha: 0.5 }, rectRadius: 0.2, zIndex: 5 });
+        // Professional card design: semi-opaque dark background with accent border
+        els.push({ type: 'shape', shapeType: 'roundRect', x: cardX, y: cardY, w: cardW, h: cardH, fill: { color: p.background, alpha: 0.75 }, border: { color: p.accent, width: 1.5, alpha: 0.9 }, rectRadius: 0.2, zIndex: 5 });
 
         // Icon
         if (m.icon) {
@@ -485,8 +489,8 @@ export class SpatialLayoutEngine {
 
         if (stepX + stepW > x + w + 0.1) return;
 
-        // Arrow/Box
-        els.push({ type: 'shape', shapeType: 'rightArrow', x: stepX, y, w: stepW, h: h * 0.6, fill: { color: p.accent, alpha: 0.2 }, border: { color: p.accent, width: 1, alpha: 0.6 }, zIndex: 5 });
+        // Arrow/Box - More opaque for professional look
+        els.push({ type: 'shape', shapeType: 'rightArrow', x: stepX, y, w: stepW, h: h * 0.6, fill: { color: p.accent, alpha: 0.6 }, border: { color: p.accent, width: 1.5, alpha: 0.9 }, zIndex: 5 });
 
         // Icon inside arrow
         if (s.icon) {
@@ -530,6 +534,59 @@ export class SpatialLayoutEngine {
       });
     } else if (comp.type === 'chart-frame') {
       els.push(...this.renderChartFrame(comp, p, x, y, w, h));
+    } else if (comp.type === 'diagram-svg') {
+      // Render diagram as image from cache
+      if (getDiagramUrl) {
+        const diagramUrl = getDiagramUrl(comp);
+
+        if (diagramUrl) {
+          // Optional title above diagram (reduce zone height for diagram)
+          let diagramY = y;
+          let diagramH = h;
+
+          if (comp.title) {
+            const titleH = 0.6 * scale;
+            els.push({
+              type: 'text',
+              content: comp.title,
+              x, y, w, h: titleH,
+              fontSize: 18 * scale,
+              bold: true,
+              color: p.text,
+              zIndex: 10
+            });
+            diagramY = y + titleH + 0.2;
+            diagramH = h - titleH - 0.2;
+          }
+
+          // Render diagram as full-zone image
+          els.push({
+            type: 'image',
+            data: diagramUrl,
+            x, y: diagramY, w, h: diagramH,
+            zIndex: 5
+          });
+        } else {
+          // Fallback: render placeholder
+          els.push({
+            type: 'shape',
+            shapeType: 'rect',
+            x, y, w, h,
+            fill: { color: p.background, alpha: 0.2 },
+            border: { color: p.accent, width: 2, alpha: 0.5 },
+            zIndex: 5
+          });
+          els.push({
+            type: 'text',
+            content: 'Diagram (requires Node.js)',
+            x, y: y + (h / 2) - 0.3, w, h: 0.6,
+            fontSize: 14,
+            color: p.text,
+            align: 'center',
+            zIndex: 10
+          });
+        }
+      }
     }
 
     return els;
@@ -594,4 +651,235 @@ export class SpatialLayoutEngine {
 
     return els;
   }
+}
+
+// --- ENVIRONMENT SNAPSHOT CREATION (Shadow State Pattern) ---
+
+/**
+ * Calculate zone utilization ratio (0-1).
+ * Estimates how much of the zone's capacity is used by the allocated content.
+ */
+function calculateZoneUtilization(zone: SpatialZone, allocated: any): number {
+  if (!allocated) return 0;
+
+  // Rough heuristic based on content type
+  if (allocated.type === 'title') {
+    return 0.8; // Titles typically use significant space
+  }
+
+  if (allocated.type === 'component-full' || allocated.type === 'component-part') {
+    const comp = allocated.component;
+    if (!comp) return 0;
+
+    switch (comp.type) {
+      case 'text-bullets':
+        // Estimate based on number of lines and title
+        const lines = comp.content?.length || 0;
+        const hasTitle = !!comp.title;
+        const estimatedHeight = (hasTitle ? 0.7 : 0) + (lines * 0.6);
+        return Math.min(1.0, estimatedHeight / zone.h);
+
+      case 'metric-cards':
+        const metrics = comp.metrics?.length || 0;
+        return metrics > 0 ? Math.min(1.0, metrics * 0.3) : 0.5;
+
+      case 'process-flow':
+        const steps = comp.steps?.length || 0;
+        return steps > 0 ? Math.min(1.0, steps * 0.25) : 0.6;
+
+      case 'icon-grid':
+        const items = comp.items?.length || 0;
+        return items > 0 ? Math.min(1.0, items * 0.2) : 0.5;
+
+      case 'chart-frame':
+        return 0.9; // Charts typically fill their zone
+
+      default:
+        return 0.5;
+    }
+  }
+
+  return 0;
+}
+
+/**
+ * Check if a zone has critical overflow (truncation warnings).
+ */
+function checkIfCriticalOverflow(zone: SpatialZone, allocated: any, warnings: string[]): boolean {
+  if (!allocated || !warnings || warnings.length === 0) return false;
+
+  // Check for zone-specific truncation warnings
+  return warnings.some(w =>
+    w.includes(zone.id) &&
+    (w.includes('truncated') || w.includes('overflow') || w.includes('hidden'))
+  );
+}
+
+/**
+ * Calculate text density for the slide (ratio of text content to available space).
+ * Higher values mean more text-heavy content.
+ */
+function calculateTextDensity(components: TemplateComponent[]): number {
+  if (!components || components.length === 0) return 0;
+
+  let totalTextItems = 0;
+  let totalItems = 0;
+
+  for (const comp of components) {
+    switch (comp.type) {
+      case 'text-bullets':
+        totalTextItems += (comp.content?.length || 0) + (comp.title ? 1 : 0);
+        totalItems += (comp.content?.length || 0) + (comp.title ? 1 : 0);
+        break;
+
+      case 'metric-cards':
+        totalTextItems += (comp.metrics?.length || 0) * 2; // Value + label
+        totalItems += (comp.metrics?.length || 0);
+        break;
+
+      case 'process-flow':
+        totalTextItems += (comp.steps?.length || 0) * 2; // Title + description
+        totalItems += (comp.steps?.length || 0);
+        break;
+
+      case 'icon-grid':
+        totalTextItems += (comp.items?.length || 0);
+        totalItems += (comp.items?.length || 0);
+        break;
+
+      case 'chart-frame':
+        totalTextItems += 1; // Title
+        totalItems += 1;
+        break;
+
+      default:
+        totalItems += 1;
+    }
+  }
+
+  return totalItems > 0 ? Math.min(1.0, totalTextItems / (totalItems * 2)) : 0;
+}
+
+/**
+ * Calculate fit score based on warnings, utilization, and density.
+ * Returns a 0-1 score where 1 = perfect, 0 = critical issues.
+ */
+function calculateFitScore(
+  warningsCount: number,
+  avgUtilization: number,
+  textDensity: number
+): number {
+  // Start with perfect score
+  let score = 1.0;
+
+  // Penalize for warnings (each warning reduces score)
+  if (warningsCount > 0) {
+    score -= warningsCount * 0.15; // -15% per warning
+  }
+
+  // Penalize for high utilization (>0.9 is risky)
+  if (avgUtilization > 0.9) {
+    score -= (avgUtilization - 0.9) * 0.5; // -50% for full utilization
+  }
+
+  // Penalize for high text density (>0.8 is packed)
+  if (textDensity > 0.8) {
+    score -= (textDensity - 0.8) * 0.3; // -30% for dense text
+  }
+
+  // Clamp to 0-1
+  return Math.max(0, Math.min(1.0, score));
+}
+
+/**
+ * Create an environment snapshot of the rendered slide.
+ * This implements the "Shadow State Pattern" for agent visibility.
+ *
+ * @param slide - The rendered slide node
+ * @param zones - Spatial zones used in the layout
+ * @param allocation - Component-to-zone allocation map
+ * @param renderDurationMs - How long rendering took
+ * @returns EnvironmentState snapshot
+ */
+export function createEnvironmentSnapshot(
+  slide: SlideNode,
+  zones: SpatialZone[],
+  allocation: Map<string, any>,
+  renderDurationMs: number
+): EnvironmentState {
+  const warnings = slide.warnings || [];
+
+  // Calculate zone-level snapshots
+  const zoneSnapshots = zones.map(zone => {
+    const allocated = allocation.get(zone.id);
+    const zoneWarnings = warnings.filter(w => w.includes(zone.id));
+
+    return {
+      id: zone.id,
+      capacity_used: calculateZoneUtilization(zone, allocated),
+      warnings: zoneWarnings,
+      content_type: allocated?.type,
+      is_critical_overflow: checkIfCriticalOverflow(zone, allocated, warnings)
+    };
+  });
+
+  // Calculate aggregate metrics
+  const avgUtilization = zoneSnapshots.length > 0
+    ? zoneSnapshots.reduce((sum, z) => sum + z.capacity_used, 0) / zoneSnapshots.length
+    : 0;
+
+  const textDensity = calculateTextDensity(slide.layoutPlan?.components || []);
+
+  // Calculate fit score
+  const fit_score = calculateFitScore(warnings.length, avgUtilization, textDensity);
+
+  // Determine health level
+  let health_level: EnvironmentState['health_level'];
+  if (fit_score >= 0.85) {
+    health_level = 'perfect';
+  } else if (fit_score >= 0.75) {
+    health_level = 'good';
+  } else if (fit_score >= 0.6) {
+    health_level = 'tight';
+  } else {
+    health_level = 'critical';
+  }
+
+  // Determine if reroute is needed
+  const needs_reroute = fit_score < 0.6;
+  const reroute_reason = needs_reroute
+    ? `Fit score ${fit_score.toFixed(2)} below threshold (0.6). ${warnings.length} warning(s).`
+    : undefined;
+
+  // Suggest action
+  let suggested_action: EnvironmentState['suggested_action'];
+  if (fit_score >= 0.85) {
+    suggested_action = 'keep';
+  } else if (fit_score >= 0.7) {
+    suggested_action = 'scale_down';
+  } else if (fit_score >= 0.5) {
+    suggested_action = 'reroute_layout';
+  } else {
+    suggested_action = 'simplify_content';
+  }
+
+  const errorsCount = warnings.filter(w =>
+    w.toLowerCase().includes('error') || w.toLowerCase().includes('critical')
+  ).length;
+
+  return {
+    slideId: slide.id || slide.title || 'unknown',
+    fit_score,
+    text_density: textDensity,
+    visual_utilization: avgUtilization,
+    zones: zoneSnapshots,
+    health_level,
+    needs_reroute,
+    reroute_reason,
+    suggested_action,
+    render_timestamp: Date.now(),
+    render_duration_ms: renderDurationMs,
+    warnings_count: warnings.length,
+    errors_count: errorsCount
+  };
 }

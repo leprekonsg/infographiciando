@@ -365,6 +365,12 @@ const PRICING = {
 // Pro baseline for savings calculation
 const PRO_RATES = PRICING.TOKENS['gemini-3-pro-preview'];
 
+// Normalize model names from API responses (e.g., "models/gemini-3-flash-preview")
+function normalizeModelName(model?: string): string {
+    if (!model) return 'unknown';
+    return model.replace(/^models\//, '').replace(/^model\//, '').trim();
+}
+
 export class CostTracker {
     totalCost = 0;
     totalInputTokens = 0;
@@ -373,14 +379,22 @@ export class CostTracker {
     totalSavingsVsPro = 0;
     private modelUsage: Map<string, { calls: number; cost: number }> = new Map();
 
+    // Qwen-VL Visual Cortex metrics
+    qwenVLCost = 0;
+    qwenVLInputTokens = 0;
+    qwenVLOutputTokens = 0;
+    qwenVLCalls = 0;
+
     addUsage(model: string, usage: InteractionResponse['usage']): void {
         if (!usage) return;
+
+        const normalizedModel = normalizeModelName(model);
 
         this.totalInputTokens += usage.total_input_tokens || 0;
         this.totalOutputTokens += usage.total_output_tokens || 0;
         this.totalReasoningTokens += usage.total_reasoning_tokens || 0;
 
-        const rates = PRICING.TOKENS[model as keyof typeof PRICING.TOKENS] || { input: 0.10, output: 0.40 };
+        const rates = PRICING.TOKENS[normalizedModel as keyof typeof PRICING.TOKENS] || { input: 0.10, output: 0.40 };
         const cost = (usage.total_input_tokens / 1_000_000 * rates.input) +
             (usage.total_output_tokens / 1_000_000 * rates.output);
         this.totalCost += cost;
@@ -392,18 +406,36 @@ export class CostTracker {
         this.totalSavingsVsPro += savings;
 
         // Track per-model usage
-        const existing = this.modelUsage.get(model) || { calls: 0, cost: 0 };
-        this.modelUsage.set(model, { calls: existing.calls + 1, cost: existing.cost + cost });
+        const existing = this.modelUsage.get(normalizedModel) || { calls: 0, cost: 0 };
+        this.modelUsage.set(normalizedModel, { calls: existing.calls + 1, cost: existing.cost + cost });
 
         // Log savings for visibility
         if (savings > 0.0001) {
-            console.log(`💰 [COST] ${model}: $${cost.toFixed(4)} (saved $${savings.toFixed(4)} vs Pro)`);
+            console.log(`💰 [COST] ${normalizedModel}: $${cost.toFixed(4)} (saved $${savings.toFixed(4)} vs Pro)`);
         }
     }
 
     addImageCost(model: string): void {
         const cost = PRICING.IMAGES[model as keyof typeof PRICING.IMAGES] || 0.134;
         this.totalCost += cost;
+    }
+
+    /**
+     * Add Qwen-VL visual critique cost
+     * Pricing: $0.2 per 1M input tokens, $1.6 per 1M output tokens
+     */
+    addQwenVLCost(inputTokens: number, outputTokens: number): void {
+        const QWEN_VL_PRICING = { input: 0.2, output: 1.6 }; // Per 1M tokens
+        const cost = (inputTokens / 1_000_000 * QWEN_VL_PRICING.input) +
+                     (outputTokens / 1_000_000 * QWEN_VL_PRICING.output);
+
+        this.qwenVLCost += cost;
+        this.qwenVLInputTokens += inputTokens;
+        this.qwenVLOutputTokens += outputTokens;
+        this.qwenVLCalls += 1;
+        this.totalCost += cost;
+
+        console.log(`💰 [COST] Qwen-VL: $${cost.toFixed(4)} (${inputTokens} input, ${outputTokens} output tokens)`);
     }
 
     getSummary(): {
@@ -413,8 +445,14 @@ export class CostTracker {
         totalReasoningTokens: number;
         totalSavingsVsPro: number;
         modelBreakdown: Record<string, { calls: number; cost: number }>;
+        qwenVL?: {
+            cost: number;
+            inputTokens: number;
+            outputTokens: number;
+            calls: number;
+        };
     } {
-        return {
+        const summary: any = {
             totalCost: this.totalCost,
             totalInputTokens: this.totalInputTokens,
             totalOutputTokens: this.totalOutputTokens,
@@ -422,6 +460,18 @@ export class CostTracker {
             totalSavingsVsPro: this.totalSavingsVsPro,
             modelBreakdown: Object.fromEntries(this.modelUsage)
         };
+
+        // Include Qwen-VL metrics if used
+        if (this.qwenVLCalls > 0) {
+            summary.qwenVL = {
+                cost: this.qwenVLCost,
+                inputTokens: this.qwenVLInputTokens,
+                outputTokens: this.qwenVLOutputTokens,
+                calls: this.qwenVLCalls
+            };
+        }
+
+        return summary;
     }
 }
 
@@ -616,7 +666,7 @@ export async function runAgentLoop(
 ): Promise<{ text: string; logger: AgentLogger; thoughtSignature?: string }> {
     const logger = new AgentLogger();
     const client = new InteractionsClient();
-    const maxIterations = config.maxIterations || 15;
+    const maxIterations = config.maxIterations || 10; // Reduced from 15 per Phil Schmid best practices
 
     // Build tool declarations for the API
     const toolDeclarations = Object.values(config.tools).map(t => t.definition);
@@ -772,6 +822,11 @@ export async function runAgentLoop(
 
             }
 
+            // Log thought signature propagation
+            if (previousInteractionId && thoughtSignature) {
+                console.log(`[AGENT LOOP] Returning thought signature to model for iteration ${iteration} (via previous_interaction_id)`);
+            }
+
             const request: InteractionRequest = {
                 model: config.model,
                 input: contents,
@@ -789,9 +844,15 @@ export async function runAgentLoop(
 
             const response = await client.create(request);
 
+            const requestedModel = normalizeModelName(config.model);
+            const resolvedModel = normalizeModelName(response.model || config.model);
+            if (response.model && resolvedModel !== requestedModel) {
+                console.log(`[INTERACTIONS CLIENT] Model resolved to ${resolvedModel} (requested ${requestedModel})`);
+            }
+
             // Track costs
             if (costTracker) {
-                costTracker.addUsage(config.model, response.usage);
+                costTracker.addUsage(resolvedModel, response.usage);
             }
 
             previousInteractionId = response.id;
@@ -809,6 +870,18 @@ export async function runAgentLoop(
                 if (output.type === 'thought' && output.signature) {
                     // Preserve thought signature for Gemini 3
                     thoughtSignature = output.signature;
+                    console.log(`[AGENT LOOP] Captured thought signature (${thoughtSignature.length} chars) at iteration ${iteration}`);
+
+                    // Log thought summary if available for debugging
+                    if (output.summary && Array.isArray(output.summary)) {
+                        const summaryText = output.summary
+                            .filter(s => s.type === 'text')
+                            .map(s => s.text)
+                            .join(' ');
+                        if (summaryText) {
+                            console.log(`[AGENT LOOP] Thought summary: ${summaryText.substring(0, 150)}...`);
+                        }
+                    }
                 }
 
                 if (output.type === 'function_call') {
@@ -926,8 +999,14 @@ export async function createInteraction(
 
     const response = await client.create(request);
 
+    const requestedModel = normalizeModelName(model);
+    const resolvedModel = normalizeModelName(response.model || model);
+    if (response.model && resolvedModel !== requestedModel) {
+        console.log(`[INTERACTIONS CLIENT] Model resolved to ${resolvedModel} (requested ${requestedModel})`);
+    }
+
     if (costTracker) {
-        costTracker.addUsage(model, response.usage);
+        costTracker.addUsage(resolvedModel, response.usage);
     }
 
     // Extract text from outputs
@@ -966,9 +1045,14 @@ export async function createInteraction(
 
         try {
             const retryResponse = await client.create(retryRequest);
+            const retryRequestedModel = normalizeModelName(MODEL_SIMPLE);
+            const retryResolvedModel = normalizeModelName(retryResponse.model || MODEL_SIMPLE);
+            if (retryResponse.model && retryResolvedModel !== retryRequestedModel) {
+                console.log(`[INTERACTIONS CLIENT] Model resolved to ${retryResolvedModel} (requested ${retryRequestedModel})`);
+            }
 
             if (costTracker) {
-                costTracker.addUsage(MODEL_SIMPLE, retryResponse.usage);
+                costTracker.addUsage(retryResolvedModel, retryResponse.usage);
             }
 
             for (const output of retryResponse.outputs || []) {

@@ -6,6 +6,8 @@ import * as LucideIcons from 'lucide-react';
 import pptxgen from 'pptxgenjs';
 import { SlideNode, GlobalStyleGuide, TemplateComponent, VisualElement, LayoutVariant } from '../types/slideTypes';
 import { SpatialLayoutEngine } from './spatialRenderer';
+import { buildDiagramSVG, DiagramPalette } from './diagramBuilder';
+import { svgToPngBase64 } from './visualCortex';
 
 const DEFAULT_COLORS = { background: "0F172A", text: "F1F5F9", primary: "22C55E", secondary: "38BDF8", accent: "F59E0B" };
 
@@ -143,6 +145,7 @@ export const convertIconToPng = async (iconName: string, color: string, pixelSiz
 
 export class InfographicRenderer {
   private iconCache = new Map<string, string>();
+  private diagramCache = new Map<string, string>();
   private layoutEngine = new SpatialLayoutEngine();
 
   async prepareIconsForDeck(slides: SlideNode[], palette: any) {
@@ -161,6 +164,62 @@ export class InfographicRenderer {
     }
   }
 
+  async prepareDiagramsForDeck(slides: SlideNode[], styleGuide: GlobalStyleGuide) {
+    const palette = resolvePalette(styleGuide);
+    const diagramPalette: DiagramPalette = {
+      primary: palette.primary,
+      accent: palette.accent,
+      background: palette.background,
+      text: palette.text
+    };
+
+    for (const slide of slides) {
+      const components = slide.layoutPlan?.components || [];
+      for (let i = 0; i < components.length; i++) {
+        const comp = components[i];
+        if (comp.type === 'diagram-svg') {
+          // Use content-based cache key (stable across renders)
+          const cacheKey = this.generateDiagramCacheKey(comp);
+          if (!this.diagramCache.has(cacheKey)) {
+            try {
+              // Check if we're in Node.js environment
+              if (typeof window !== 'undefined') {
+                console.warn('[InfographicRenderer] Diagram rendering requires Node.js environment, skipping');
+                continue;
+              }
+
+              const svgString = buildDiagramSVG(
+                comp.diagramType,
+                comp.elements,
+                comp.centralTheme,
+                diagramPalette
+              );
+
+              // Rasterize to PNG (1920x1080 for high quality)
+              const pngBase64 = await svgToPngBase64(svgString, 1920, 1080);
+
+              this.diagramCache.set(cacheKey, pngBase64);
+            } catch (error: any) {
+              console.error(`[InfographicRenderer] Failed to generate diagram for slide ${slide.order}:`, error.message);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private generateDiagramCacheKey(comp: any): string {
+    // Generate stable key from diagram content
+    const elements = comp.elements || [];
+    const elementKeys = elements.map((e: any) => `${e.id}:${e.label}`).join('|');
+    return `${comp.diagramType}:${comp.centralTheme || 'no-theme'}:${elementKeys}`;
+  }
+
+  public getDiagramFromCache(comp: any): string | undefined {
+    const cacheKey = this.generateDiagramCacheKey(comp);
+    return this.diagramCache.get(cacheKey);
+  }
+
   // --- COMPILER: THE RENDERING ENVIRONMENT ---
   public compileSlide(slide: SlideNode, styleGuide: GlobalStyleGuide): VisualElement[] {
     // Use the new Spatial Layout Engine with VisualDesignSpec for color overrides
@@ -168,7 +227,8 @@ export class InfographicRenderer {
       slide,
       styleGuide,
       (name: string) => this.iconCache.get(name),
-      slide.visualDesignSpec // Pass through the visual design spec for color harmony
+      slide.visualDesignSpec, // Pass through the visual design spec for color harmony
+      (comp: any) => this.getDiagramFromCache(comp)
     );
   }
 

@@ -78,6 +78,28 @@ Open `http://localhost:5173`, enter a topic, and watch the agents work.
 
 ---
 
+## Qwen-VL Visual Architect (Optional)
+
+Qwen-VL powers the visual critique/repair loop. It requires a small Node backend for SVG → PNG rasterization and the DashScope API call.
+
+### Environment Variables
+- `GEMINI_API_KEY` — Required for Gemini Interactions API
+- `DASHSCOPE_API_KEY` or `QWEN_API_KEY` — Required for Qwen-VL
+- `QWEN_VL_PROXY_URL` — Base URL of the local Qwen-VL proxy (e.g., `http://localhost:8787`)
+
+### Local Setup
+```bash
+# Terminal 1: start Qwen-VL proxy server (Node-only)
+npm run qwen:server
+
+# Terminal 2: start the Vite app
+npm run dev
+```
+
+If `QWEN_VL_PROXY_URL` is not set, the app will fall back to the internal visual critique only.
+
+---
+
 ## Project Structure
 
 ```
