@@ -23,6 +23,10 @@ export async function runContentPlanner(
     }
 
     // NOTE: Schema flattened for consistency with Gemini Interactions API nesting limits.
+    const MAX_FACTS_CONTEXT_CHARS = 4000;
+    const safeFactsContext = factsContext.length > MAX_FACTS_CONTEXT_CHARS
+        ? `${factsContext.slice(0, MAX_FACTS_CONTEXT_CHARS - 3)}...`
+        : factsContext;
     const contentPlanSchema = {
         type: "object",
         properties: {
@@ -40,7 +44,7 @@ export async function runContentPlanner(
         // Thinking: Low (extraction task with moderate reasoning)
         return await createJsonInteraction(
             MODEL_AGENTIC,
-            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, factsContext, recentHistory),
+            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, safeFactsContext, recentHistory),
             contentPlanSchema,
             {
                 systemInstruction: PROMPTS.CONTENT_PLANNER.ROLE,

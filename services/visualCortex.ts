@@ -120,6 +120,11 @@ export interface VisualCritiqueResult {
         description: string;
         suggested_fix?: string;
     }>;
+    edit_instructions?: Array<{
+        action: 'move' | 'resize' | 'trim_text' | 'simplify_content' | 'increase_negative_space' | 'swap_zones';
+        target_region: string; // e.g., "top-left", "center", or "x:0.1,y:0.2,w:0.3,h:0.2"
+        detail: string;
+    }>;
     empty_regions: Array<{
         bbox: { x: number; y: number; w: number; h: number }; // Normalized 0-1
         label: 'safe_for_text' | 'safe_for_image' | 'marginal';
@@ -191,6 +196,13 @@ OUTPUT JSON with structure:
       "suggested_fix": "..."
     }
   ],
+    "edit_instructions": [
+        {
+            "action": "move" | "resize" | "trim_text" | "simplify_content" | "increase_negative_space" | "swap_zones",
+            "target_region": "top-left" | "top-right" | "center" | "bottom-left" | "bottom-right" | "x:<0-1>,y:<0-1>,w:<0-1>,h:<0-1>",
+            "detail": "..."
+        }
+    ],
   "empty_regions": [
     {
       "bbox": { "x": <0-1>, "y": <0-1>, "w": <0-1>, "h": <0-1> },
@@ -210,6 +222,7 @@ IMPORTANT:
 - Coordinates are normalized 0-1 (not pixels)
 - Focus on actionable issues
 - Be concise in descriptions
+- If you can suggest edits, include 1-5 edit_instructions with target_region + action
 - Output ONLY valid JSON`;
 
         try {

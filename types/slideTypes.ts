@@ -405,10 +405,20 @@ export interface RouterConstraints {
  * GeneratorResult: Extended return type for circuit breaker pattern.
  * If needsReroute is true, orchestrator should re-run pipeline with new constraints.
  */
+export enum GeneratorFailureReason {
+  LowFitScore = 'low_fit_score',
+  QwenQaFailed = 'qwen_qa_failed',
+  CriticalValidation = 'critical_validation',
+  VisualFocusMissing = 'visual_focus_missing',
+  ModelDegeneration = 'model_degeneration',
+  Unknown = 'unknown'
+}
+
 export interface GeneratorResult {
   slide: SlideNode;
   needsReroute: boolean;
   rerouteReason?: string;
+  rerouteReasonType?: GeneratorFailureReason;
   avoidLayoutVariants?: string[];
   // System 2 tracking
   visualCritiqueRan?: boolean;

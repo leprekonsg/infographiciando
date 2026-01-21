@@ -1011,6 +1011,11 @@ function calculateTextDensity(components: TemplateComponent[]): number {
         totalItems += 1;
         break;
 
+      case 'title-section':
+        totalTextItems += 1 + (comp.subtitle ? 1 : 0);
+        totalItems += 1 + (comp.subtitle ? 1 : 0);
+        break;
+
       default:
         totalItems += 1;
     }

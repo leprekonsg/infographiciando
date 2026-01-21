@@ -174,6 +174,23 @@ function extractLongestValidPrefix(text: string): { json: string; discarded: str
     return null;
 }
 
+// Detect low-entropy/degenerate output patterns (e.g., "0-0-0", "o0o0o0", repeated chars)
+function hasEntropyDegeneration(text: string): boolean {
+    const sample = text.slice(-200).toLowerCase();
+    if (/(\b0-){2,}0\b/.test(sample)) return true;
+    if (/(?:\b0\b[\s,\-]*){6,}/.test(sample)) return true;
+    if (/(?:o0){5,}/.test(sample)) return true;
+    if (/([a-z0-9])\1{10,}/.test(sample)) return true;
+
+    const alnum = sample.replace(/[^a-z0-9]/g, '');
+    if (alnum.length >= 30) {
+        const uniqueChars = new Set(alnum.split('')).size;
+        if (uniqueChars <= 3) return true;
+    }
+
+    return false;
+}
+
 export type ContentType =
     | { type: 'text'; text: string }
     | { type: 'image'; image: { data: string; mimeType: string } }
@@ -1012,10 +1029,57 @@ export async function createInteraction(
     // Extract text from outputs
     const outputs = response.outputs || [];
 
+    let extractedText: string | null = null;
     for (const output of outputs) {
         if (output.type === 'text') {
-            return output.text;
+            extractedText = output.text;
+            break;
         }
+    }
+
+    if (extractedText) {
+        // --- CASE 3 FIX: Degenerate output ("0-0-0" or low-entropy loops) ---
+        if (hasEntropyDegeneration(extractedText)) {
+            console.warn(`[INTERACTIONS CLIENT] Degenerate output detected. Reissuing with stricter maxOutputTokens...`);
+
+            const fallbackMaxTokens = Math.max(512, Math.min(options.maxOutputTokens ?? 8192, 1024));
+            const retryRequest: InteractionRequest = {
+                model,
+                input: prompt,
+                system_instruction: options.systemInstruction,
+                response_format: options.responseFormat,
+                response_mime_type: options.responseMimeType,
+                generation_config: {
+                    temperature: 0.0,
+                    max_output_tokens: fallbackMaxTokens,
+                    thinking_level: undefined
+                }
+            };
+
+            try {
+                const retryResponse = await client.create(retryRequest);
+                const retryRequestedModel = normalizeModelName(model);
+                const retryResolvedModel = normalizeModelName(retryResponse.model || model);
+                if (retryResponse.model && retryResolvedModel !== retryRequestedModel) {
+                    console.log(`[INTERACTIONS CLIENT] Model resolved to ${retryResolvedModel} (requested ${retryRequestedModel})`);
+                }
+
+                if (costTracker) {
+                    costTracker.addUsage(retryResolvedModel, retryResponse.usage);
+                }
+
+                for (const output of retryResponse.outputs || []) {
+                    if (output.type === 'text') {
+                        console.log(`[INTERACTIONS CLIENT] Degeneration retry succeeded`);
+                        return output.text;
+                    }
+                }
+            } catch (retryErr: any) {
+                console.error(`[INTERACTIONS CLIENT] Degeneration retry failed:`, retryErr.message);
+            }
+        }
+
+        return extractedText;
     }
 
     // --- CASE 2 FIX: Empty response (thinking exhaustion or API error) ---

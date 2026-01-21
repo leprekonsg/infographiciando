@@ -71,6 +71,42 @@ function estimateComponentTypes(routerConfig: RouterDecision, contentPlan: any):
     return Array.from(types);
 }
 
+// Deterministically enforce visual focus cues in visual prompt to avoid validation loops
+function enforceVisualFocusInSpec(spec: VisualDesignSpec, visualFocus?: string): VisualDesignSpec {
+    if (!visualFocus || visualFocus.trim().length === 0 || visualFocus === 'Content') {
+        return spec;
+    }
+
+    const focus = visualFocus.trim();
+    const focusTerms = focus.toLowerCase().split(/\s+/).filter(t => t.length > 3);
+    const prompt = spec.prompt_with_composition || '';
+    const promptLower = prompt.toLowerCase();
+    const elementsLower = (spec.foreground_elements || []).join(' ').toLowerCase();
+
+    const mentionsFocus = focusTerms.some(term =>
+        promptLower.includes(term) || elementsLower.includes(term)
+    ) || promptLower.includes(focus.toLowerCase());
+
+    if (!mentionsFocus) {
+        const trimmed = prompt.trim();
+        const suffix = ` Visual focus cues: ${focus}.`;
+        spec.prompt_with_composition = trimmed.length > 0
+            ? `${trimmed}${trimmed.endsWith('.') ? '' : '.'}${suffix}`
+            : `Visual focus cues: ${focus}.`;
+
+        if (Array.isArray(spec.foreground_elements)) {
+            const hasExact = spec.foreground_elements.some(el =>
+                typeof el === 'string' && el.toLowerCase().includes(focus.toLowerCase())
+            );
+            if (!hasExact) {
+                spec.foreground_elements = [...spec.foreground_elements, focus];
+            }
+        }
+    }
+
+    return spec;
+}
+
 export const runVisualDesigner = async (
     slideTitle: string,
     contentPlan: any,
@@ -161,10 +197,13 @@ export const runVisualDesigner = async (
 
             // STEP 2: Inject pre-computed spatial_strategy (LLM-generated zones are unreliable)
             // The LLM generates creative fields; zones come from deterministic layout templates
-            const visualPrompt: VisualDesignSpec = {
+            let visualPrompt: VisualDesignSpec = {
                 ...rawVisualPrompt,
                 spatial_strategy: spatialStrategy // Use pre-computed zones from layoutEngine
             };
+
+            // STEP 2.5: Enforce visual focus cues deterministically before validation
+            visualPrompt = enforceVisualFocusInSpec(visualPrompt, routerConfig.visualFocus);
 
             // STEP 3: Schema Validation (Hard Parse)
             const parseResult = VisualDesignSpecSchema.safeParse(visualPrompt);

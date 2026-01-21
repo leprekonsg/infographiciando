@@ -108,6 +108,7 @@ BACKGROUND DESIGN REQUIREMENTS:
   - Abstract textures (e.g., "subtle mesh pattern", "soft bokeh")
   - Mood/atmosphere (e.g., "professional", "modern", "sophisticated")
   - Text-safe contrast planning (e.g., "dark vignette band for text area", "low-contrast texture in text zone")
+  - Visual focus cues: MUST include the exact phrase "${context.visualFocus}" verbatim in prompt_with_composition
    
 2. prompt_with_composition must NOT describe:
    - Any text, words, labels, or numbers

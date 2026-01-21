@@ -31,25 +31,45 @@ function buildMockComponentsFromContentPlan(
     };
 
     const variantCaps: Record<string, { bullets: number; bulletChars: number; metrics: number }> = {
-        'bento-grid': { bullets: 2, bulletChars: 60, metrics: 3 },
-        'dashboard-tiles': { bullets: 1, bulletChars: 55, metrics: 3 },
-        'metrics-rail': { bullets: 2, bulletChars: 70, metrics: 2 },
-        'split-left-text': { bullets: 2, bulletChars: 70, metrics: 2 },
-        'split-right-text': { bullets: 2, bulletChars: 70, metrics: 2 },
-        'standard-vertical': { bullets: 3, bulletChars: 80, metrics: 3 },
-        'asymmetric-grid': { bullets: 3, bulletChars: 75, metrics: 3 },
-        'hero-centered': { bullets: 2, bulletChars: 70, metrics: 2 },
-        'timeline-horizontal': { bullets: 2, bulletChars: 70, metrics: 2 }
+        'bento-grid': { bullets: 2, bulletChars: 55, metrics: 3 },
+        'dashboard-tiles': { bullets: 1, bulletChars: 50, metrics: 3 },
+        'metrics-rail': { bullets: 2, bulletChars: 60, metrics: 2 },
+        'split-left-text': { bullets: 2, bulletChars: 60, metrics: 2 },
+        'split-right-text': { bullets: 2, bulletChars: 60, metrics: 2 },
+        'standard-vertical': { bullets: 3, bulletChars: 70, metrics: 3 },
+        'asymmetric-grid': { bullets: 3, bulletChars: 65, metrics: 3 },
+        'hero-centered': { bullets: 1, bulletChars: 55, metrics: 2 },
+        'timeline-horizontal': { bullets: 3, bulletChars: 55, metrics: 2 }
     };
 
     const caps = variant ? (variantCaps[variant] || variantCaps['standard-vertical']) : variantCaps['standard-vertical'];
 
-    const includeTextBullets = keyPoints.length > 0 && variant !== 'bento-grid';
+    // Derive per-line target from density budget (caps are hard limits)
+    const densityPerItem = densityBudget?.maxChars && maxItems
+        ? Math.floor(densityBudget.maxChars / Math.max(1, maxItems))
+        : undefined;
+    const effectiveBulletChars = Math.max(40, Math.min(caps.bulletChars, densityPerItem || caps.bulletChars));
+
+    const wantsProcessFlow = variant === 'timeline-horizontal' && keyPoints.length >= 3;
+    if (wantsProcessFlow) {
+        components.push({
+            type: 'process-flow',
+            steps: keyPoints.slice(0, Math.min(3, maxItems)).map((kp: any, i: number) => ({
+                number: i + 1,
+                title: trimLine(String(kp), 18),
+                description: trimLine(String(kp), effectiveBulletChars),
+                icon: 'ArrowRight'
+            }))
+        });
+    }
+
+    const includeTextBullets = !wantsProcessFlow && keyPoints.length > 0 &&
+        variant !== 'bento-grid' && variant !== 'dashboard-tiles';
     if (includeTextBullets) {
         components.push({
             type: 'text-bullets',
             title: 'Key Points',
-            content: keyPoints.slice(0, Math.min(caps.bullets, maxItems)).map((kp: any) => trimLine(String(kp), caps.bulletChars))
+            content: keyPoints.slice(0, Math.min(caps.bullets, maxItems)).map((kp: any) => trimLine(String(kp), effectiveBulletChars))
         });
     }
 
@@ -80,6 +100,31 @@ function buildMockComponentsFromContentPlan(
             title: 'Summary',
             content: [contentPlan?.title || 'Overview']
         });
+    }
+
+    // Variant-level component cap to avoid unplaced warnings
+    if (variant === 'hero-centered') {
+        if (keyPoints.length > 0) {
+            return components.filter(c => c.type === 'text-bullets').slice(0, 1).length
+                ? components.filter(c => c.type === 'text-bullets').slice(0, 1)
+                : components.slice(0, 1);
+        }
+        return components.slice(0, 1);
+    }
+
+    if (variant === 'split-left-text' || variant === 'split-right-text') {
+        if (components.length === 1) {
+            components.push({
+                type: 'text-bullets',
+                title: 'Context',
+                content: ['Condense to fit layout.']
+            });
+        }
+        return components.slice(0, 2);
+    }
+
+    if (variant === 'timeline-horizontal') {
+        return components.slice(0, 1);
     }
 
     return components;

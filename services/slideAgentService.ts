@@ -19,7 +19,7 @@ import {
     ResearchFact, RouterDecision,
     FactClusterSchema, VisualDesignSpec, ValidationResult,
     // Level 3 Agentic Stack Types
-    NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics,
+    NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics, GeneratorFailureReason,
     // System 2 Visual Critique
     VISUAL_THRESHOLDS
 } from "../types/slideTypes";
@@ -51,6 +51,44 @@ import { z } from "zod";
 import { MODEL_AGENTIC } from "./interactionsClient";
 
 const MAX_AGENT_ITERATIONS = 10; // Global escape hatch per Phil Schmid's recommendation (reduced from 15 for faster convergence)
+
+// Deterministic visual focus enforcement for visual design spec
+function enforceVisualFocusInSpec(
+    spec: VisualDesignSpec | undefined,
+    visualFocus?: string
+): VisualDesignSpec | undefined {
+    if (!spec || !visualFocus || visualFocus.trim().length === 0 || visualFocus === 'Content') {
+        return spec;
+    }
+
+    const focus = visualFocus.trim();
+    const focusTerms = focus.toLowerCase().split(/\s+/).filter(t => t.length > 3);
+    const prompt = spec.prompt_with_composition || '';
+    const promptLower = prompt.toLowerCase();
+    const elementsLower = (spec.foreground_elements || []).join(' ').toLowerCase();
+
+    const mentionsFocus = focusTerms.some(term =>
+        promptLower.includes(term) || elementsLower.includes(term)
+    ) || promptLower.includes(focus.toLowerCase());
+
+    if (mentionsFocus) return spec;
+
+    const trimmed = prompt.trim();
+    const suffix = ` Visual focus cues: ${focus}.`;
+    const updatedPrompt = trimmed.length > 0
+        ? `${trimmed}${trimmed.endsWith('.') ? '' : '.'}${suffix}`
+        : `Visual focus cues: ${focus}.`;
+
+    return {
+        ...spec,
+        prompt_with_composition: updatedPrompt,
+        foreground_elements: Array.isArray(spec.foreground_elements)
+            ? (spec.foreground_elements.some(el =>
+                typeof el === 'string' && el.toLowerCase().includes(focus.toLowerCase())
+            ) ? spec.foreground_elements : [...spec.foreground_elements, focus])
+            : spec.foreground_elements
+    };
+}
 
 // --- SYSTEM 2: RECURSIVE VISUAL CRITIQUE ---
 
@@ -609,6 +647,9 @@ async function runGenerator(
         );
     }
 
+    // Apply deterministic visual focus enforcement early to avoid repeated validation loops
+    const enforcedVisualDesignSpec = enforceVisualFocusInSpec(visualDesignSpec, routerConfig.visualFocus);
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
             const isRecoveryAttempt = attempt > 0;
@@ -651,10 +692,10 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 }
             };
 
-            const compressedVisualSpec = visualDesignSpec ? {
-                color_harmony: visualDesignSpec.color_harmony,
-                background_treatment: visualDesignSpec.background_treatment,
-                negative_space_allocation: visualDesignSpec.negative_space_allocation
+            const compressedVisualSpec = enforcedVisualDesignSpec ? {
+                color_harmony: enforcedVisualDesignSpec.color_harmony,
+                background_treatment: enforcedVisualDesignSpec.background_treatment,
+                negative_space_allocation: enforcedVisualDesignSpec.negative_space_allocation
                 // Omit spatial_strategy (verbose zones), prompt_with_composition, foreground_elements
             } : undefined;
 
@@ -668,7 +709,10 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             if (isRecoveryAttempt && lastValidation?.errors) {
                 // Compact repair prompt
                 const errorSummary = lastValidation.errors.slice(0, 2).map((e: any) => e.message).join('; ');
-                basePrompt = `Fix these errors: ${errorSummary}\n\nContent: ${JSON.stringify(safeContentPlan)}`;
+                const visualFocusHint = routerConfig.visualFocus && routerConfig.visualFocus !== 'Content'
+                    ? `\nVISUAL FOCUS: Include the theme "${routerConfig.visualFocus}" in component text.`
+                    : '';
+                basePrompt = `Fix these errors: ${errorSummary}${visualFocusHint}\n\nContent: ${JSON.stringify(safeContentPlan)}`;
             } else {
                 basePrompt = PROMPTS.VISUAL_DESIGNER.TASK(
                     JSON.stringify(safeContentPlan),
@@ -745,7 +789,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 layoutPlan: raw.layoutPlan,
                 visualReasoning: "Generated via Interactions API",
                 visualPrompt: "",
-                visualDesignSpec,
+                visualDesignSpec: enforcedVisualDesignSpec,
                 speakerNotesLines: raw.speakerNotesLines || [],
                 citations: [],
                 chartSpec: raw.chartSpec,
@@ -785,8 +829,8 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             }
 
             // Merge Visual Alignment Validation
-            if (visualDesignSpec) {
-                const alignment = validateVisualLayoutAlignment(visualDesignSpec, routerConfig, candidate.layoutPlan);
+            if (enforcedVisualDesignSpec) {
+                const alignment = validateVisualLayoutAlignment(enforcedVisualDesignSpec, routerConfig, candidate.layoutPlan);
                 if (!alignment.passed || alignment.errors.length > 0) {
                     validation.errors.push(...alignment.errors);
                     validation.score = Math.min(validation.score, alignment.score);
@@ -911,6 +955,22 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                                 ...(candidate.warnings || []),
                                 `Qwen QA flagged for repair (score: ${qaCritique.overall_score})`
                             ];
+                        } else if (qaCritique.overall_verdict === 'flag_for_review') {
+                            candidate.warnings = [
+                                ...(candidate.warnings || []),
+                                `Qwen QA flagged for review (score: ${qaCritique.overall_score})`
+                            ];
+                        }
+
+                        if (qaCritique.edit_instructions?.length) {
+                            const hints = qaCritique.edit_instructions
+                                .slice(0, 3)
+                                .map((h: any) => `${h.action} @ ${h.target_region}: ${h.detail}`)
+                                .join(' | ');
+                            candidate.warnings = [
+                                ...(candidate.warnings || []),
+                                `Qwen QA edit hints: ${hints}`
+                            ];
                         }
                     } else {
                         console.warn('[QWEN QA] Critique unavailable (proxy/key missing or rasterizer unavailable).');
@@ -957,6 +1017,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                     slide: candidate,
                     needsReroute: true,
                     rerouteReason: envSnapshot.reroute_reason || `Low fit score: ${envSnapshot.fit_score.toFixed(2)}`,
+                    rerouteReasonType: GeneratorFailureReason.LowFitScore,
                     avoidLayoutVariants: [routerConfig.layoutVariant],
                     visualCritiqueRan,
                     visualRepairAttempted,
@@ -977,6 +1038,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                         slide: candidate,
                         needsReroute: true,
                         rerouteReason: `Qwen QA score ${qwenQaScore}`,
+                        rerouteReasonType: GeneratorFailureReason.QwenQaFailed,
                         avoidLayoutVariants: [routerConfig.layoutVariant],
                         visualCritiqueRan,
                         visualRepairAttempted,
@@ -1017,6 +1079,25 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 e.code === 'ERR_ITEM_COUNT_CRITICAL'
             );
 
+            const visualFocusError = validation.errors.find(e => e.code === 'VISUAL_FOCUS_MISSING');
+
+            if (visualFocusError && attempt === MAX_RETRIES) {
+                console.warn(`[GENERATOR] Visual focus missing, signaling reroute.`);
+                return {
+                    slide: candidate,
+                    needsReroute: true,
+                    rerouteReason: visualFocusError.message,
+                    rerouteReasonType: GeneratorFailureReason.VisualFocusMissing,
+                    avoidLayoutVariants: [routerConfig.layoutVariant],
+                    visualCritiqueRan,
+                    visualRepairAttempted,
+                    visualRepairSucceeded,
+                    system2Cost,
+                    system2InputTokens,
+                    system2OutputTokens
+                };
+            }
+
             if (criticalErrors.length > 0 && attempt === MAX_RETRIES) {
                 // Instead of falling back immediately, signal reroute opportunity
                 console.warn(`[GENERATOR] Critical errors detected, signaling reroute: ${criticalErrors.map(e => e.code).join(', ')}`);
@@ -1024,6 +1105,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                     slide: candidate,
                     needsReroute: true,
                     rerouteReason: criticalErrors[0].code,
+                    rerouteReasonType: GeneratorFailureReason.CriticalValidation,
                     avoidLayoutVariants: [routerConfig.layoutVariant],
                     visualCritiqueRan,
                     visualRepairAttempted,
@@ -1069,7 +1151,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
         },
         visualReasoning: "Fallback (circuit breaker)",
         visualPrompt: "",
-        visualDesignSpec,
+        visualDesignSpec: enforcedVisualDesignSpec,
         speakerNotesLines: [`Fallback due to ${generatorFailures} generation failures.`],
         readabilityCheck: 'warning',
         citations: [],
@@ -1231,7 +1313,8 @@ export const generateAgenticDeck = async (
                 // --- PHASE 3: SELF-HEALING CIRCUIT BREAKER ---
                 if (generatorResult.needsReroute && slideRerouteCount < MAX_REROUTES_PER_SLIDE) {
                     slideRerouteCount++;
-                    console.warn(`[ORCHESTRATOR] Reroute ${slideRerouteCount}/${MAX_REROUTES_PER_SLIDE} for slide ${i + 1}: ${generatorResult.rerouteReason}`);
+                    const reasonType = generatorResult.rerouteReasonType || GeneratorFailureReason.Unknown;
+                    console.warn(`[ORCHESTRATOR] Reroute ${slideRerouteCount}/${MAX_REROUTES_PER_SLIDE} for slide ${i + 1} (${reasonType}): ${generatorResult.rerouteReason}`);
                     rerouteCount++;
 
                     // Re-run router with constraints to avoid failed layout
