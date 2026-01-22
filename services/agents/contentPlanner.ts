@@ -42,7 +42,7 @@ export async function runContentPlanner(
     try {
         // Content Planner: Moderate reasoning for keyPoints extraction → MODEL_AGENTIC (3 Flash)
         // Thinking: Low (extraction task with moderate reasoning)
-        return await createJsonInteraction(
+        const result = await createJsonInteraction(
             MODEL_AGENTIC,
             PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, safeFactsContext, recentHistory),
             contentPlanSchema,
@@ -54,6 +54,71 @@ export async function runContentPlanner(
             },
             costTracker
         );
+
+        const normalizeKeyPoints = (items: any[]): string[] => {
+            const title = String(meta.title || '').trim().toLowerCase();
+            const purpose = String(meta.purpose || '').trim().toLowerCase();
+            const banned = new Set(['generated slide.', 'generated slide', 'overview', 'summary', 'key points']);
+            const uniq = new Set<string>();
+            const cleaned: string[] = [];
+
+            (Array.isArray(items) ? items : []).forEach((raw: any) => {
+                const text = String(raw ?? '').trim();
+                if (!text) return;
+                const lower = text.toLowerCase();
+                if (banned.has(lower)) return;
+                if (lower === title || lower === purpose) return;
+                if (!uniq.has(lower)) {
+                    uniq.add(lower);
+                    cleaned.push(text);
+                }
+            });
+
+            if (cleaned.length === 0) {
+                return [meta.title || 'Key point'];
+            }
+
+            return cleaned.slice(0, 4);
+        };
+
+        const normalizeDataPoints = (items: any[]): any[] => {
+            if (!Array.isArray(items)) return [];
+            const normalized: any[] = [];
+
+            const parseNumber = (value: any): number | null => {
+                if (typeof value === 'number' && Number.isFinite(value)) return value;
+                if (typeof value === 'string') {
+                    const cleaned = value.replace(/[%$,]/g, '').trim();
+                    const parsed = Number(cleaned);
+                    if (Number.isFinite(parsed)) return parsed;
+                }
+                return null;
+            };
+
+            items.forEach((raw, idx) => {
+                if (raw && typeof raw === 'object') {
+                    const val = parseNumber((raw as any).value ?? (raw as any).amount ?? (raw as any).metric);
+                    const label = String((raw as any).label ?? (raw as any).name ?? `Metric ${idx + 1}`).trim();
+                    if (val !== null && label) {
+                        normalized.push({ label, value: val });
+                    }
+                    return;
+                }
+
+                const parsed = parseNumber(raw);
+                if (parsed !== null) {
+                    normalized.push({ label: `Metric ${idx + 1}`, value: parsed });
+                }
+            });
+
+            return normalized.slice(0, 4);
+        };
+
+        return {
+            ...result,
+            keyPoints: normalizeKeyPoints(result?.keyPoints || []),
+            dataPoints: normalizeDataPoints(result?.dataPoints || [])
+        };
     } catch (e: any) {
         console.warn("[CONTENT PLANNER] Failed. Using basic fallback.", e.message);
         return {

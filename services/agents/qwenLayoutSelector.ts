@@ -179,7 +179,8 @@ export async function runQwenLayoutSelector(
     baseRouterConfig: RouterDecision,
     styleGuide: GlobalStyleGuide,
     costTracker: CostTracker,
-    constraints?: RouterConstraints
+    constraints?: RouterConstraints,
+    componentsOverride?: any[]
 ): Promise<RouterDecision> {
     const { isQwenVLAvailable, getVisualCritiqueFromSvg } = await import('../visualCortex');
 
@@ -198,7 +199,9 @@ export async function runQwenLayoutSelector(
     let bestScore = -1;
 
     for (const variant of candidateVariants) {
-        const components = buildMockComponentsFromContentPlan(contentPlan, baseRouterConfig?.densityBudget, variant);
+        const components = Array.isArray(componentsOverride) && componentsOverride.length > 0
+            ? componentsOverride
+            : buildMockComponentsFromContentPlan(contentPlan, baseRouterConfig?.densityBudget, variant);
         const mockSlide: SlideNode = autoRepairSlide({
             order: slideMeta?.order ?? 0,
             type: slideMeta?.type ?? SLIDE_TYPES.CONTENT,

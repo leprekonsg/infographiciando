@@ -299,6 +299,88 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
         return false;
     };
 
+    const isPlaceholderValue = (value: any) => {
+        if (value === null || value === undefined) return true;
+        const raw = String(value).trim().toLowerCase();
+        if (!raw) return true;
+        return [
+            'n/a', 'na', 'tbd', 'unknown', 'none', 'null', 'nil', 'not available',
+            '-', '—', '...', 'n.a.'
+        ].includes(raw);
+    };
+
+    const extractFallbackBullets = () => {
+        const bullets: string[] = [];
+        const add = (text?: string) => {
+            if (!text || typeof text !== 'string') return;
+            const clean = text.replace(/^slide:\s*/i, '').trim();
+            if (clean.length >= 6) bullets.push(clean);
+        };
+
+        if (Array.isArray(slide.content)) {
+            slide.content.forEach(line => add(line));
+        }
+
+        if (Array.isArray(slide.speakerNotesLines)) {
+            slide.speakerNotesLines.slice(0, 2).forEach(line => add(line));
+        }
+
+        add(slide.layoutPlan?.title as any);
+        add((slide as any).title);
+
+        const unique = Array.from(new Set(bullets));
+        const titleText = String(slide.layoutPlan?.title || (slide as any).title || '').trim();
+        if (titleText) {
+            const titleLower = titleText.toLowerCase();
+            const nonTitle = unique.filter(item => String(item).trim().toLowerCase() !== titleLower);
+            if (nonTitle.length > 0) return nonTitle.slice(0, 4);
+        }
+        return unique.slice(0, 4);
+    };
+
+    const convertMetricsToTextBullets = (component: any, reason: string) => {
+        const fallback = extractFallbackBullets();
+        const safeBullets = fallback.length > 0
+            ? fallback
+            : ['Key focus areas', 'Operational priorities', 'Expected outcomes'];
+
+        component.type = 'text-bullets';
+        component.title = component.title || 'Key Points';
+        component.content = safeBullets;
+        delete component.metrics;
+        delete component.items;
+        delete component.cards;
+        addWarning(`Converted metric-cards to text-bullets: ${reason}`);
+    };
+
+    const convertIconGridToTextBullets = (component: any, reason: string) => {
+        const fallback = extractFallbackBullets();
+        const safeBullets = fallback.length > 0
+            ? fallback
+            : ['Core capability', 'Primary benefit', 'Key outcome'];
+
+        component.type = 'text-bullets';
+        component.title = component.title || 'Key Points';
+        component.content = safeBullets;
+        delete component.items;
+        delete component.icons;
+        delete component.features;
+        addWarning(`Converted icon-grid to text-bullets: ${reason}`);
+    };
+
+    const convertChartFrameToTextBullets = (component: any, reason: string) => {
+        const fallback = extractFallbackBullets();
+        const safeBullets = fallback.length > 0
+            ? fallback
+            : ['Key data signal', 'Supporting evidence', 'Impact highlight'];
+
+        component.type = 'text-bullets';
+        component.title = component.title || 'Key Points';
+        component.content = safeBullets;
+        delete component.data;
+        addWarning(`Converted chart-frame to text-bullets: ${reason}`);
+    };
+
     const normalizeComponentType = (rawType: string | undefined | null): string => {
         if (!rawType || typeof rawType !== 'string') return 'text-bullets';
         const trimmed = rawType.trim();
@@ -432,9 +514,8 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
         }
     }
 
-    // STEP 1.5: Cap components to layout capacity (prevents unplaced components)
-    const layoutVariant = slide.routerConfig?.layoutVariant || 'standard-vertical';
-    const layoutComponentCaps: Record<string, number> = {
+    const capComponentsToLayout = (layoutVariant: string, componentList: any[]) => {
+        const layoutComponentCaps: Record<string, number> = {
         'hero-centered': 1,
         'timeline-horizontal': 1,
         'split-left-text': 2,
@@ -444,24 +525,83 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
         'dashboard-tiles': 3,
         'metrics-rail': 2,
         'asymmetric-grid': 3
-    };
-    const maxComponents = layoutComponentCaps[layoutVariant] ?? 2;
-    if (components.length > maxComponents) {
-        const priorityOrder = layoutVariant === 'bento-grid'
-            ? ['metric-cards', 'icon-grid', 'chart-frame', 'text-bullets', 'process-flow', 'diagram-svg']
-            : ['text-bullets', 'chart-frame', 'metric-cards', 'process-flow', 'icon-grid', 'diagram-svg'];
-
-        const priorityRank = (type: string) => {
-            const idx = priorityOrder.indexOf(type);
-            return idx >= 0 ? idx : priorityOrder.length + 1;
         };
+        const maxComponents = layoutComponentCaps[layoutVariant] ?? 2;
+        if (componentList.length > maxComponents) {
+            const priorityOrder = layoutVariant === 'bento-grid'
+                ? ['metric-cards', 'icon-grid', 'chart-frame', 'text-bullets', 'process-flow', 'diagram-svg']
+                : ['text-bullets', 'chart-frame', 'metric-cards', 'process-flow', 'icon-grid', 'diagram-svg'];
 
-        const trimmed = [...components]
-            .sort((a: any, b: any) => priorityRank(a.type) - priorityRank(b.type))
-            .slice(0, maxComponents);
+            const priorityRank = (type: string) => {
+                const idx = priorityOrder.indexOf(type);
+                return idx >= 0 ? idx : priorityOrder.length + 1;
+            };
 
-        slide.layoutPlan!.components = trimmed;
-        addWarning(`Auto-trimmed components to ${maxComponents} for layout ${layoutVariant}`);
+            const trimmed = [...componentList]
+                .sort((a: any, b: any) => priorityRank(a.type) - priorityRank(b.type))
+                .slice(0, maxComponents);
+
+            addWarning(`Auto-trimmed components to ${maxComponents} for layout ${layoutVariant}`);
+            return trimmed;
+        }
+        return componentList;
+    };
+
+    const consolidateTextBullets = (layoutVariant: string, componentList: any[]) => {
+        const textComponents = componentList.filter(c => c.type === 'text-bullets');
+        if (textComponents.length <= 1) return componentList;
+
+        const maxTextComponents = ['standard-vertical', 'dashboard-tiles', 'asymmetric-grid'].includes(layoutVariant) ? 2 : 1;
+        const hasDuplicates = textComponents.some((a: any, idx: number) => {
+            const aKey = `${String(a.title || '').trim().toLowerCase()}|${(a.content || []).map((s: any) => String(s).trim().toLowerCase()).join('||')}`;
+            return textComponents.slice(idx + 1).some((b: any) => {
+                const bKey = `${String(b.title || '').trim().toLowerCase()}|${(b.content || []).map((s: any) => String(s).trim().toLowerCase()).join('||')}`;
+                return aKey === bKey;
+            });
+        });
+
+        if (textComponents.length <= maxTextComponents && !hasDuplicates) return componentList;
+
+        const merged = textComponents[0];
+        const mergedContent: string[] = [];
+        const seen = new Set<string>();
+
+        textComponents.forEach((comp: any) => {
+            const items = Array.isArray(comp.content) ? comp.content : [];
+            items.forEach((item: any) => {
+                const norm = String(item).trim();
+                const key = norm.toLowerCase();
+                if (norm && !seen.has(key)) {
+                    seen.add(key);
+                    mergedContent.push(norm);
+                }
+            });
+        });
+
+        const layoutBulletCaps: Record<string, number> = {
+            'split-left-text': 2,
+            'split-right-text': 2,
+            'asymmetric-grid': 3,
+            'bento-grid': 2,
+            'metrics-rail': 2,
+            'hero-centered': 2,
+            'dashboard-tiles': 2,
+            'timeline-horizontal': 3,
+            'standard-vertical': LIST_LIMITS.textBullets
+        };
+        const layoutCap = layoutBulletCaps[layoutVariant] ?? LIST_LIMITS.textBullets;
+        merged.title = merged.title || 'Key Points';
+        merged.content = capList(mergedContent.map(t => truncateText(t, CONTENT_LIMITS.bullet, 'bullet text')), layoutCap, 'bullet items');
+
+        addWarning(`Auto-merged ${textComponents.length} text-bullets components`);
+        return componentList.filter(c => c.type !== 'text-bullets').concat([merged]);
+    };
+
+    // STEP 1.5: Cap components to layout capacity (prevents unplaced components)
+    const layoutVariant = slide.routerConfig?.layoutVariant || 'standard-vertical';
+    components = capComponentsToLayout(layoutVariant, components);
+    if (slide.layoutPlan) {
+        slide.layoutPlan.components = components as any;
     }
 
     // STEP 2: Normalize and repair component data
@@ -477,13 +617,11 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
             let list: any[] = c.metrics || c.items || c.cards || [];
             if (!Array.isArray(list)) list = [list];
 
-            // CRITICAL FIX: If array is empty, create placeholder metrics
+            // If array is empty, convert to text-bullets instead of injecting placeholders
             if (list.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty metric-cards array, injecting placeholder metrics`);
-                list = [
-                    { value: 'N/A', label: 'Metric 1', icon: 'Activity' },
-                    { value: 'N/A', label: 'Metric 2', icon: 'TrendingUp' }
-                ];
+                console.warn(`[AUTO-REPAIR] Empty metric-cards array, converting to text-bullets`);
+                convertMetricsToTextBullets(c, 'no metrics available');
+                return;
             }
 
             // Normalize each item
@@ -498,15 +636,35 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
                     if (item.label && isGarbage(item.label)) {
                         item.label = "Metric " + (idx + 1);
                     }
-                    // Ensure value exists
-                    if (!item.value) {
-                        item.value = 'N/A';
+
+                    // Ensure value exists without placeholder injection
+                    if (isPlaceholderValue(item.value)) {
+                        item.value = '';
+                    }
+
+                    if (isPlaceholderValue(item.label)) {
+                        item.label = '';
                     }
 
                     item.value = truncateText(String(item.value), CONTENT_LIMITS.metricValue, 'metric value');
                     item.label = truncateText(String(item.label || ''), CONTENT_LIMITS.metricLabel, 'metric label');
                 }
             });
+
+            // Drop placeholder or empty metrics
+            list = list.filter(item => {
+                if (!item || typeof item !== 'object') return false;
+                const valueOk = !isPlaceholderValue(item.value) && String(item.value).trim().length > 0;
+                const labelOk = !isPlaceholderValue(item.label) && String(item.label).trim().length > 0;
+                return valueOk && labelOk;
+            });
+
+            // If we don't have enough valid metrics, convert to text-bullets
+            if (list.length < 2) {
+                console.warn(`[AUTO-REPAIR] Insufficient valid metrics (${list.length}), converting to text-bullets`);
+                convertMetricsToTextBullets(c, 'insufficient valid metrics');
+                return;
+            }
 
             const maxItems = Math.min(LIST_LIMITS.metricCards, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.metricCards);
             list = capList(list, maxItems, 'metric cards');
@@ -553,14 +711,11 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
             let list: any[] = c.items || c.icons || c.features || [];
             if (!Array.isArray(list)) list = [list];
 
-            // CRITICAL FIX: If array is empty, create placeholder items
+            // If array is empty, convert to text-bullets instead of placeholders
             if (list.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty icon-grid array, injecting placeholder items`);
-                list = [
-                    { label: 'Feature 1', icon: 'Star' },
-                    { label: 'Feature 2', icon: 'Zap' },
-                    { label: 'Feature 3', icon: 'Shield' }
-                ];
+                console.warn(`[AUTO-REPAIR] Empty icon-grid array, converting to text-bullets`);
+                convertIconGridToTextBullets(c, 'no icon items available');
+                return;
             }
 
             list = list.map((item, idx) => normalizeArrayItem(item, idx, 'item'));
@@ -612,6 +767,8 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
 
             const unique = new Set();
             const cleanContent: string[] = [];
+            const rawItems = Array.isArray(c.content) ? c.content : [];
+            const bulletCount = rawItems.length;
             c.content.forEach((s: any) => {
                 // Convert non-strings to strings
                 let text = typeof s === 'string' ? s : JSON.stringify(s);
@@ -619,7 +776,37 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
                 if (isGarbage(norm)) {
                     norm = norm.substring(0, 50) + "...";
                 }
-                norm = truncateText(norm, CONTENT_LIMITS.bullet, 'bullet text');
+                const layoutVariantForText = slide.routerConfig?.layoutVariant || 'standard-vertical';
+                const layoutBulletCaps: Record<string, number> = {
+                    'split-left-text': 2,
+                    'split-right-text': 2,
+                    'asymmetric-grid': 3,
+                    'bento-grid': 2,
+                    'metrics-rail': 2,
+                    'hero-centered': 2,
+                    'dashboard-tiles': 2,
+                    'timeline-horizontal': 3,
+                    'standard-vertical': LIST_LIMITS.textBullets
+                };
+                const layoutBulletCharCaps: Record<string, number> = {
+                    'split-left-text': 55,
+                    'split-right-text': 55,
+                    'asymmetric-grid': 60,
+                    'bento-grid': 50,
+                    'metrics-rail': 55,
+                    'hero-centered': 50,
+                    'dashboard-tiles': 50,
+                    'timeline-horizontal': 55,
+                    'standard-vertical': 70
+                };
+                const densityMaxChars = slide.routerConfig?.densityBudget?.maxChars;
+                const densityMaxItems = slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.textBullets;
+                const perItemDensity = densityMaxChars ? Math.floor(densityMaxChars / Math.max(1, densityMaxItems)) : undefined;
+                const baseCap = layoutBulletCharCaps[layoutVariantForText] ?? 70;
+                const countAdjustedCap = bulletCount >= 3 ? Math.min(baseCap, 55) : baseCap;
+                const bulletCharCap = Math.max(40, Math.min(countAdjustedCap, perItemDensity || countAdjustedCap));
+
+                norm = truncateText(norm, bulletCharCap, 'bullet text');
                 const key = norm.toLowerCase();
                 if (!unique.has(key) && norm.length > 0) {
                     unique.add(key);
@@ -628,12 +815,14 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
             });
             const layoutVariantForText = slide.routerConfig?.layoutVariant || 'standard-vertical';
             const layoutBulletCaps: Record<string, number> = {
-                'split-left-text': 3,
-                'split-right-text': 3,
+                'split-left-text': 2,
+                'split-right-text': 2,
                 'asymmetric-grid': 3,
-                'bento-grid': 3,
-                'metrics-rail': 3,
+                'bento-grid': 2,
+                'metrics-rail': 2,
                 'hero-centered': 2,
+                'dashboard-tiles': 2,
+                'timeline-horizontal': 3,
                 'standard-vertical': LIST_LIMITS.textBullets
             };
             const layoutCap = layoutBulletCaps[layoutVariantForText] ?? LIST_LIMITS.textBullets;
@@ -658,11 +847,53 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
                     ...d,
                     label: truncateText(String(d.label || ''), CONTENT_LIMITS.chartLabel, 'chart label')
                 }));
+
+            if (!c.data || c.data.length === 0) {
+                console.warn(`[AUTO-REPAIR] Empty chart-frame data, converting to text-bullets`);
+                convertChartFrameToTextBullets(c, 'no data available');
+            }
         }
     });
 
+    // STEP 2.5: Consolidate text components and re-cap after conversions
+    const postVariant = slide.routerConfig?.layoutVariant || 'standard-vertical';
+    components = consolidateTextBullets(postVariant, components);
+    components = capComponentsToLayout(postVariant, components);
+
     if (slide.layoutPlan) {
         slide.layoutPlan.components = components as any;
+    }
+
+    // STEP 3: Post-normalization layout sanity check (after conversions)
+    const finalVariant = slide.routerConfig?.layoutVariant || 'standard-vertical';
+    const finalTypes = (slide.layoutPlan?.components || []).map((c: any) => c.type);
+    const hasGrid = finalTypes.some(t => t === 'metric-cards' || t === 'icon-grid');
+    const componentCount = finalTypes.length;
+
+    const enforceFinalFallback = (reason: string) => {
+        addWarning(`Auto-rerouted layout to standard-vertical: ${reason}`);
+        if (slide.routerConfig) slide.routerConfig.layoutVariant = 'standard-vertical' as any;
+    };
+
+    if (['bento-grid', 'dashboard-tiles', 'metrics-rail'].includes(finalVariant)) {
+        if (!hasGrid) {
+            enforceFinalFallback(`${finalVariant} requires metric-cards or icon-grid`);
+        }
+        if (componentCount < 2) {
+            enforceFinalFallback(`${finalVariant} requires at least 2 components`);
+        }
+    }
+
+    const hasDiagram = finalTypes.includes('diagram-svg');
+    if (hasDiagram && !['split-left-text', 'split-right-text', 'asymmetric-grid'].includes(finalVariant)) {
+        if (slide.routerConfig) {
+            slide.routerConfig.layoutVariant = 'split-right-text' as any;
+        }
+        addWarning(`Auto-rerouted layout to split-right-text: diagram-svg needs a dedicated visual zone`);
+    }
+
+    if (['split-left-text', 'split-right-text'].includes(finalVariant) && componentCount < 2) {
+        enforceFinalFallback(`${finalVariant} requires 2 components`);
     }
 
     return slide;

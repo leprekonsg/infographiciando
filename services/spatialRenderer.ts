@@ -348,6 +348,9 @@ export class SpatialLayoutEngine {
 
     if (unplaced.length > 0) {
       console.warn(`[SpatialRenderer] Unplaced components for slide ${slide.title}:`, unplaced.map(c => c.type));
+      unplaced.forEach(c => {
+        this.addWarning(`Unplaced component: ${c.type}`);
+      });
     }
 
     const themeTokens = this.resolveThemeTokens(effectiveStyleGuide);
@@ -810,6 +813,7 @@ export class SpatialLayoutEngine {
             align: 'center',
             zIndex: 10
           });
+          this.addWarning(`Diagram placeholder used in zone '${zone.id}' (diagram renderer unavailable).`);
         }
       }
     }

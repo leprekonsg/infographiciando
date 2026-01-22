@@ -274,6 +274,39 @@ export interface InteractionResponse {
     previous_interaction_id?: string;
 }
 
+type NormalizedUsage = InteractionResponse['usage'];
+
+function normalizeUsage(raw: any): NormalizedUsage | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+
+    const usage = raw.usage || raw.usageMetadata || raw.usage_metadata || raw.tokenUsage || raw.token_usage;
+    if (!usage || typeof usage !== 'object') return undefined;
+
+    const input = Number(
+        usage.total_input_tokens ?? usage.input_tokens ?? usage.prompt_tokens ?? usage.prompt_token_count ?? usage.promptTokenCount ?? 0
+    );
+    const output = Number(
+        usage.total_output_tokens ?? usage.output_tokens ?? usage.candidates_tokens ?? usage.candidates_token_count ?? usage.candidatesTokenCount ?? 0
+    );
+    const reasoning = Number(
+        usage.total_reasoning_tokens ?? usage.reasoning_tokens ?? usage.thought_tokens ?? usage.thinking_token_count ?? 0
+    );
+    const toolUse = Number(
+        usage.total_tool_use_tokens ?? usage.tool_use_tokens ?? usage.toolTokenCount ?? 0
+    );
+    const total = Number(
+        usage.total_tokens ?? usage.totalTokenCount ?? (input + output + reasoning + toolUse)
+    );
+
+    return {
+        total_input_tokens: Number.isFinite(input) ? input : 0,
+        total_output_tokens: Number.isFinite(output) ? output : 0,
+        total_reasoning_tokens: Number.isFinite(reasoning) ? reasoning : 0,
+        total_tool_use_tokens: Number.isFinite(toolUse) ? toolUse : 0,
+        total_tokens: Number.isFinite(total) ? total : (input + output + reasoning + toolUse)
+    };
+}
+
 export interface AgentConfig {
     model: string;
     systemInstruction: string;
@@ -393,8 +426,9 @@ export class CostTracker {
     totalInputTokens = 0;
     totalOutputTokens = 0;
     totalReasoningTokens = 0;
+    totalTokensReported = 0;
     totalSavingsVsPro = 0;
-    private modelUsage: Map<string, { calls: number; cost: number }> = new Map();
+    private modelUsage: Map<string, { calls: number; cost: number; inputTokens: number; outputTokens: number; reasoningTokens: number }> = new Map();
 
     // Qwen-VL Visual Cortex metrics
     qwenVLCost = 0;
@@ -412,6 +446,15 @@ export class CostTracker {
         this.totalReasoningTokens += usage.total_reasoning_tokens || 0;
 
         const rates = PRICING.TOKENS[normalizedModel as keyof typeof PRICING.TOKENS] || { input: 0.10, output: 0.40 };
+        const computedTotal = (usage.total_input_tokens || 0) + (usage.total_output_tokens || 0) + (usage.total_reasoning_tokens || 0) + (usage.total_tool_use_tokens || 0);
+        if (usage.total_tokens && Number.isFinite(usage.total_tokens)) {
+            this.totalTokensReported += usage.total_tokens;
+            if (usage.total_tokens < computedTotal) {
+                console.warn(`[COST] Token total less than sum for ${normalizedModel}: reported ${usage.total_tokens}, computed ${computedTotal}`);
+            }
+        } else {
+            this.totalTokensReported += computedTotal;
+        }
         const cost = (usage.total_input_tokens / 1_000_000 * rates.input) +
             (usage.total_output_tokens / 1_000_000 * rates.output);
         this.totalCost += cost;
@@ -423,12 +466,19 @@ export class CostTracker {
         this.totalSavingsVsPro += savings;
 
         // Track per-model usage
-        const existing = this.modelUsage.get(normalizedModel) || { calls: 0, cost: 0 };
-        this.modelUsage.set(normalizedModel, { calls: existing.calls + 1, cost: existing.cost + cost });
+        const existing = this.modelUsage.get(normalizedModel) || { calls: 0, cost: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0 };
+        this.modelUsage.set(normalizedModel, {
+            calls: existing.calls + 1,
+            cost: existing.cost + cost,
+            inputTokens: existing.inputTokens + (usage.total_input_tokens || 0),
+            outputTokens: existing.outputTokens + (usage.total_output_tokens || 0),
+            reasoningTokens: existing.reasoningTokens + (usage.total_reasoning_tokens || 0)
+        });
 
         // Log savings for visibility
+        console.log(`💰 [COST] ${normalizedModel}: $${cost.toFixed(4)} (${usage.total_input_tokens} input, ${usage.total_output_tokens} output tokens${usage.total_reasoning_tokens ? `, ${usage.total_reasoning_tokens} reasoning` : ''})`);
         if (savings > 0.0001) {
-            console.log(`💰 [COST] ${normalizedModel}: $${cost.toFixed(4)} (saved $${savings.toFixed(4)} vs Pro)`);
+            console.log(`💰 [COST] ${normalizedModel}: saved $${savings.toFixed(4)} vs Pro`);
         }
     }
 
@@ -460,8 +510,9 @@ export class CostTracker {
         totalInputTokens: number;
         totalOutputTokens: number;
         totalReasoningTokens: number;
+        totalTokensReported: number;
         totalSavingsVsPro: number;
-        modelBreakdown: Record<string, { calls: number; cost: number }>;
+        modelBreakdown: Record<string, { calls: number; cost: number; inputTokens: number; outputTokens: number; reasoningTokens: number }>;
         qwenVL?: {
             cost: number;
             inputTokens: number;
@@ -474,6 +525,7 @@ export class CostTracker {
             totalInputTokens: this.totalInputTokens,
             totalOutputTokens: this.totalOutputTokens,
             totalReasoningTokens: this.totalReasoningTokens,
+            totalTokensReported: this.totalTokensReported,
             totalSavingsVsPro: this.totalSavingsVsPro,
             modelBreakdown: Object.fromEntries(this.modelUsage)
         };
@@ -616,7 +668,14 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     throw new Error(errorMessage);
                 }
 
-                return response.json();
+                const raw = await response.json();
+                const normalizedUsage = normalizeUsage(raw);
+                if (normalizedUsage) {
+                    raw.usage = normalizedUsage;
+                } else if (raw?.usage) {
+                    raw.usage = normalizeUsage({ usage: raw.usage }) || raw.usage;
+                }
+                return raw;
             } catch (err: any) {
                 if (err.name === 'AbortError') {
                     throw new Error(`Interactions API request timed out after ${timeoutMs / 1000}s`);
@@ -869,7 +928,12 @@ export async function runAgentLoop(
 
             // Track costs
             if (costTracker) {
-                costTracker.addUsage(resolvedModel, response.usage);
+                const usage = normalizeUsage(response);
+                if (usage) {
+                    costTracker.addUsage(resolvedModel, usage);
+                } else {
+                    console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${resolvedModel}`);
+                }
             }
 
             previousInteractionId = response.id;
@@ -1022,9 +1086,14 @@ export async function createInteraction(
         console.log(`[INTERACTIONS CLIENT] Model resolved to ${resolvedModel} (requested ${requestedModel})`);
     }
 
-    if (costTracker) {
-        costTracker.addUsage(resolvedModel, response.usage);
-    }
+        if (costTracker) {
+            const usage = normalizeUsage(response);
+            if (usage) {
+                costTracker.addUsage(resolvedModel, usage);
+            } else {
+                console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${resolvedModel}`);
+            }
+        }
 
     // Extract text from outputs
     const outputs = response.outputs || [];
@@ -1065,7 +1134,12 @@ export async function createInteraction(
                 }
 
                 if (costTracker) {
-                    costTracker.addUsage(retryResolvedModel, retryResponse.usage);
+                    const usage = normalizeUsage(retryResponse);
+                    if (usage) {
+                        costTracker.addUsage(retryResolvedModel, usage);
+                    } else {
+                        console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${retryResolvedModel}`);
+                    }
                 }
 
                 for (const output of retryResponse.outputs || []) {
@@ -1116,7 +1190,12 @@ export async function createInteraction(
             }
 
             if (costTracker) {
-                costTracker.addUsage(retryResolvedModel, retryResponse.usage);
+                const usage = normalizeUsage(retryResponse);
+                if (usage) {
+                    costTracker.addUsage(retryResolvedModel, usage);
+                } else {
+                    console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${retryResolvedModel}`);
+                }
             }
 
             for (const output of retryResponse.outputs || []) {

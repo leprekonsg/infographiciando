@@ -167,15 +167,16 @@ OUTPUT: Return JSON with:
       - Output ONLY the JSON object. No preamble ("Here is…"), no markdown fences.
       - Every string value must be a single line. Do not include literal newline characters inside any string.
       - Prefer short strings. Shorten by removing adjectives or clauses—never invent new content.
+      - NEVER echo the prompt, schema, or examples. Do not repeat instruction text inside any field.
       - Do NOT output speakerNotesLines; they are generated automatically.
       - NO REPETITION: Do not repeat the same word more than twice in a row.
       - GRID LIMITS: For 'icon-grid', generate exactly 3-6 items. Never exceed 6.
-      - CONTENT SAFETY: If you lack specific content for a field, use 'N/A' or a generic placeholder instead of hallucinating or repeating.
+      - CONTENT SAFETY: If you lack specific content for a field, omit the component or use qualitative text-bullets drawn from CONTENT_PLAN. Never output placeholders like "N/A", "TBD", "unknown", "-", or "—".
 
       Semantic rules:
       - Use ONLY information from CONTENT_PLAN. Do not add facts, numbers, or claims not present in the input.
       - Respect ROUTER_CONFIG.densityBudget: keep total text under maxChars, items under maxItems.
-      - If CONTENT_PLAN has no dataPoints, avoid chart-frame and metric-cards.
+      - If CONTENT_PLAN has no dataPoints, avoid chart-frame and metric-cards. Use text-bullets or icon-grid with qualitative labels instead.
       - All icon fields must be present; use "Activity" if unsure.
 
       Layout rules:

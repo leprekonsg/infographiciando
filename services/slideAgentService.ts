@@ -90,6 +90,131 @@ function enforceVisualFocusInSpec(
     };
 }
 
+// --- SPATIAL PREFLIGHT ADJUSTMENTS ---
+// Reduce content density when spatial warnings indicate truncation or unplaced components.
+const VARIANT_LIMITS: Record<string, {
+    maxComponents: number;
+    bullets: number;
+    bulletChars: number;
+    metrics: number;
+    steps: number;
+    icons: number;
+}> = {
+    'hero-centered': { maxComponents: 1, bullets: 1, bulletChars: 55, metrics: 2, steps: 1, icons: 2 },
+    'split-left-text': { maxComponents: 2, bullets: 2, bulletChars: 60, metrics: 2, steps: 2, icons: 3 },
+    'split-right-text': { maxComponents: 2, bullets: 2, bulletChars: 60, metrics: 2, steps: 2, icons: 3 },
+    'standard-vertical': { maxComponents: 3, bullets: 3, bulletChars: 70, metrics: 3, steps: 3, icons: 4 },
+    'asymmetric-grid': { maxComponents: 3, bullets: 3, bulletChars: 65, metrics: 3, steps: 3, icons: 4 },
+    'bento-grid': { maxComponents: 3, bullets: 2, bulletChars: 55, metrics: 3, steps: 2, icons: 4 },
+    'dashboard-tiles': { maxComponents: 3, bullets: 1, bulletChars: 50, metrics: 3, steps: 2, icons: 3 },
+    'metrics-rail': { maxComponents: 2, bullets: 2, bulletChars: 60, metrics: 2, steps: 2, icons: 3 },
+    'timeline-horizontal': { maxComponents: 1, bullets: 2, bulletChars: 55, metrics: 2, steps: 3, icons: 3 }
+};
+
+function trimText(input: string, max: number): string {
+    if (!input || typeof input !== 'string') return input as any;
+    if (input.length <= max) return input;
+    return input.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
+}
+
+function applySpatialPreflightAdjustments(
+    slide: SlideNode,
+    styleGuide: GlobalStyleGuide
+): { slide: SlideNode; adjustments: string[] } {
+    const updatedSlide: SlideNode = JSON.parse(JSON.stringify(slide));
+    const adjustments: string[] = [];
+
+    // Render once to populate spatial warnings
+    const renderer = new SpatialLayoutEngine();
+    renderer.renderWithSpatialAwareness(
+        updatedSlide,
+        styleGuide,
+        () => undefined,
+        updatedSlide.visualDesignSpec
+    );
+
+    const warnings = updatedSlide.warnings || [];
+    const hasTruncation = warnings.some(w => /truncated|hidden|title dropped/i.test(String(w)));
+    const hasUnplaced = warnings.some(w => /unplaced component/i.test(String(w)));
+
+    if (!hasTruncation && !hasUnplaced) {
+        return { slide: updatedSlide, adjustments };
+    }
+
+    const variant = updatedSlide.routerConfig?.layoutVariant || 'standard-vertical';
+    const limits = VARIANT_LIMITS[variant] || VARIANT_LIMITS['standard-vertical'];
+    const tightenedBulletLimit = hasTruncation ? Math.max(1, limits.bullets - 1) : limits.bullets;
+    const tightenedBulletChars = hasTruncation ? Math.min(limits.bulletChars, 60) : limits.bulletChars;
+
+    const components = updatedSlide.layoutPlan?.components || [];
+
+    components.forEach((c: any) => {
+        if (c.type === 'text-bullets') {
+            if (Array.isArray(c.content)) {
+                const before = c.content.length;
+                c.content = c.content.slice(0, tightenedBulletLimit).map((t: string) => trimText(String(t), tightenedBulletChars));
+                if (before !== c.content.length) adjustments.push('reduced bullets');
+            }
+            if (c.title) c.title = trimText(String(c.title), 50);
+        }
+        if (c.type === 'metric-cards' && Array.isArray(c.metrics)) {
+            const before = c.metrics.length;
+            c.metrics = c.metrics.slice(0, limits.metrics);
+            if (before !== c.metrics.length) adjustments.push('reduced metrics');
+        }
+        if (c.type === 'process-flow' && Array.isArray(c.steps)) {
+            const before = c.steps.length;
+            c.steps = c.steps.slice(0, limits.steps).map((s: any) => ({
+                ...s,
+                title: s.title ? trimText(String(s.title), 18) : s.title,
+                description: s.description ? trimText(String(s.description), tightenedBulletChars) : s.description
+            }));
+            if (before !== c.steps.length) adjustments.push('reduced steps');
+        }
+        if (c.type === 'icon-grid' && Array.isArray(c.items)) {
+            const before = c.items.length;
+            c.items = c.items.slice(0, limits.icons).map((it: any) => ({
+                ...it,
+                label: it.label ? trimText(String(it.label), 24) : it.label,
+                description: it.description ? trimText(String(it.description), 60) : it.description
+            }));
+            if (before !== c.items.length) adjustments.push('reduced icons');
+        }
+    });
+
+    if (hasUnplaced || components.length > limits.maxComponents) {
+        const prefer = updatedSlide.type === 'data-viz'
+            ? ['chart-frame', 'diagram-svg', 'text-bullets', 'metric-cards', 'process-flow', 'icon-grid']
+            : ['diagram-svg', 'text-bullets', 'metric-cards', 'process-flow', 'chart-frame', 'icon-grid'];
+
+        const ranked = components
+            .map((c: any, idx: number) => ({ c, idx, rank: prefer.indexOf(c.type) >= 0 ? prefer.indexOf(c.type) : prefer.length }))
+            .sort((a, b) => a.rank - b.rank || a.idx - b.idx)
+            .slice(0, limits.maxComponents)
+            .map(r => r.c);
+
+        if (ranked.length < components.length) {
+            updatedSlide.layoutPlan.components = ranked;
+            adjustments.push('reduced components');
+        }
+    }
+
+    const spatialWarningRegex = /truncated|hidden|title dropped|unplaced component|diagram placeholder used/i;
+    const existingWarnings = updatedSlide.warnings || [];
+    updatedSlide.warnings = existingWarnings.filter(w => !spatialWarningRegex.test(String(w)));
+
+    const repaired = autoRepairSlide(updatedSlide);
+    const rerender = new SpatialLayoutEngine();
+    rerender.renderWithSpatialAwareness(
+        repaired,
+        styleGuide,
+        () => undefined,
+        repaired.visualDesignSpec
+    );
+
+    return { slide: repaired, adjustments };
+}
+
 // --- SYSTEM 2: RECURSIVE VISUAL CRITIQUE ---
 
 /**
@@ -586,7 +711,12 @@ async function runGenerator(
     factClusters: z.infer<typeof FactClusterSchema>[],
     styleGuide: GlobalStyleGuide,
     costTracker: CostTracker,
-    recentHistory?: NarrativeTrail[]
+    recentHistory?: NarrativeTrail[],
+    progress?: {
+        onProgress: (status: string, percent?: number) => void;
+        slideIndex?: number;
+        totalSlides?: number;
+    }
 ): Promise<GeneratorResult> {
     console.log(`[GENERATOR] Generating slide: "${meta.title}"...`);
     if (recentHistory?.length) {
@@ -668,15 +798,12 @@ async function runGenerator(
             const maxComponents = ['bento-grid'].includes(layoutVariant) ? 3 : 2;
 
             // SCHEMA GUIDANCE: Since schema is now ultra-minimal, provide explicit JSON examples
-            const componentExamples = `COMPONENT STRUCTURE (choose ${minComponents}-${maxComponents} for ${layoutVariant}):
-
+            const componentExamples = `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
 text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
 metric-cards: {"type":"metric-cards","metrics":[{"value":"42M","label":"Users","icon":"TrendingUp"}]}
 process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
-icon-grid: {"type":"icon-grid","items":[{"label":"Feature","description":"Details","icon":"Activity"}]}
-chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}
-
-LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW JSON only.`;
+icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}
+chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}`;
 
             // CONTEXT COMPRESSION: Only pass essential fields to prevent "constraint too tall" errors
             // Problem: Full routerConfig + visualDesignSpec can exceed Gemini's FST constraint (5888 height)
@@ -799,6 +926,10 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 warnings: []
             };
 
+            if (Array.isArray(contentPlan?.keyPoints) && contentPlan.keyPoints.length > 0) {
+                candidate.content = contentPlan.keyPoints;
+            }
+
             // Auto-add chart frame if needed
             if (candidate.type === 'data-viz' && candidate.chartSpec && candidate.layoutPlan?.components) {
                 const hasFrame = candidate.layoutPlan.components.some((c: any) => c.type === 'chart-frame');
@@ -813,11 +944,57 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             }
 
             candidate = autoRepairSlide(candidate);
+            const preflight = applySpatialPreflightAdjustments(candidate, styleGuide);
+            candidate = preflight.slide;
+            if (preflight.adjustments.length > 0) {
+                candidate.warnings = [
+                    ...(candidate.warnings || []),
+                    `Preflight adjustments: ${Array.from(new Set(preflight.adjustments)).join(', ')}`
+                ];
+            }
+
+            const preflightWarnings = candidate.warnings || [];
+            const preflightNeedsLayout = preflightWarnings.some(w => /truncated|hidden|title dropped|unplaced component/i.test(String(w)));
+            if (preflightNeedsLayout && attempt === MAX_RETRIES) {
+                try {
+                    const suggestedRouter = await runQwenLayoutSelector(
+                        meta,
+                        safeContentPlan,
+                        candidate.routerConfig,
+                        styleGuide,
+                        costTracker,
+                        undefined,
+                        candidate.layoutPlan?.components
+                    );
+
+                    if (suggestedRouter.layoutVariant !== candidate.routerConfig.layoutVariant) {
+                        candidate.routerConfig = {
+                            ...candidate.routerConfig,
+                            layoutVariant: suggestedRouter.layoutVariant,
+                            layoutIntent: suggestedRouter.layoutIntent
+                        };
+                        candidate.warnings = [
+                            ...(candidate.warnings || []),
+                            `Layout adjusted by Qwen selector: ${suggestedRouter.layoutVariant}`
+                        ];
+
+                        const rerender = new SpatialLayoutEngine();
+                        rerender.renderWithSpatialAwareness(
+                            candidate,
+                            styleGuide,
+                            () => undefined,
+                            candidate.visualDesignSpec
+                        );
+                    }
+                } catch (layoutErr: any) {
+                    console.warn(`[GENERATOR] Qwen layout selector failed during preflight: ${layoutErr.message}`);
+                }
+            }
             const validation = validateSlide(candidate);
 
             // GAP 1: Content-Intent Alignment Validation
             // Validate that Generator honored Router's decisions
-            const complianceValidation = validateGeneratorCompliance(candidate, routerConfig);
+            const complianceValidation = validateGeneratorCompliance(candidate, candidate.routerConfig);
             if (!complianceValidation.passed || complianceValidation.errors.length > 0) {
                 validation.errors.push(...complianceValidation.errors);
                 validation.score = Math.min(validation.score, complianceValidation.score);
@@ -830,7 +1007,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
 
             // Merge Visual Alignment Validation
             if (enforcedVisualDesignSpec) {
-                const alignment = validateVisualLayoutAlignment(enforcedVisualDesignSpec, routerConfig, candidate.layoutPlan);
+                const alignment = validateVisualLayoutAlignment(enforcedVisualDesignSpec, candidate.routerConfig, candidate.layoutPlan);
                 if (!alignment.passed || alignment.errors.length > 0) {
                     validation.errors.push(...alignment.errors);
                     validation.score = Math.min(validation.score, alignment.score);
@@ -849,6 +1026,7 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
 
             // --- VISUAL ARCHITECT: QWEN-VL3 VISION-FIRST CRITIQUE LOOP (DEFAULT) ---
             // Run Vision Architect if validation passed but score < TARGET threshold
+            // OR if spatial warnings indicate layout issues (unplaced/truncation)
             // This uses Qwen-VL to see actual SVG renders and apply structured repairs
             const VISUAL_REPAIR_ENABLED = true;
 
@@ -860,16 +1038,49 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             let system2InputTokens = 0;
             let system2OutputTokens = 0;
 
-            if (VISUAL_REPAIR_ENABLED && validation.passed && validation.score < VISUAL_THRESHOLDS.TARGET) {
+            let hasSpatialWarnings = false;
+            try {
+                const spatialProbe = JSON.parse(JSON.stringify(candidate)) as SlideNode;
+                const probeRenderer = new SpatialLayoutEngine();
+                probeRenderer.renderWithSpatialAwareness(
+                    spatialProbe,
+                    styleGuide,
+                    () => undefined,
+                    spatialProbe.visualDesignSpec
+                );
+                const probeWarnings = spatialProbe.warnings || [];
+                hasSpatialWarnings = probeWarnings.some(w => /unplaced component|truncated|hidden|title dropped|diagram placeholder used/i.test(String(w)));
+            } catch (probeErr: any) {
+                console.warn(`[GENERATOR] Spatial probe failed for visual repair gate: ${probeErr.message}`);
+            }
+
+            const qualityFlags = (candidate.warnings || []).some(w =>
+                /Qwen QA flagged|Auto-rerouted layout|Converted .* to text-bullets|Preflight adjustments|Validation:/i.test(String(w))
+            );
+
+            const shouldRunVisualRepair = VISUAL_REPAIR_ENABLED
+                && (validation.passed || qualityFlags)
+                && (validation.score < VISUAL_THRESHOLDS.TARGET || hasSpatialWarnings || qualityFlags);
+
+            if (shouldRunVisualRepair) {
                 console.log(`[GENERATOR] Entering visual repair loop (score: ${validation.score})...`);
                 visualCritiqueRan = true;
+
+                if (progress?.onProgress) {
+                    const slideLabel = (typeof progress.slideIndex === 'number' && typeof progress.totalSlides === 'number')
+                        ? ` Slide ${progress.slideIndex + 1}/${progress.totalSlides}`
+                        : '';
+                    progress.onProgress(`Agent 4b/5: Visual Architect${slideLabel}...`);
+                }
 
                 try {
                     // Import Visual Architect functions
                     const { runQwenVisualArchitectLoop, isQwenVLAvailable } = await import('./visualCortex');
 
                     // Check if Qwen-VL Visual Architect is available (DEFAULT)
-                    if (isQwenVLAvailable()) {
+                    const qwenAvailable = isQwenVLAvailable();
+                    console.log(`[VISUAL ARCHITECT] Availability: ${qwenAvailable ? 'available' : 'unavailable'}`);
+                    if (qwenAvailable) {
                         console.log('✨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
 
                         const architectResult = await runQwenVisualArchitectLoop(
@@ -894,6 +1105,10 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                         lastValidation = candidate.validation;
 
                         console.log(`✅ [VISUAL ARCHITECT] Complete: ${system2Rounds} rounds, final score: ${architectResult.finalScore}, converged: ${architectResult.converged}, cost: $${system2Cost.toFixed(4)}`);
+
+                        if (progress?.onProgress) {
+                            progress.onProgress(`Visual Architect complete: score ${Math.round(architectResult.finalScore)} (${architectResult.converged ? 'converged' : 'not converged'})`);
+                        }
 
                     } else {
                         // Fallback: Use legacy System 2 critique loop
@@ -920,19 +1135,26 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                         lastValidation = candidate.validation;
 
                         console.log(`[GENERATOR] Legacy System 2 complete: ${system2Rounds} rounds, final score: ${system2Result.finalScore}, cost: $${system2Result.system2Cost.toFixed(4)}`);
+
+                        if (progress?.onProgress) {
+                            progress.onProgress(`Visual critique complete: score ${Math.round(system2Result.finalScore)}`);
+                        }
                     }
 
                 } catch (critiqueErr: any) {
                     // Don't block on visual critique errors - graceful degradation
                     console.error(`[GENERATOR] Visual repair error:`, critiqueErr.message);
                     candidate.warnings = [...(candidate.warnings || []), `Visual critique skipped: ${critiqueErr.message}`];
+                    if (progress?.onProgress) {
+                        progress.onProgress(`Visual critique skipped: ${critiqueErr.message}`);
+                    }
                 }
             } else if (!VISUAL_REPAIR_ENABLED) {
                 console.log('[GENERATOR] Visual repair disabled by flag.');
             } else if (!validation.passed) {
                 console.log(`[GENERATOR] Skipping visual repair: validation failed (score: ${validation.score})`);
             } else {
-                console.log(`[GENERATOR] Skipping visual repair: score ${validation.score} meets/exceeds target ${VISUAL_THRESHOLDS.TARGET}`);
+                console.log(`[GENERATOR] Skipping visual repair: score ${validation.score} meets/exceeds target ${VISUAL_THRESHOLDS.TARGET} and no spatial warnings detected.`);
             }
 
             // --- QWEN VISUAL QA (always inspect slide if available) ---
@@ -984,7 +1206,16 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             // Create environment snapshot to check spatial health
             const renderStartTime = Date.now();
             const spatialEngine = new SpatialLayoutEngine();
-            const variant = routerConfig.layoutVariant || 'standard-vertical';
+            const variant = candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant || 'standard-vertical';
+
+            // Render once to attach spatial warnings (truncation/unplaced)
+            spatialEngine.renderWithSpatialAwareness(
+                candidate,
+                styleGuide,
+                () => undefined,
+                candidate.visualDesignSpec
+            );
+
             const zones = spatialEngine.getZonesForVariant(variant);
             const { allocation } = spatialEngine.allocateComponents(
                 candidate.title,
@@ -1010,6 +1241,24 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 CRITICAL: 0.50
             };
 
+            // Immediate reroute on Qwen QA requires_repair
+            if (qwenQaVerdict === 'requires_repair') {
+                console.warn(`[CIRCUIT BREAKER] Qwen QA verdict requires repair. Signaling reroute.`);
+                return {
+                    slide: candidate,
+                    needsReroute: true,
+                    rerouteReason: `Qwen QA requires repair (score: ${qwenQaScore ?? 'n/a'})`,
+                    rerouteReasonType: GeneratorFailureReason.QwenQaFailed,
+                    avoidLayoutVariants: [routerConfig.layoutVariant],
+                    visualCritiqueRan,
+                    visualRepairAttempted,
+                    visualRepairSucceeded,
+                    system2Cost,
+                    system2InputTokens,
+                    system2OutputTokens
+                };
+            }
+
             // Check if reroute is needed based on fit score
             if (envSnapshot.fit_score < SCORE_THRESHOLD.ACCEPTABLE && attempt === MAX_RETRIES) {
                 console.warn(`[CIRCUIT BREAKER] Fit score ${envSnapshot.fit_score.toFixed(2)} < threshold ${SCORE_THRESHOLD.ACCEPTABLE}. Signaling reroute.`);
@@ -1031,8 +1280,9 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
             // Qwen QA-weighted reroute (high priority)
             if (attempt === MAX_RETRIES && qwenQaScore !== null) {
                 const QWEN_MIN_SCORE = 70;
-                const qwenFailed = qwenQaVerdict === 'requires_repair' || qwenQaScore < QWEN_MIN_SCORE;
-                if (qwenFailed) {
+                const qwenSoftFail = qwenQaVerdict === 'requires_repair' || qwenQaScore < QWEN_MIN_SCORE;
+                const qwenReviewFail = qwenQaVerdict === 'flag_for_review' && envSnapshot.fit_score < 0.7;
+                if (qwenSoftFail || qwenReviewFail) {
                     console.warn(`[CIRCUIT BREAKER] Qwen QA score ${qwenQaScore} below ${QWEN_MIN_SCORE} or requires repair. Signaling reroute.`);
                     return {
                         slide: candidate,
@@ -1076,7 +1326,8 @@ LIMITS: content≤4, metrics≤3, steps≤4, items≤5, elements≤8. Output RAW
                 e.code === 'ERR_LAYOUT_MISMATCH_CRITICAL' ||
                 e.code === 'ERR_DENSITY_CRITICAL_EXCEEDED' ||
                 e.code === 'ERR_TOO_MANY_COMPONENTS' ||
-                e.code === 'ERR_ITEM_COUNT_CRITICAL'
+                e.code === 'ERR_ITEM_COUNT_CRITICAL' ||
+                e.code === 'ERR_PLACEHOLDER_METRIC'
             );
 
             const visualFocusError = validation.errors.find(e => e.code === 'VISUAL_FOCUS_MISSING');
@@ -1297,7 +1548,12 @@ export const generateAgenticDeck = async (
                     outline.factClusters || [],
                     outline.styleGuide,
                     costTracker,
-                    recentHistory
+                    recentHistory,
+                    {
+                        onProgress,
+                        slideIndex: i,
+                        totalSlides
+                    }
                 );
 
                 // Track System 2 metrics
@@ -1509,6 +1765,7 @@ export const generateAgenticDeck = async (
     console.log(`[ORCHESTRATOR] Total Cost: $${costSummary.totalCost.toFixed(4)}`);
     console.log(`[ORCHESTRATOR] 💰 Savings vs Pro: $${costSummary.totalSavingsVsPro.toFixed(4)} (${((costSummary.totalSavingsVsPro / (costSummary.totalCost + costSummary.totalSavingsVsPro)) * 100).toFixed(0)}%)`);
     console.log(`[ORCHESTRATOR] Tokens: ${costSummary.totalInputTokens} in, ${costSummary.totalOutputTokens} out`);
+    console.log(`[ORCHESTRATOR] Tokens (reported total): ${costSummary.totalTokensReported}`);
     console.log(`[ORCHESTRATOR] Model Breakdown:`, costSummary.modelBreakdown);
     console.log(`[ORCHESTRATOR] 📊 RELIABILITY METRICS:`);
     console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ≤1/deck`);

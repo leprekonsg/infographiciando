@@ -25,6 +25,16 @@ const hasGoodContrast = (hex: string): boolean => {
   return yiq < 160 || yiq > 220;
 };
 
+const isPlaceholderValue = (value: any): boolean => {
+  if (value === null || value === undefined) return true;
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return true;
+  return [
+    'n/a', 'na', 'tbd', 'unknown', 'none', 'null', 'nil', 'not available',
+    '-', '—', '...', 'n.a.'
+  ].includes(raw);
+};
+
 export const validateVisualLayoutAlignment = (
   visualDesign: VisualDesignSpec,
   routerConfig: RouterDecision,
@@ -280,11 +290,13 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
       if (c.type === 'metric-cards') text += (c.metrics || []).map(m => m.label || "").join(" ");
       if (c.type === 'icon-grid') text += (c.items || []).map(i => i.label || "").join(" ");
       if (c.type === 'chart-frame' && c.data) text += c.data.map(d => d.label || "").join(" ");
-    } catch (e) { }
+    } catch (e: any) {
+      console.warn(`[VALIDATOR] Failed to read component text content: ${e?.message || e}`);
+    }
     return acc + text.length;
   }, 0);
 
-  const maxChars = routerConfig?.densityBudget.maxChars || 600;
+  const maxChars = routerConfig?.densityBudget?.maxChars || 600;
   if (totalText > maxChars) {
     score -= 20;
     if (totalText > maxChars * 2) {
@@ -335,6 +347,16 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
           addLengthIssue('WARN_METRIC_LABEL_TOO_LONG',
             `Metric label too long (${String(m.label).length} chars) at index ${idx}.${i}`);
         }
+
+        if (isPlaceholderValue(m?.value) || isPlaceholderValue(m?.label)) {
+          score -= 25;
+          errors.push({
+            code: 'ERR_PLACEHOLDER_METRIC',
+            message: `Placeholder metric detected at index ${idx}.${i}.`,
+            suggestedFix: 'Remove metric-cards or provide real dataPoints.'
+          });
+          isCriticalFailure = true;
+        }
       });
     }
 
@@ -383,7 +405,9 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
     try {
       if (c.type === 'metric-cards') { requiresIcons = true; iconCount += (c.metrics || []).filter(m => !!m.icon).length; }
       if (c.type === 'icon-grid') { requiresIcons = true; iconCount += (c.items || []).filter(i => !!i.icon).length; }
-    } catch (e) { }
+    } catch (e: any) {
+      console.warn(`[VALIDATOR] Failed to read icon data: ${e?.message || e}`);
+    }
   });
 
   if (requiresIcons && iconCount === 0) {
@@ -553,7 +577,7 @@ export function validateGeneratorCompliance(
     return sum + chars;
   }, 0);
 
-  const densityBudget = routerConfig.densityBudget;
+  const densityBudget = routerConfig?.densityBudget || { maxChars: 600, maxItems: 4 };
   const charOverage = totalTextChars - densityBudget.maxChars;
 
   if (charOverage > densityBudget.maxChars * 0.3) {

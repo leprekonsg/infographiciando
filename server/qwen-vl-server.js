@@ -175,13 +175,17 @@ async function callQwenVL({ imageBase64, prompt }) {
 function parseJsonResponse(text) {
   try {
     return JSON.parse(text.trim());
-  } catch {}
+  } catch (e) {
+    console.warn('[QWEN-VL] Direct JSON parse failed:', e && e.message ? e.message : e);
+  }
 
   if (text.includes('```json')) {
     try {
       const extracted = text.split('```json')[1].split('```')[0].trim();
       return JSON.parse(extracted);
-    } catch {}
+    } catch (e) {
+      console.warn('[QWEN-VL] ```json parse failed:', e && e.message ? e.message : e);
+    }
   }
 
   if (text.includes('```')) {
@@ -192,14 +196,18 @@ function parseJsonResponse(text) {
         if (extracted.startsWith('json')) extracted = extracted.substring(4);
         return JSON.parse(extracted.trim());
       }
-    } catch {}
+    } catch (e) {
+      console.warn('[QWEN-VL] ``` block parse failed:', e && e.message ? e.message : e);
+    }
   }
 
   const jsonMatch = text.match(/\{[\s\S]*\}/);
   if (jsonMatch) {
     try {
       return JSON.parse(jsonMatch[0]);
-    } catch {}
+    } catch (e) {
+      console.warn('[QWEN-VL] Regex parse failed:', e && e.message ? e.message : e);
+    }
   }
 
   throw new Error('Failed to parse Qwen-VL response JSON');

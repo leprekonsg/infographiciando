@@ -140,7 +140,10 @@ export const convertIconToPng = async (iconName: string, color: string, pixelSiz
     if (ctx) { ctx.scale(2, 2); ctx.drawImage(img, 0, 0, pixelSize, pixelSize); }
     URL.revokeObjectURL(url);
     return canvas.toDataURL("image/png");
-  } catch { return ""; }
+  } catch (e: any) {
+    console.warn(`[ICON RENDER] Failed to render icon ${normalizedName}: ${e?.message || e}`);
+    return "";
+  }
 };
 
 export class InfographicRenderer {
@@ -150,7 +153,7 @@ export class InfographicRenderer {
 
   async prepareIconsForDeck(slides: SlideNode[], palette: any) {
     const allIcons = new Set<string>();
-    slides.forEach(s => s.layoutPlan?.components.forEach(c => {
+    slides.forEach(s => s.layoutPlan?.components?.forEach(c => {
       if (c.type === 'metric-cards') (c.metrics || []).forEach(m => m.icon && allIcons.add(m.icon));
       if (c.type === 'process-flow') (c.steps || []).forEach(st => st.icon && allIcons.add(st.icon));
       if (c.type === 'icon-grid') (c.items || []).forEach(i => i.icon && allIcons.add(i.icon));
@@ -215,9 +218,47 @@ export class InfographicRenderer {
     return `${comp.diagramType}:${comp.centralTheme || 'no-theme'}:${elementKeys}`;
   }
 
-  public getDiagramFromCache(comp: any): string | undefined {
+  private buildDiagramSvgDataUrl(comp: any, styleGuide: GlobalStyleGuide): string | undefined {
+    try {
+      const palette = resolvePalette(styleGuide);
+      const diagramPalette: DiagramPalette = {
+        primary: palette.primary,
+        accent: palette.accent,
+        background: palette.background,
+        text: palette.text
+      };
+      const svgString = buildDiagramSVG(
+        comp.diagramType,
+        comp.elements,
+        comp.centralTheme,
+        diagramPalette
+      );
+      const encoded = encodeURIComponent(svgString)
+        .replace(/'/g, '%27')
+        .replace(/"/g, '%22');
+      return `data:image/svg+xml;charset=utf-8,${encoded}`;
+    } catch (error: any) {
+      console.warn('[InfographicRenderer] Failed to build SVG diagram data URL:', error.message);
+      return undefined;
+    }
+  }
+
+  public getDiagramFromCache(comp: any, styleGuide: GlobalStyleGuide): string | undefined {
     const cacheKey = this.generateDiagramCacheKey(comp);
-    return this.diagramCache.get(cacheKey);
+    const cached = this.diagramCache.get(cacheKey);
+
+    if (cached) return cached;
+
+    // Browser fallback: generate SVG data URL for preview rendering
+    if (typeof window !== 'undefined') {
+      const svgDataUrl = this.buildDiagramSvgDataUrl(comp, styleGuide);
+      if (svgDataUrl) {
+        this.diagramCache.set(cacheKey, svgDataUrl);
+        return svgDataUrl;
+      }
+    }
+
+    return undefined;
   }
 
   // --- COMPILER: THE RENDERING ENVIRONMENT ---
@@ -228,7 +269,7 @@ export class InfographicRenderer {
       styleGuide,
       (name: string) => this.iconCache.get(name),
       slide.visualDesignSpec, // Pass through the visual design spec for color harmony
-      (comp: any) => this.getDiagramFromCache(comp)
+      (comp: any) => this.getDiagramFromCache(comp, styleGuide)
     );
   }
 

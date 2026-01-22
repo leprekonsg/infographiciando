@@ -218,18 +218,22 @@ export function cleanAndParseJson(text: string): any {
   // 4. THE DECODE LADDER (Attempt to parse the Auto-Closed string)
   try {
     return JSON.parse(cleaned);
-  } catch (e1) {
+  } catch (e1: any) {
     try {
       const noNewLines = cleaned.replace(/(?<!\\)\n/g, "\\n");
       return JSON.parse(noNewLines);
-    } catch (e2) { }
+    } catch (e2: any) {
+      console.warn(`[JSON REPAIR] Secondary parse failed: ${e2?.message || e2}`);
+    }
 
     if (cleaned.startsWith('"') && cleaned.endsWith('"')) {
       try {
         const firstLayer = JSON.parse(cleaned);
         if (typeof firstLayer === 'string') return JSON.parse(firstLayer);
         return firstLayer;
-      } catch (e4) { }
+      } catch (e4: any) {
+        console.warn(`[JSON REPAIR] Tertiary parse failed: ${e4?.message || e4}`);
+      }
     }
 
     const isTruncated = stack.length > 0;
