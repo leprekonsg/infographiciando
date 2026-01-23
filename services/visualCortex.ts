@@ -700,8 +700,111 @@ import type {
 } from '../types/slideTypes';
 
 /**
+ * Parse component ID from various formats Qwen-VL might generate.
+ * Handles:
+ * - "text-bullets-0" → { type: "text-bullets", index: 0 }
+ * - "text-title-0" → { type: "text-title", index: 0, isTitle: true }
+ * - "shape-card-0" → { type: "shape-card", index: 0 }
+ * - "heading-0", "title-0" → { type: "title", index: 0, isTitle: true }
+ * - "divider-0", "line-decorative-0" → { type: "divider", index: 0, isDivider: true }
+ */
+function parseComponentId(componentId: string): {
+    type: string;
+    index: number;
+    isTitle: boolean;
+    isDivider: boolean;
+    isLine: boolean;
+} {
+    const parts = componentId.split('-');
+    const indexStr = parts[parts.length - 1];
+    const index = /^\d+$/.test(indexStr) ? parseInt(indexStr) : 0;
+    const typeWithoutIndex = /^\d+$/.test(indexStr) 
+        ? parts.slice(0, -1).join('-') 
+        : componentId;
+    
+    // Normalize common variations
+    const normalized = typeWithoutIndex.toLowerCase();
+    
+    const isTitle = ['title', 'heading', 'text-title', 'section-header'].includes(normalized);
+    const isDivider = ['divider', 'line-decorative', 'underline', 'accent-bar'].includes(normalized);
+    const isLine = isDivider || normalized.includes('line');
+    
+    return { type: normalized, index, isTitle, isDivider, isLine };
+}
+
+/**
+ * Find component by flexible matching.
+ * Tries:
+ * 1. Exact index match for matching type
+ * 2. Type-only match (first component of that type)
+ * 3. Fuzzy match (partial type name)
+ */
+function findComponentByFlexibleMatch(
+    components: any[],
+    parsedId: { type: string; index: number }
+): { component: any; actualIndex: number } | null {
+    if (!components || components.length === 0) return null;
+    
+    const { type, index } = parsedId;
+    
+    // Map SVG element types to component types
+    const typeMapping: Record<string, string[]> = {
+        'text-bullets': ['text-bullets'],
+        'text-title': ['text-bullets'], // Title text often rendered from text-bullets
+        'shape-card': ['metric-cards', 'icon-grid', 'chart-frame'],
+        'metric-cards': ['metric-cards'],
+        'process-flow': ['process-flow'],
+        'icon-grid': ['icon-grid'],
+        'chart-frame': ['chart-frame'],
+        'diagram-svg': ['diagram-svg'],
+    };
+    
+    // Get potential component types this ID could refer to
+    const potentialTypes = typeMapping[type] || [type];
+    
+    // Strategy 1: Find component of matching type at the specified index
+    let typeMatchCount = 0;
+    for (let i = 0; i < components.length; i++) {
+        const cType = components[i].type?.toLowerCase() || '';
+        if (potentialTypes.some(pt => cType === pt || cType.includes(pt.split('-')[0]))) {
+            if (typeMatchCount === index) {
+                return { component: components[i], actualIndex: i };
+            }
+            typeMatchCount++;
+        }
+    }
+    
+    // Strategy 2: If index was 0 and we found no match, try first of any matching type
+    if (index === 0 && typeMatchCount === 0) {
+        for (let i = 0; i < components.length; i++) {
+            const cType = components[i].type?.toLowerCase() || '';
+            // Fuzzy match: check if component type contains any part of our target type
+            const typeWords = type.split('-').filter(w => w.length > 2);
+            if (typeWords.some(w => cType.includes(w))) {
+                return { component: components[i], actualIndex: i };
+            }
+        }
+    }
+    
+    // Strategy 3: Fall back to direct index if within bounds
+    if (index >= 0 && index < components.length) {
+        console.log(`[REPAIR] Using fallback index match for ${type}-${index}`);
+        return { component: components[index], actualIndex: index };
+    }
+    
+    return null;
+}
+
+/**
  * Apply structured repairs to a slide
  * Modifies component positions, sizes, colors based on Qwen-VL repair instructions
+ * 
+ * IMPROVED: Better component ID parsing and flexible matching to handle
+ * the mismatch between SVG element IDs and actual component indices.
+ * 
+ * NOTE: Some repairs (reposition, adjust_spacing) add hints to the component that
+ * the spatial renderer can use during layout. These don't directly change positions
+ * but influence the rendering pass.
  */
 function applyRepairsToSlide(
     slide: SlideNode,
@@ -709,15 +812,14 @@ function applyRepairsToSlide(
     styleGuide: GlobalStyleGuide
 ): SlideNode {
     const updatedSlide = JSON.parse(JSON.stringify(slide)); // Deep clone
+    let appliedCount = 0;
+    const components = updatedSlide.layoutPlan?.components || [];
 
     for (const repair of repairs) {
         const { component_id, action, params, reason } = repair;
 
-        // Parse component ID: "text-bullets-0" → type="text-bullets", index=0
-        const parts = component_id.split('-');
-        const indexStr = parts[parts.length - 1];
-        const componentType = parts.slice(0, -1).join('-');
-        const componentIndex = parseInt(indexStr || '0');
+        // Parse component ID with improved logic
+        const parsedId = parseComponentId(component_id);
 
         // Find component in layoutPlan
         if (!updatedSlide.layoutPlan?.components) {
@@ -725,71 +827,122 @@ function applyRepairsToSlide(
             continue;
         }
 
-        const component = updatedSlide.layoutPlan.components[componentIndex];
-        if (!component) {
-            console.warn(`[REPAIR] Component not found: ${component_id}`);
+        // Handle special IDs that map to slide-level properties
+        if (parsedId.isTitle) {
+            // Title repairs affect the slide title styling
+            if (action === 'reposition' && params?.y !== undefined) {
+                console.log(`[REPAIR] Setting title top margin hint: ${params.y} (${reason})`);
+                updatedSlide.layoutPlan._titleMarginTop = params.y;
+                appliedCount++;
+            } else if (action === 'adjust_spacing') {
+                console.log(`[REPAIR] Setting title spacing hint (${reason})`);
+                updatedSlide.layoutPlan._titleSpacing = params?.padding || 'increased';
+                appliedCount++;
+            }
             continue;
         }
+
+        if (parsedId.isDivider || parsedId.isLine) {
+            // Divider positioning hints
+            if (action === 'reposition' && params?.y !== undefined) {
+                console.log(`[REPAIR] Setting divider position hint: y=${params.y} (${reason})`);
+                updatedSlide.layoutPlan._dividerY = params.y;
+                appliedCount++;
+            }
+            continue;
+        }
+
+        // Use flexible matching to find the component
+        const match = findComponentByFlexibleMatch(components, parsedId);
+        if (!match) {
+            console.warn(`[REPAIR] Component not found: ${component_id} (parsed as ${parsedId.type}-${parsedId.index})`);
+            continue;
+        }
+        
+        const { component, actualIndex } = match;
 
         // Apply action
         switch (action) {
             case 'resize':
-                console.log(`[REPAIR] Resizing ${component_id}: ${params.width}x${params.height} (${reason})`);
-                // Note: Resizing would require spatial metadata - for now, log only
-                // Future: Add spatial hints to components for zone reallocation
+                console.log(`[REPAIR] Resizing ${component_id}: ${params?.width}x${params?.height} (${reason})`);
+                // Add resize hints that spatial renderer can use
+                if (params?.width !== undefined) (component as any)._hintWidth = params.width;
+                if (params?.height !== undefined) (component as any)._hintHeight = params.height;
+                appliedCount++;
                 break;
 
             case 'reposition':
-                console.log(`[REPAIR] Repositioning ${component_id}: (${params.x}, ${params.y}) (${reason})`);
-                // Note: Repositioning would require zone coordinate system - for now, log only
-                // Future: Update zone coordinates in spatial renderer
+                console.log(`[REPAIR] Repositioning ${component_id}: (${params?.x}, ${params?.y}) (${reason})`);
+                // Add position hints for spatial renderer
+                if (params?.x !== undefined) (component as any)._hintX = params.x;
+                if (params?.y !== undefined) (component as any)._hintY = params.y;
+                appliedCount++;
                 break;
 
             case 'adjust_color':
-                console.log(`[REPAIR] Adjusting color ${component_id}: ${params.color} (${reason})`);
+                console.log(`[REPAIR] Adjusting color ${component_id}: ${params?.color} (${reason})`);
                 // Apply color changes to component data
-                if (component.type === 'text-bullets' && 'textColor' in component) {
+                if (params?.color) {
                     (component as any).textColor = params.color;
-                } else if (component.type === 'metric-cards' && 'metrics' in component) {
-                    const metrics = (component as any).metrics;
-                    if (Array.isArray(metrics)) {
-                        metrics.forEach((m: any) => m.color = params.color);
+                    (component as any)._hintColor = params.color;
+                    
+                    if (component.type === 'metric-cards' && 'metrics' in component) {
+                        const metrics = (component as any).metrics;
+                        if (Array.isArray(metrics)) {
+                            metrics.forEach((m: any) => m.color = params.color);
+                        }
                     }
+                    appliedCount++;
                 }
                 break;
 
             case 'adjust_spacing':
-                console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params.padding} (${reason})`);
-                // Note: Spacing would require spatial metadata - for now, log only
-                // Future: Update padding/margin metadata
+                console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params?.padding}, lineHeight=${params?.lineHeight} (${reason})`);
+                // Add spacing hints
+                if (params?.padding !== undefined) (component as any)._hintPadding = params.padding;
+                if (params?.lineHeight !== undefined) (component as any)._hintLineHeight = params.lineHeight;
+                if (params?.itemSpacing !== undefined) (component as any)._hintItemSpacing = params.itemSpacing;
+                appliedCount++;
                 break;
 
             case 'simplify_content':
-                console.log(`[REPAIR] Simplifying ${component_id}: remove ${params.removeCount} items (${reason})`);
+                console.log(`[REPAIR] Simplifying ${component_id}: remove ${params?.removeCount} items (${reason})`);
+                const removeCount = params?.removeCount || 1;
                 // Truncate arrays (bullets, metrics, etc.)
                 if (component.type === 'text-bullets' && 'content' in component) {
                     const content = (component as any).content;
-                    if (Array.isArray(content)) {
-                        (component as any).content = content.slice(0, -params.removeCount);
+                    if (Array.isArray(content) && content.length > removeCount) {
+                        (component as any).content = content.slice(0, -removeCount);
+                        appliedCount++;
                     }
                 } else if (component.type === 'metric-cards' && 'metrics' in component) {
                     const metrics = (component as any).metrics;
-                    if (Array.isArray(metrics)) {
-                        (component as any).metrics = metrics.slice(0, -params.removeCount);
+                    if (Array.isArray(metrics) && metrics.length > removeCount) {
+                        (component as any).metrics = metrics.slice(0, -removeCount);
+                        appliedCount++;
                     }
                 } else if (component.type === 'process-flow' && 'steps' in component) {
                     const steps = (component as any).steps;
-                    if (Array.isArray(steps)) {
-                        (component as any).steps = steps.slice(0, -params.removeCount);
+                    if (Array.isArray(steps) && steps.length > removeCount) {
+                        (component as any).steps = steps.slice(0, -removeCount);
+                        appliedCount++;
                     }
                 } else if (component.type === 'icon-grid' && 'items' in component) {
                     const items = (component as any).items;
-                    if (Array.isArray(items)) {
-                        (component as any).items = items.slice(0, -params.removeCount);
+                    if (Array.isArray(items) && items.length > removeCount) {
+                        (component as any).items = items.slice(0, -removeCount);
+                        appliedCount++;
                     }
                 }
                 break;
         }
+    }
+
+    // Log summary
+    if (appliedCount > 0) {
+        console.log(`[REPAIR] Applied ${appliedCount}/${repairs.length} repairs to slide`);
+    } else if (repairs.length > 0) {
+        console.warn(`[REPAIR] No repairs could be applied (0/${repairs.length})`);
     }
 
     return updatedSlide;

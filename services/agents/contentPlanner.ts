@@ -191,19 +191,40 @@ export async function runContentPlanner(
         : (factsContext || '');
 
     // Schema for Gemini Interactions API (flattened for nesting limits)
+    // CRITICAL: All array types MUST have `items` property to avoid API validation errors
+    // Error: "GenerateContentRequest.generation_config.response_schema.properties[dataPoints].items: missing field"
     const contentPlanSchema = {
         type: "object",
         properties: {
             title: { type: "string" },
             keyPoints: { type: "array", items: { type: "string" } },
-            dataPoints: { type: "array" },
+            dataPoints: { 
+                type: "array", 
+                items: { 
+                    type: "object",
+                    properties: {
+                        value: { type: "string" },
+                        label: { type: "string" },
+                        unit: { type: "string" }
+                    }
+                }
+            },
             narrative: { type: "string" },
             chartSpec: {
                 type: "object",
                 properties: {
                     type: { type: "string", enum: ["bar", "line", "pie", "doughnut", "stat-big"] },
                     title: { type: "string" },
-                    data: { type: "array" }
+                    data: { 
+                        type: "array",
+                        items: {
+                            type: "object",
+                            properties: {
+                                label: { type: "string" },
+                                value: { type: "number" }
+                            }
+                        }
+                    }
                 }
             }
         },
@@ -211,7 +232,9 @@ export async function runContentPlanner(
     };
 
     try {
-        // Content Planner: Moderate reasoning for keyPoints extraction → MODEL_AGENTIC (3 Flash)
+        // Content Planner: DISABLE THINKING - empty responses occur when thinking consumes output budget
+        // The model spends all tokens on internal reasoning, leaving 0 for actual keyPoints
+        // Fix: Use MODEL_AGENTIC with undefined thinkingLevel for pure generation
         const result = await createJsonInteraction<any>(
             MODEL_AGENTIC,
             PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, safeFactsContext, recentHistory, densityHint),
@@ -220,7 +243,7 @@ export async function runContentPlanner(
                 systemInstruction: PROMPTS.CONTENT_PLANNER.ROLE,
                 temperature: 0.2,
                 maxOutputTokens: 2048,
-                thinkingLevel: 'low' as ThinkingLevel
+                thinkingLevel: undefined  // CRITICAL: Disabled to prevent empty responses
             },
             costTracker
         );

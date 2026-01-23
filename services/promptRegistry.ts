@@ -263,9 +263,15 @@ OUTPUT: Return JSON with:
       - elements array (diagram-svg): min 3, max 8 items
 
       Component minimums (to avoid empty arrays):
-      - metric-cards: metrics must have 2–3 items
+      - metric-cards: metrics array MUST have 2–3 items. NEVER output empty metrics:[].
+        Each metric needs: value (string like "42M"), label (string), icon (Lucide name like "TrendingUp")
+        EXAMPLE metric-cards: {"type":"metric-cards","metrics":[{"value":"85%","label":"Efficiency","icon":"TrendingUp"},{"value":"42M","label":"Users","icon":"Users"}]}
       - icon-grid: items must have 3–5 items
       - process-flow: steps must have 3–4 items
+
+      CRITICAL METRIC-CARDS RULE:
+      If CONTENT_PLAN.dataPoints is empty or has fewer than 2 items, DO NOT USE metric-cards.
+      Use text-bullets or icon-grid instead. Empty metrics:[] will fail validation and waste compute.
 
       INPUTS:
       CONTENT_PLAN: ${contentPlanJson}

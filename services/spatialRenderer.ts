@@ -466,10 +466,39 @@ export class SpatialLayoutEngine {
       accent: normalizeColor(styleGuide.colorPalette.accentHighContrast),
       background: normalizeColor(styleGuide.colorPalette.background)
     };
-    const { x, y, w, h } = zone;
+    
+    // Apply repair hints if present (from visual repair system)
+    const compAny = comp as any;
+    let { x, y, w, h } = zone;
+    
+    // Apply position hints (override zone defaults)
+    if (typeof compAny._hintX === 'number') x = compAny._hintX;
+    if (typeof compAny._hintY === 'number') y = compAny._hintY;
+    
+    // Apply size hints (clamp to zone bounds for safety)
+    if (typeof compAny._hintWidth === 'number') w = Math.min(compAny._hintWidth, zone.w);
+    if (typeof compAny._hintHeight === 'number') h = Math.min(compAny._hintHeight, zone.h);
+    
+    // Apply color hints
+    if (compAny._hintColor) {
+      p.text = normalizeColor(compAny._hintColor);
+    }
+    
     const els: VisualElement[] = [];
 
-    const spacing = themeTokens.spacing;
+    // Get spacing values, applying hints if present
+    const baseSpacing = themeTokens.spacing;
+    const spacingMultiplier = typeof compAny._hintPadding === 'number' 
+      ? compAny._hintPadding / (baseSpacing.md * 10) // Normalize hint to multiplier
+      : 1.0;
+    const spacing = {
+      xs: baseSpacing.xs * spacingMultiplier,
+      sm: baseSpacing.sm * spacingMultiplier,
+      md: baseSpacing.md * spacingMultiplier,
+      lg: baseSpacing.lg * spacingMultiplier,
+      xl: baseSpacing.xl * spacingMultiplier
+    };
+    
     const cardRadius = themeTokens.radii.card;
     const cardStyle = themeTokens.surfaces.cardStyle;
     const cardBorderWidth = themeTokens.surfaces.borderWidth;
@@ -487,6 +516,16 @@ export class SpatialLayoutEngine {
 
     // Scale fonts based on zone purpose (Hierarchy)
     const scale = zone.purpose === 'hero' ? 1.2 : (zone.purpose === 'accent' ? 0.85 : 1.0);
+    
+    // Apply line height hint if present (affects text vertical spacing)
+    const lineHeightMultiplier = typeof compAny._hintLineHeight === 'number' 
+      ? compAny._hintLineHeight 
+      : 1.0;
+    
+    // Apply item spacing hint if present (affects spacing between list items)
+    const itemSpacingMultiplier = typeof compAny._hintItemSpacing === 'number'
+      ? compAny._hintItemSpacing
+      : 1.0;
 
     if (comp.type === 'text-bullets') {
       let contentScale = scale;
@@ -583,11 +622,11 @@ export class SpatialLayoutEngine {
         const wrappedLinesCount = Math.ceil(visibleText.length / maxCharsPerLine);
         const vLines = Math.max(1, wrappedLinesCount);
 
-        const lineH = 0.5 * contentScale;
+        const lineH = 0.5 * contentScale * lineHeightMultiplier;
         const totalVisualH = vLines * lineH;
 
-        // Advance: 0.6 basis + extra height for wrapped lines
-        const advance = Math.max(0.6 * contentScale, totalVisualH + (0.1 * contentScale));
+        // Advance: 0.6 basis + extra height for wrapped lines (apply item spacing multiplier)
+        const advance = Math.max(0.6 * contentScale * itemSpacingMultiplier, totalVisualH + (0.1 * contentScale));
 
         if (curY + totalVisualH > maxY) {
           if (i < lines.length) {

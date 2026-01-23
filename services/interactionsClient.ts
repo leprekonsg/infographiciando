@@ -28,6 +28,7 @@ export type JsonFailureType =
     | 'schema_drift'     // Wrong field types (e.g., string[] instead of object[])
     | 'string_array'     // Flat string array instead of object structure
     | 'empty_response'   // API returned empty/whitespace-only response (often after 500 error)
+    | 'degeneration'     // LLM stuck in repetition loop (enum concatenation, word repeats)
     | 'unknown';         // Unclassified malformation
 
 interface JsonClassification {
@@ -52,8 +53,26 @@ function classifyJsonFailure(text: string): JsonClassification {
     // Check for degeneration pattern (o0o0o0, aaaaa, etc.) - severe token exhaustion
     // This happens when the model runs out of tokens and starts repeating characters
     if (/([a-z0-9])\1{10,}/.test(trimmed.slice(-50))) {
-        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (token exhaustion)`);
-        return { type: 'truncation', confidence: 'high' };
+        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (token exhaustion - character repeat)`);
+        return { type: 'degeneration', confidence: 'high' };
+    }
+
+    // NEW: Check for word/phrase repetition loops (LLM hallucination)
+    // Example: "diagram-svg_circular-ecosystem_component_type_enum_value_diagram-svg_circular-ecosystem_..."
+    // These happen when the LLM gets stuck in a loop generating enum-like patterns
+    const last500 = trimmed.slice(-500);
+    const wordRepeatPattern = /([a-z_-]{4,}(?:_[a-z_-]+){2,})\1{3,}/i;
+    if (wordRepeatPattern.test(last500)) {
+        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (word-level repetition loop)`);
+        return { type: 'degeneration', confidence: 'high' };
+    }
+
+    // NEW: Check for enum value concatenation pattern
+    // Example: "metric-cards-left-text-bullets-right-metric-cards-left-text-bullets-right-..."
+    const enumConcatPattern = /((?:text-bullets|metric-cards|process-flow|icon-grid|chart-frame|diagram-svg)[-_]){4,}/i;
+    if (enumConcatPattern.test(last500)) {
+        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (enum value concatenation)`);
+        return { type: 'degeneration', confidence: 'high' };
     }
 
     // Check for string array pattern: ["item1", "item2", ...]
@@ -1134,10 +1153,17 @@ export async function createInteraction(
 
     if (extractedText) {
         // --- CASE 3 FIX: Degenerate output ("0-0-0" or low-entropy loops) ---
+        // Degeneration happens when the model gets stuck in repetition loops.
+        // FIX STRATEGY: Instead of reducing tokens (which causes truncation), we:
+        // 1. Use temperature=0.0 for determinism
+        // 2. INCREASE token budget slightly to allow proper JSON completion
+        // 3. Add stop sequences implicitly through simpler prompt structure
         if (hasEntropyDegeneration(extractedText)) {
-            console.warn(`[INTERACTIONS CLIENT] Degenerate output detected. Reissuing with stricter maxOutputTokens...`);
+            console.warn(`[INTERACTIONS CLIENT] Degenerate output detected. Reissuing with stabilized config...`);
 
-            const fallbackMaxTokens = Math.max(512, Math.min(options.maxOutputTokens ?? 8192, 1024));
+            // CRITICAL FIX: Don't cap at 1024 - that causes truncation!
+            // Instead, use the original budget but with temperature=0 for determinism
+            const fallbackMaxTokens = Math.min(options.maxOutputTokens ?? 8192, 4096);
             const retryRequest: InteractionRequest = {
                 model,
                 input: prompt,
@@ -1145,9 +1171,9 @@ export async function createInteraction(
                 response_format: options.responseFormat,
                 response_mime_type: options.responseMimeType,
                 generation_config: {
-                    temperature: 0.0,
+                    temperature: 0.0,  // Deterministic to break repetition loop
                     max_output_tokens: fallbackMaxTokens,
-                    thinking_level: undefined
+                    thinking_level: undefined  // Disable thinking to maximize output budget
                 }
             };
 
@@ -1312,6 +1338,68 @@ export async function createJsonInteraction<T = any>(
                         } as T;
                     }
                 } catch { /* continue to other repairs */ }
+            }
+        }
+
+        // --- LAYER 1.5: Degeneration fallback (LLM repetition loop) ---
+        // When the LLM gets stuck generating repeated enum values, extract what we can
+        if (classification.type === 'degeneration') {
+            console.warn(`[JSON REPAIR] LLM degeneration detected - attempting to extract valid prefix before repetition`);
+            
+            // Try to find valid JSON before the degeneration started
+            // Look for patterns like: valid JSON then "type": "text-bullets-metric-cards-text-bullets-..."
+            let repaired = text;
+            
+            // Remove the degenerated component type values
+            // Pattern: "type": "valid-type-garbage-garbage-garbage..."
+            const degeneratedTypePattern = /"type"\s*:\s*"([a-z-]+)(?:[-_][a-z-]+){5,}[^"]*"/gi;
+            repaired = repaired.replace(degeneratedTypePattern, (match, validPart) => {
+                // Extract just the first valid component type
+                const validTypes = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
+                const extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t.replace('-', ''))) 
+                    || validTypes.find(t => validPart.toLowerCase().includes(t.split('-')[0]))
+                    || 'text-bullets';
+                console.warn(`[JSON REPAIR] Extracted base type from degeneration: "${extracted}"`);
+                return `"type": "${extracted}"`;
+            });
+            
+            // Try to parse the cleaned version
+            try {
+                // Also try closing brackets if needed
+                const firstBrace = repaired.indexOf('{');
+                if (firstBrace !== -1) {
+                    repaired = repaired.substring(firstBrace);
+                    
+                    // Count and close brackets
+                    let depth = 0;
+                    let inString = false;
+                    let escape = false;
+                    for (let i = 0; i < repaired.length; i++) {
+                        const char = repaired[i];
+                        if (escape) { escape = false; continue; }
+                        if (char === '\\') { escape = true; continue; }
+                        if (char === '"') { inString = !inString; continue; }
+                        if (!inString) {
+                            if (char === '{') depth++;
+                            else if (char === '[') depth++;
+                            else if (char === '}') depth--;
+                            else if (char === ']') depth--;
+                        }
+                    }
+                    
+                    // Close any open brackets
+                    while (depth > 0) {
+                        repaired += '}';
+                        depth--;
+                    }
+                }
+                
+                const parsed = JSON.parse(repaired) as T;
+                console.log(`[JSON REPAIR] Degeneration repair success!`);
+                return normalizeJsonOutput(parsed);
+            } catch (degErr) {
+                console.warn(`[JSON REPAIR] Degeneration repair failed, falling through to truncation repair...`);
+                // Fall through to truncation repair as backup
             }
         }
 

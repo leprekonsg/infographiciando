@@ -945,13 +945,25 @@ async function runGenerator(
             const minComponents = ['split-left-text', 'split-right-text'].includes(layoutVariant) ? 2 : 1;
             const maxComponents = ['bento-grid'].includes(layoutVariant) ? 3 : 2;
 
+            // CRITICAL FIX: Pre-check if we have valid dataPoints for metric-cards
+            // If not, steer away from metric-cards in examples to prevent empty arrays
+            const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
+            
             // SCHEMA GUIDANCE: Since schema is now ultra-minimal, provide explicit JSON examples
+            // CRITICAL: metric-cards example MUST show full array structure with 2+ items
+            // The model outputs empty metrics:[] because the minimal schema doesn't define inner structure
+            const metricExample = hasValidDataPoints
+                ? `metric-cards: {"type":"metric-cards","metrics":[{"value":"${safeContentPlan.dataPoints[0]?.value || '42M'}","label":"${safeContentPlan.dataPoints[0]?.label || 'Metric'}","icon":"TrendingUp"},{"value":"${safeContentPlan.dataPoints[1]?.value || '85%'}","label":"${safeContentPlan.dataPoints[1]?.label || 'Growth'}","icon":"Activity"}]}`
+                : `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}  // (use text-bullets when no dataPoints)`;
+
             const componentExamples = `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
 text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
-metric-cards: {"type":"metric-cards","metrics":[{"value":"42M","label":"Users","icon":"TrendingUp"}]}
+${metricExample}
 process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
 icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}
-chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}`;
+chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}
+
+CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with value, label, and icon. Empty metrics:[] will fail validation.`;
 
             // CONTEXT COMPRESSION: Only pass essential fields to prevent "constraint too tall" errors
             // Problem: Full routerConfig + visualDesignSpec can exceed Gemini's FST constraint (5888 height)
@@ -1685,6 +1697,19 @@ export const generateAgenticDeck = async (
             const safeContentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, slideMeta);
             
             console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints`);
+
+            // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
+            // This prevents Generator from outputting empty metrics:[] arrays
+            const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
+            if (!hasValidDataPoints) {
+                // Add metrics-rail and dashboard-tiles to avoid list (they require metrics)
+                const metricHeavyLayouts = ['metrics-rail', 'dashboard-tiles'];
+                slideConstraints.avoidLayoutVariants = [
+                    ...(slideConstraints.avoidLayoutVariants || []),
+                    ...metricHeavyLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
+                ];
+                console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding metric-heavy layouts`);
+            }
 
             // 3b.1 Qwen Layout Selector (visual QA-driven layout selection)
             routerConfig = await runQwenLayoutSelector(

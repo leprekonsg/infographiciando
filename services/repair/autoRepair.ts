@@ -386,14 +386,22 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             if (clean.length >= 6) bullets.push(clean);
         };
 
-        if (Array.isArray(slide.content)) {
+        // PRIORITY 1: Use slide.content (populated from ContentPlan keyPoints)
+        // This is the authoritative source of content from the Content Planner
+        if (Array.isArray(slide.content) && slide.content.length > 0) {
             slide.content.forEach(line => add(line));
+            if (bullets.length >= 2) {
+                console.log(`[AUTO-REPAIR] Using ${bullets.length} keyPoints from slide.content`);
+                return bullets.slice(0, 4);
+            }
         }
 
+        // PRIORITY 2: Speaker notes (often contain key points)
         if (Array.isArray(slide.speakerNotesLines)) {
             slide.speakerNotesLines.slice(0, 2).forEach(line => add(line));
         }
 
+        // PRIORITY 3: Title as fallback
         add(slide.layoutPlan?.title as any);
         add((slide as any).title);
 
@@ -943,6 +951,106 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             if (!c.data || c.data.length === 0) {
                 console.warn(`[AUTO-REPAIR] Empty chart-frame data, converting to text-bullets`);
                 convertChartFrameToTextBullets(c, 'no data available');
+            }
+        }
+
+        // Handle diagram-svg component validation
+        if (c.type === 'diagram-svg') {
+            // Supported diagram types
+            const SUPPORTED_DIAGRAM_TYPES = ['circular-ecosystem', 'layered-stack', 'radial-hub', 'flow-sequence', 'hierarchy-tree', 'venn-overlap'];
+            
+            // Validate diagramType exists and is supported
+            if (!c.diagramType || typeof c.diagramType !== 'string') {
+                console.warn(`[AUTO-REPAIR] diagram-svg missing diagramType, inferring from context`);
+                
+                // Try to infer diagram type from elements or title
+                const title = String(c.title || c.centralTheme || slide.title || '').toLowerCase();
+                const elements = c.elements || [];
+                
+                if (title.includes('layer') || title.includes('stack')) {
+                    c.diagramType = 'layered-stack';
+                } else if (title.includes('ecosystem') || title.includes('cycle') || title.includes('circular')) {
+                    c.diagramType = 'circular-ecosystem';
+                } else if (title.includes('hub') || title.includes('radial') || title.includes('spoke')) {
+                    c.diagramType = 'radial-hub';
+                } else if (title.includes('flow') || title.includes('process') || title.includes('sequence')) {
+                    c.diagramType = 'flow-sequence';
+                } else if (title.includes('hierarchy') || title.includes('tree') || title.includes('org')) {
+                    c.diagramType = 'hierarchy-tree';
+                } else if (title.includes('venn') || title.includes('overlap') || title.includes('intersection')) {
+                    c.diagramType = 'venn-overlap';
+                } else if (elements.length >= 3) {
+                    // Default based on element count
+                    c.diagramType = elements.length <= 4 ? 'circular-ecosystem' : 'layered-stack';
+                } else {
+                    // Ultimate fallback - convert to text-bullets instead of breaking
+                    console.warn(`[AUTO-REPAIR] Cannot infer diagram type, converting to text-bullets`);
+                    c.type = 'text-bullets';
+                    c.title = c.title || c.centralTheme || 'Key Concepts';
+                    c.content = (c.elements || []).map((e: any) => 
+                        e.label || e.title || e.name || 'Concept'
+                    ).slice(0, 5);
+                    if (c.content.length === 0) {
+                        c.content = ['Core concept 1', 'Core concept 2', 'Core concept 3'];
+                    }
+                    delete c.elements;
+                    delete c.centralTheme;
+                    delete c.diagramType;
+                    addWarning('Converted diagram-svg to text-bullets: missing diagramType');
+                    return; // Skip further diagram processing
+                }
+                
+                addWarning(`Inferred diagramType: ${c.diagramType}`);
+            }
+            
+            // Validate diagramType is in supported list
+            if (!SUPPORTED_DIAGRAM_TYPES.includes(c.diagramType)) {
+                console.warn(`[AUTO-REPAIR] Unsupported diagramType "${c.diagramType}", mapping to closest match`);
+                
+                const lowerType = c.diagramType.toLowerCase();
+                if (lowerType.includes('circular') || lowerType.includes('ecosystem') || lowerType.includes('cycle')) {
+                    c.diagramType = 'circular-ecosystem';
+                } else if (lowerType.includes('layer') || lowerType.includes('stack')) {
+                    c.diagramType = 'layered-stack';
+                } else if (lowerType.includes('hub') || lowerType.includes('radial')) {
+                    c.diagramType = 'radial-hub';
+                } else if (lowerType.includes('flow') || lowerType.includes('sequence')) {
+                    c.diagramType = 'flow-sequence';
+                } else {
+                    c.diagramType = 'circular-ecosystem'; // Safe default
+                }
+                
+                addWarning(`Mapped unsupported diagramType to: ${c.diagramType}`);
+            }
+            
+            // Ensure elements array exists
+            if (!Array.isArray(c.elements) || c.elements.length === 0) {
+                console.warn(`[AUTO-REPAIR] diagram-svg has no elements, converting to text-bullets`);
+                c.type = 'text-bullets';
+                c.title = c.title || c.centralTheme || 'Key Concepts';
+                c.content = ['Core component', 'Supporting element', 'Integration layer'];
+                delete c.elements;
+                delete c.centralTheme;
+                delete c.diagramType;
+                addWarning('Converted diagram-svg to text-bullets: no elements');
+                return;
+            }
+            
+            // Validate each element has required fields
+            c.elements = c.elements.map((el: any, idx: number) => {
+                if (!el || typeof el !== 'object') {
+                    return { id: `element-${idx}`, label: `Element ${idx + 1}` };
+                }
+                return {
+                    id: el.id || `element-${idx}`,
+                    label: truncateText(String(el.label || el.title || el.name || `Element ${idx + 1}`), 40, 'diagram element'),
+                    description: el.description ? truncateText(String(el.description), 80, 'diagram description') : undefined
+                };
+            }).slice(0, 8); // Cap at 8 elements for visual clarity
+            
+            // Ensure centralTheme exists
+            if (!c.centralTheme) {
+                c.centralTheme = c.title || slide.title || 'Core Concept';
             }
         }
     });
