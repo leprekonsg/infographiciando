@@ -1,5 +1,6 @@
 
-import { SlideNode, ValidationResult, RenderModeSchema, VisualDesignSpec, RouterDecision, SlideLayoutPlanSchema, VisualCritiqueReportSchema, VisualCritiqueReport } from "../types/slideTypes";
+import { SlideNode, ValidationResult, RenderModeSchema, VisualDesignSpec, RouterDecision, SlideLayoutPlanSchema, VisualCritiqueReportSchema, VisualCritiqueReport, PREMIUM_QUALITY_CHECKS } from "../types/slideTypes";
+import { CompositionPlan } from "../types/serendipityTypes";
 
 // Helper for contrast check (handles hex with or without # prefix)
 const hasGoodContrast = (hex: string): boolean => {
@@ -34,6 +35,100 @@ const isPlaceholderValue = (value: any): boolean => {
     '-', '—', '...', 'n.a.'
   ].includes(raw);
 };
+
+// ============================================================================
+// PREMIUM/SERENDIPITY MODE VALIDATION
+// ============================================================================
+
+/**
+ * Validates a composition plan against premium quality standards.
+ * Used when SERENDIPITY_MODE_ENABLED is true to ensure "Steve Jobs quality".
+ * 
+ * @param compositionPlan - The composition plan from Composition Architect
+ * @param slideNode - The slide being validated
+ * @returns ValidationResult with premium-specific checks
+ */
+export const validatePremiumComposition = (
+  compositionPlan: CompositionPlan | undefined,
+  slideNode: SlideNode
+): ValidationResult => {
+  const errors: { code: string; message: string; suggestedFix?: string }[] = [];
+  let score = 100;
+
+  if (!compositionPlan) {
+    return { passed: true, score: 100, errors: [] }; // Skip if no composition plan
+  }
+
+  // 1. Check decorative element count (not too many surprises)
+  const decorativeCount = compositionPlan.layerPlan?.decorativeElements?.length || 0;
+  if (decorativeCount > PREMIUM_QUALITY_CHECKS.MAX_BADGES_PER_SLIDE) {
+    score -= 10;
+    errors.push({
+      code: 'PREMIUM_TOO_MANY_DECORATIVES',
+      message: `Too many decorative elements (${decorativeCount}) - premium slides should be minimal`,
+      suggestedFix: `Reduce decorative elements to ${PREMIUM_QUALITY_CHECKS.MAX_BADGES_PER_SLIDE} or fewer`
+    });
+  }
+
+  // 2. Check card count for card-based patterns
+  const cardCount = compositionPlan.layerPlan?.contentStructure?.cardCount || 0;
+  const pattern = compositionPlan.layerPlan?.contentStructure?.pattern;
+  
+  if ((pattern === 'card-row' || pattern === 'narrative-flow' || pattern === 'card-grid') 
+      && cardCount > PREMIUM_QUALITY_CHECKS.MAX_CARDS_PER_SLIDE) {
+    score -= 15;
+    errors.push({
+      code: 'PREMIUM_TOO_MANY_CARDS',
+      message: `Too many cards (${cardCount}) - premium designs use 2-4 cards max`,
+      suggestedFix: `Reduce to ${PREMIUM_QUALITY_CHECKS.MAX_CARDS_PER_SLIDE} cards for visual clarity`
+    });
+  }
+
+  // 3. Check surprise intensity matches budget
+  const surprises = compositionPlan.serendipityPlan?.allocatedSurprises || [];
+  const budget = compositionPlan.serendipityPlan?.variationBudget || 0.5;
+  const boldSurprises = surprises.filter(s => s.intensity === 'bold').length;
+  
+  if (budget < 0.5 && boldSurprises > 0) {
+    score -= 10;
+    errors.push({
+      code: 'PREMIUM_SURPRISE_BUDGET_MISMATCH',
+      message: 'Bold surprises used with conservative budget - breaks design consistency',
+      suggestedFix: 'Use subtle or moderate intensity surprises for conservative slides'
+    });
+  }
+
+  // 4. Narrative-flow pattern validation
+  if (pattern === 'narrative-flow' && cardCount !== 3) {
+    score -= 5;
+    errors.push({
+      code: 'PREMIUM_NARRATIVE_CARD_COUNT',
+      message: 'Narrative-flow pattern should have exactly 3 cards (problem/insight/solution)',
+      suggestedFix: 'Adjust card count to 3 for proper narrative structure'
+    });
+  }
+
+  // 5. Check negative space is planned (breathing room)
+  const layoutComponents = slideNode.layoutPlan?.components || [];
+  if (layoutComponents.length > PREMIUM_QUALITY_CHECKS.MAX_ELEMENT_DENSITY) {
+    score -= 15;
+    errors.push({
+      code: 'PREMIUM_HIGH_DENSITY',
+      message: `Too many components (${layoutComponents.length}) - premium slides need breathing room`,
+      suggestedFix: 'Simplify content to fewer, higher-impact elements'
+    });
+  }
+
+  return {
+    passed: errors.length === 0,
+    score,
+    errors
+  };
+};
+
+// ============================================================================
+// STANDARD VALIDATION
+// ============================================================================
 
 export const validateVisualLayoutAlignment = (
   visualDesign: VisualDesignSpec,
@@ -454,7 +549,7 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
 export function validateCritiqueResponse(raw: any): VisualCritiqueReport | null {
   const result = VisualCritiqueReportSchema.safeParse(raw);
   if (!result.success) {
-    console.error('[VALIDATOR] Critique response invalid:', result.error.format());
+    console.error('[VALIDATOR] Critique response invalid:', (result as any).error?.format?.() || 'Unknown error');
     return null;
   }
   return result.data;
@@ -467,7 +562,7 @@ export function validateCritiqueResponse(raw: any): VisualCritiqueReport | null 
 export function validateRepairResponse(raw: any): any | null {
   const result = SlideLayoutPlanSchema.safeParse(raw);
   if (!result.success) {
-    console.error('[VALIDATOR] Repair response invalid:', result.error.format());
+    console.error('[VALIDATOR] Repair response invalid:', (result as any).error?.format?.() || 'Unknown error');
     return null;
   }
   return result.data;
@@ -533,7 +628,7 @@ export function validateGeneratorCompliance(
   if (expectations) {
     // Check required component types
     if (expectations.requiredTypes && expectations.requiredTypes.length > 0) {
-      const hasRequired = expectations.requiredTypes.some(type => componentTypes.includes(type));
+      const hasRequired = expectations.requiredTypes.some(type => componentTypes.includes(type as any));
       if (!hasRequired) {
         score -= 25;
         isCritical = true;
@@ -732,7 +827,7 @@ export function validateDeckCoherence(slides: SlideNode[]): CoherenceReport {
   // Intro slides should be early, conclusion slides should be late
   slides.forEach((slide, idx) => {
     const title = slide.layoutPlan?.title?.toLowerCase() || '';
-    const purpose = slide.meta?.purpose?.toLowerCase() || '';
+    const purpose = (slide.purpose || (slide as any).meta?.purpose || '').toLowerCase();
 
     const isIntro = title.includes('intro') || title.includes('overview') ||
                     purpose.includes('intro') || purpose.includes('hook');

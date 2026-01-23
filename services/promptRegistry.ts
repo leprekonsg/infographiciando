@@ -234,12 +234,21 @@ OUTPUT: Return JSON with:
       - Keep descriptions to 1–2 sentences; metrics limited to 2; features limited to 2.
 
       Component type selection:
-      - text-bullets: Lists, key points, standard text content
-      - metric-cards: Statistics, KPIs, numeric data with labels
-      - process-flow: Sequential steps, workflows, timelines
-      - icon-grid: Features, benefits, categories (2-4 columns). You may add optional "emphasis" per item (primary|secondary|low) to drive visual hierarchy.
-      - chart-frame: Bar, pie, line, or doughnut charts
-      - diagram-svg: Circular ecosystems, closed-loop systems, integration diagrams
+      - ONLY USE THESE EXACT STRINGS (case-sensitive):
+        * "text-bullets" - Lists, key points, standard text content
+        * "metric-cards" - Statistics, KPIs, numeric data with labels (REQUIRES dataPoints)
+        * "process-flow" - Sequential steps, workflows, timelines
+        * "icon-grid" - Features, benefits, categories (2-4 columns)
+        * "chart-frame" - Bar, pie, line, or doughnut charts
+        * "diagram-svg" - Circular ecosystems, closed-loop systems
+      
+      CRITICAL COMPONENT TYPE RULE:
+      The "type" field MUST be EXACTLY one of: "text-bullets", "metric-cards", "process-flow", "icon-grid", "chart-frame", "diagram-svg"
+      DO NOT concatenate types. DO NOT add suffixes. DO NOT repeat words.
+      WRONG: "text-bullets-metric-cards", "metric-cardsMetricCards", "text-bullets_safe-zone"
+      RIGHT: "text-bullets"
+      
+      diagram-svg usage rules:
         * Use when visualFocus suggests: "ecosystem", "cycle", "integration", "closed-loop", "sovereignty", "interconnected"
         * Diagram type: circular-ecosystem (center theme + outer ring of 3-8 elements)
         * Each element needs: id, label (max 30 chars), optional icon

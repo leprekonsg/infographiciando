@@ -49,7 +49,7 @@ import { z } from "zod";
 
 // --- FEATURE FLAGS ---
 // Enable serendipity mode for high-variation slide generation
-export const SERENDIPITY_MODE_ENABLED = false; // Set to true to enable layer-based composition
+export const SERENDIPITY_MODE_ENABLED = true; // Layer-based composition with premium design
 
 // --- CONSTANTS ---
 // Model tiers imported from interactionsClient for consistency
@@ -1680,14 +1680,34 @@ export const generateAgenticDeck = async (
             }
             const factsContext = relevantClusterFacts.join('\n') || "No specific facts found.";
 
-            // Compute density hints based on slide type and position
-            // Earlier slides and hero-centered get tighter budgets
+            // Compute density hints based on slide type, position, AND LAYOUT VARIANT
+            // This is critical - zone sizes vary dramatically between layouts
             const isHeroOrIntro = slideMeta.type === 'title-slide' || slideMeta.type === 'section-header' || i === 0;
-            const densityHint: ContentDensityHint = {
-                maxBullets: isHeroOrIntro ? 2 : 3,
-                maxCharsPerBullet: isHeroOrIntro ? 60 : 80,
-                maxDataPoints: 3
+            const layoutVariant = routerConfig?.layoutVariant || 'standard-vertical';
+            
+            // Layout-aware density budgets (based on actual zone capacity)
+            // These values are calibrated to the zone sizes in spatialRenderer.ts
+            const LAYOUT_DENSITY_BUDGETS: Record<string, { maxBullets: number; maxCharsPerBullet: number }> = {
+                'hero-centered': { maxBullets: 2, maxCharsPerBullet: 50 },      // Minimal text, big impact
+                'split-left-text': { maxBullets: 3, maxCharsPerBullet: 60 },    // 50% width for text
+                'split-right-text': { maxBullets: 3, maxCharsPerBullet: 60 },   // 50% width for text
+                'bento-grid': { maxBullets: 2, maxCharsPerBullet: 40 },         // Very tight cells
+                'dashboard-tiles': { maxBullets: 2, maxCharsPerBullet: 45 },    // Metric-focused
+                'metrics-rail': { maxBullets: 2, maxCharsPerBullet: 50 },       // Sidebar layout
+                'timeline-horizontal': { maxBullets: 3, maxCharsPerBullet: 50 },// Horizontal flow
+                'asymmetric-grid': { maxBullets: 3, maxCharsPerBullet: 55 },    // Mixed zones
+                'standard-vertical': { maxBullets: 3, maxCharsPerBullet: 70 },  // Most generous
             };
+            
+            const layoutBudget = LAYOUT_DENSITY_BUDGETS[layoutVariant] || LAYOUT_DENSITY_BUDGETS['standard-vertical'];
+            
+            const densityHint: ContentDensityHint = {
+                maxBullets: isHeroOrIntro ? Math.min(2, layoutBudget.maxBullets) : layoutBudget.maxBullets,
+                maxCharsPerBullet: isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet,
+                maxDataPoints: layoutVariant === 'bento-grid' ? 4 : 3
+            };
+            
+            console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} → max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars`);
 
             onProgress(`Agent 3b/5: Content Planning Slide ${i + 1}...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
             

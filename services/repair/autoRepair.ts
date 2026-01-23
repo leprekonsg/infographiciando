@@ -101,17 +101,135 @@ const COMPONENT_TYPE_MAP: Record<string, string> = {
 const SUPPORTED_COMPONENT_TYPES = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
 
 /**
+ * EARLY TOKEN LOOP DETECTION
+ * Detects if any string value in an object has degenerate repetition patterns
+ * This catches the root cause BEFORE it pollutes component types
+ */
+function detectAndCleanDegeneratedStrings(obj: any, maxDepth = 5): any {
+    if (maxDepth <= 0 || obj === null || obj === undefined) return obj;
+    
+    if (typeof obj === 'string') {
+        // PATTERN 1: Character repetition (aaaaa, 0o0o0o)
+        if (obj.length > 30 && /(.{2,6})\1{4,}/i.test(obj)) {
+            const match = obj.match(/^(.{2,50}?)(?:\1{2,}|(.{2,6})\2{3,})/);
+            if (match) {
+                console.warn(`[AUTO-REPAIR] Cleaned character degeneration: "${obj.slice(0, 30)}..."`);
+                return match[1] || obj.slice(0, 30);
+            }
+        }
+        
+        // PATTERN 2: Word repetition (MetricCardsMetricCards)
+        const wordPattern = /([A-Z][a-z]+(?:[A-Z][a-z]+)?)\1{3,}/;
+        if (wordPattern.test(obj)) {
+            const match = obj.match(wordPattern);
+            if (match) {
+                const base = match[1];
+                console.warn(`[AUTO-REPAIR] Cleaned word degeneration: "${base}..."`);
+                return base;
+            }
+        }
+        
+        // PATTERN 3: Phrase repetition with separators (-safe-zone_text-safe-zone)
+        if (obj.length > 60) {
+            const segments = obj.split(/[-_]/);
+            if (segments.length > 6) {
+                const segmentCounts: Record<string, number> = {};
+                for (const seg of segments) {
+                    if (seg.length >= 3) segmentCounts[seg] = (segmentCounts[seg] || 0) + 1;
+                }
+                const maxCount = Math.max(0, ...Object.values(segmentCounts));
+                if (maxCount >= 5) {
+                    // Extract the valid prefix before degeneration
+                    const validPrefix = obj.split(/[-_]/).slice(0, 3).join('-');
+                    console.warn(`[AUTO-REPAIR] Cleaned phrase degeneration (${maxCount}x repeat)`);
+                    return validPrefix;
+                }
+            }
+        }
+        
+        // PATTERN 4: Length sanity check for component type strings
+        // No valid component type should exceed 30 chars
+        if (obj.length > 80) {
+            // Try to extract a valid type from the beginning
+            for (const validType of SUPPORTED_COMPONENT_TYPES) {
+                if (obj.toLowerCase().startsWith(validType)) {
+                    console.warn(`[AUTO-REPAIR] Truncated oversized value to valid type: ${validType}`);
+                    return validType;
+                }
+            }
+            // Otherwise truncate
+            return obj.slice(0, 50);
+        }
+        
+        return obj;
+    }
+    
+    if (Array.isArray(obj)) {
+        return obj.map(item => detectAndCleanDegeneratedStrings(item, maxDepth - 1));
+    }
+    
+    if (typeof obj === 'object') {
+        const cleaned: any = {};
+        for (const [key, value] of Object.entries(obj)) {
+            // Special handling for 'type' field - most critical
+            if (key === 'type' && typeof value === 'string') {
+                cleaned[key] = preSanitizeComponentType(value);
+            } else {
+                cleaned[key] = detectAndCleanDegeneratedStrings(value, maxDepth - 1);
+            }
+        }
+        return cleaned;
+    }
+    
+    return obj;
+}
+
+/**
  * Pre-sanitize component type string before normalization.
  * Handles malformed types like:
  * - 'diagram-svg, ' (trailing punctuation)
  * - 'text-bulletsLookupError: ...' (error messages embedded)
  * - 'text-bullets-and-no-icon-bullets-and-...' (LLM degeneration)
+ * 
+ * ENHANCED: Now catches more degeneration patterns including:
+ * - CamelCase repetition (MetricCardsMetricCards...)
+ * - Underscore/hyphen repetition (_safe-zone_text-safe-zone...)
+ * - Mixed pattern hallucinations
  */
 function preSanitizeComponentType(rawType: string): string {
     if (!rawType || typeof rawType !== 'string') return 'text-bullets';
     
+    // FAST PATH: Already valid type
+    const trimmed = rawType.trim().toLowerCase();
+    if (SUPPORTED_COMPONENT_TYPES.includes(trimmed)) return trimmed;
+    
     // Strip trailing punctuation and whitespace
     let cleaned = rawType.trim().replace(/[,;:\s]+$/, '').trim();
+    
+    // IMMEDIATE LENGTH CHECK: No valid type is > 20 chars
+    // This catches 99% of degeneration cases instantly
+    if (cleaned.length > 25) {
+        // Try to extract valid type from start
+        for (const validType of SUPPORTED_COMPONENT_TYPES) {
+            if (cleaned.toLowerCase().startsWith(validType)) {
+                console.warn(`[AUTO-REPAIR] Detected degenerated component type, extracting base: "${cleaned.slice(0, 40)}..."`);
+                return validType;
+            }
+        }
+        
+        // Try to find any valid type embedded
+        for (const validType of SUPPORTED_COMPONENT_TYPES) {
+            const idx = cleaned.toLowerCase().indexOf(validType);
+            if (idx !== -1) {
+                console.warn(`[AUTO-REPAIR] Extracted embedded type "${validType}" from garbage: "${cleaned.slice(0, 30)}..."`);
+                return validType;
+            }
+        }
+        
+        // Default fallback
+        console.warn(`[AUTO-REPAIR] Degenerated type (${cleaned.length} chars) -> text-bullets`);
+        return 'text-bullets';
+    }
     
     // If an error message is embedded, extract the first valid-looking type
     if (cleaned.includes('LookupError') || cleaned.includes('is not a valid')) {
@@ -119,29 +237,18 @@ function preSanitizeComponentType(rawType: string): string {
         cleaned = match ? match[1] : 'text-bullets';
     }
     
-    // Detect degeneration pattern: check for repeated word sequences (e.g., "and-no-icon-bullets" repeated)
-    if (cleaned.length > 50) {
-        // Check if any valid component type appears at the start
-        const validStart = SUPPORTED_COMPONENT_TYPES.find(t => cleaned.toLowerCase().startsWith(t));
-        if (validStart) {
-            // Check if there's garbage after the valid type
-            if (cleaned.length > validStart.length + 10) {
-                console.warn(`[AUTO-REPAIR] Detected degenerated component type, extracting base: "${cleaned.slice(0, 40)}..."`);
-                return validStart;
+    // Detect word-level repetition in remaining cases (50+ chars already handled above)
+    if (cleaned.length > 20) {
+        const words = cleaned.split(/[-_\s]+/);
+        if (words.length > 4) {
+            const wordCounts: Record<string, number> = {};
+            for (const w of words) {
+                if (w.length > 2) wordCounts[w] = (wordCounts[w] || 0) + 1;
             }
-        } else {
-            // Check for word-level repetition pattern
-            const words = cleaned.split(/[-_\s]+/);
-            if (words.length > 6) {
-                const wordCounts: Record<string, number> = {};
-                for (const w of words) {
-                    if (w.length > 2) wordCounts[w] = (wordCounts[w] || 0) + 1;
-                }
-                const maxRepeat = Math.max(...Object.values(wordCounts));
-                if (maxRepeat >= 4) {
-                    console.warn(`[AUTO-REPAIR] Detected degenerated component type (${maxRepeat}x repetition), defaulting to text-bullets`);
-                    return 'text-bullets';
-                }
+            const maxRepeat = Math.max(0, ...Object.values(wordCounts));
+            if (maxRepeat >= 3) {
+                console.warn(`[AUTO-REPAIR] Detected degenerated component type (${maxRepeat}x repetition), defaulting to text-bullets`);
+                return 'text-bullets';
             }
         }
     }
@@ -229,6 +336,17 @@ function deepParseJsonStrings(obj: any): any {
 }
 
 export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide): SlideNode {
+    // --- LAYER 0: EARLY DEGENERATION CLEANUP (CRITICAL) ---
+    // Before ANY other processing, clean degenerated strings from the entire slide object
+    // This catches token loop issues at the source before they pollute component types
+    if (slide.layoutPlan?.components) {
+        slide.layoutPlan.components = detectAndCleanDegeneratedStrings(slide.layoutPlan.components);
+    }
+    if (slide.layoutPlan?.title && typeof slide.layoutPlan.title === 'string' && slide.layoutPlan.title.length > 100) {
+        slide.layoutPlan.title = slide.layoutPlan.title.slice(0, 80);
+        console.warn(`[AUTO-REPAIR] Truncated oversized title`);
+    }
+    
     // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
 
     const CONTENT_LIMITS = {

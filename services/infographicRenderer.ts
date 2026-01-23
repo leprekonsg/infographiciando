@@ -193,7 +193,7 @@ export class InfographicRenderer {
 
               const svgString = buildDiagramSVG(
                 comp.diagramType,
-                comp.elements,
+                (comp.elements || []) as any,
                 comp.centralTheme,
                 diagramPalette
               );
@@ -302,15 +302,34 @@ export class InfographicRenderer {
         const shapeType = (pres.ShapeType as any)[el.shapeType] || pres.ShapeType.rect;
         pptSlide.addShape(shapeType, opts);
       } else if (el.type === 'text') {
-        pptSlide.addText(el.content, {
+        // Build text options with premium typography support
+        const textOpts: any = {
           x: el.x, y: el.y, w: el.w, h: el.h,
           fontSize: el.fontSize,
           color: el.color,
-          bold: el.bold,
+          bold: el.bold || (el.fontWeight && el.fontWeight >= 700),
           fontFace: el.fontFamily,
           align: el.align,
           rotate: el.rotation
-        });
+        };
+        
+        // Note: PptxGenJS doesn't natively support letterSpacing
+        // For premium typography, we apply font weight mapping
+        // letterSpacing and lineHeight are visual-only (used in preview renderer)
+        if (el.fontWeight) {
+          // Map fontWeight to bold (700+) or regular
+          textOpts.bold = el.fontWeight >= 700;
+        }
+        
+        // Transform content if textTransform is specified
+        let content = el.content;
+        if ((el as any).textTransform === 'uppercase') {
+          content = content.toUpperCase();
+        } else if ((el as any).textTransform === 'lowercase') {
+          content = content.toLowerCase();
+        }
+        
+        pptSlide.addText(content, textOpts);
       } else if (el.type === 'image') {
         // Render icons/images
         pptSlide.addImage({

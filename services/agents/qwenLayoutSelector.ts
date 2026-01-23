@@ -10,8 +10,20 @@ import {
 import { CostTracker } from "../interactionsClient";
 import { autoRepairSlide } from "../repair/autoRepair";
 import { generateSvgProxy } from "../visual/svgProxy";
+import { 
+    QWEN_PERSONAS, 
+    LAYOUT_SELECTOR_PROMPT, 
+    buildQwenMessage,
+    getQwenRequestConfig,
+    getThinkingMode 
+} from "../visual/qwenPromptConfig";
 
 // --- QWEN LAYOUT SELECTOR (Visual QA-driven layout choice) ---
+// 
+// Optimized for Qwen3-VL's architecture:
+// - Uses /no_think mode for fast perception-only scoring
+// - Layout Selector persona for focused evaluation
+// - Minimal token output for rapid iteration
 
 function buildMockComponentsFromContentPlan(
     contentPlan: any,
@@ -182,7 +194,7 @@ export async function runQwenLayoutSelector(
     constraints?: RouterConstraints,
     componentsOverride?: any[]
 ): Promise<RouterDecision> {
-    const { isQwenVLAvailable, getVisualCritiqueFromSvg } = await import('../visualCortex');
+    const { isQwenVLAvailable, getLayoutScoreFast, getVisualCritiqueFromSvg } = await import('../visualCortex');
 
     if (!isQwenVLAvailable()) {
         return baseRouterConfig;
@@ -226,8 +238,21 @@ export async function runQwenLayoutSelector(
 
         try {
             const svgProxy = generateSvgProxy(mockSlide, styleGuide);
-            const critique = await getVisualCritiqueFromSvg(svgProxy, costTracker);
-            let score = critique?.overall_score ?? -1;
+            
+            // Use fast-path scoring for layout selection (optimized for /no_think mode)
+            // Falls back to full critique if fast scoring unavailable
+            let score: number = -1;
+            
+            const fastScore = await getLayoutScoreFast(svgProxy, costTracker);
+            if (fastScore && typeof fastScore.overall_score === 'number') {
+                score = fastScore.overall_score;
+                console.log(`[QWEN LAYOUT SELECTOR] Fast score for ${variant}: ${score} (issue: ${fastScore.primary_issue || 'none'})`);
+            } else {
+                // Fallback to full critique
+                const critique = await getVisualCritiqueFromSvg(svgProxy, costTracker);
+                score = critique?.overall_score ?? -1;
+                console.log(`[QWEN LAYOUT SELECTOR] Full critique for ${variant}: ${score}`);
+            }
 
             const warnings = mockSlide.warnings || [];
             const hasTruncation = warnings.some(w => String(w).toLowerCase().includes('truncated'));
@@ -238,7 +263,7 @@ export async function runQwenLayoutSelector(
                 console.log(`[QWEN LAYOUT SELECTOR] Penalty applied for warnings (${penalty}): ${warnings.join(' | ')}`);
             }
 
-            console.log(`[QWEN LAYOUT SELECTOR] Variant ${variant} score: ${score}`);
+            console.log(`[QWEN LAYOUT SELECTOR] Variant ${variant} final score: ${score}`);
 
             if (score > bestScore) {
                 bestScore = score;

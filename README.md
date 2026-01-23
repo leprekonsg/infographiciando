@@ -11,7 +11,7 @@ InfographIQ transforms a simple topic into a professional, data-driven presentat
 The system employs a multi-agent pipeline where each agent has a focused responsibility:
 
 ```
-Topic → Researcher → Architect → Router → Content Planner → Visual Designer → Generator → Renderer → PPTX
+Topic → Researcher → Architect → Router → Content Planner → Composition Architect → Visual Designer → Generator → Renderer → PPTX
 ```
 
 ### Agent Pipeline
@@ -22,6 +22,7 @@ Topic → Researcher → Architect → Router → Content Planner → Visual Des
 | **Architect** | Gemini 3 Flash | Structures narrative arc, clusters facts, defines style guide |
 | **Router** | Gemini 2.5 Flash | Classifies layout variant and render mode per slide |
 | **Content Planner** | Gemini 3 Flash | Extracts key points and data from assigned fact clusters |
+| **Composition Architect** | Gemini 3 Flash | Determines layered structure, primitives, and "surprise" elements |
 | **Visual Designer** | Gemini 3 Flash | Creates spatial composition spec with color harmony |
 | **Generator** | Gemini 3 Flash | Produces final slide JSON with component layout |
 | **Image Generator** | Gemini 3 Pro Image | Renders background visuals from composed prompts |
@@ -41,9 +42,10 @@ Based on [Phil Schmid's agent best practices](https://www.philschmid.de/building
 ## Features
 
 - **Agentic Generation** — Full deck creation with real-time agent activity feed
-- **Spatial Layout Engine** — Zone-based component allocation with affinity matching
-- **Visual Design RLM Loop** — Iterative refinement with validation feedback
-- **Auto-Repair Pipeline** — Deterministic JSON normalization and component type mapping
+- **Serendipity Engine** — Controlled variation system with "surprise slots" and variation budgets
+- **Layered Spatial Engine** — Background → Decorative → Content → Overlay stack for modern design
+- **Visual Architect (Qwen-VL)** — Vision-first critique and repair loop with SVG-to-PNG proxy and structured repair application
+- **Auto-Repair Pipeline** — Deterministic JSON normalization, component type mapping, and context-aware fallback recovery
 - **PPTX Export** — Native PowerPoint output preserving layouts, images, and speaker notes
 - **Cost Optimized** — ~$0.18/deck (60% savings vs naive Pro usage)
 
@@ -134,19 +136,20 @@ The generator produces slides using these component primitives:
 | `process-flow` | 3-5 step horizontal flow |
 | `icon-grid` | 2-4 column grid with icons |
 | `chart-frame` | Bar, pie, line, or doughnut chart |
+| `diagram-svg` | Complex SVG-based diagram (e.g., SWOT) |
 
 ---
 
-## Validation
+## Validation & Recovery
 
-Each slide passes through:
+Each slide passes through a deterministic pipeline:
 
-1. **Schema Validation** — Zod parsing against `SlideNodeSchema`
-2. **Auto-Repair** — Component type normalization, deduplication, garbage removal
-3. **Visual Alignment** — Spatial zone compatibility check
-4. **Density Check** — Text overflow and item count limits
+1. **Schema Validation** — Zod parsing with custom error classification (truncation vs. schema)
+2. **Auto-Repair** — Normalization of types, junk removal, and context-aware content fallback
+3. **Spatial Preflight** — Zone allocation, affinity matching, and density overflow checks
+4. **Vision-First Architect** — Optional Qwen-VL closed-loop refinement for spatial perfection
 
-Failed validation triggers the RLM loop for targeted regeneration.
+Failed slides trigger a **Circuit Breaker** which reroutes the slide back to the Architect/Router with more restrictive layout constraints.
 
 ---
 

@@ -83,6 +83,7 @@ AGENT 2: Architect (MODEL_AGENTIC, thinking=medium)
 FOR EACH SLIDE (sequential, with context folding)
      ├─ Router (MODEL_SIMPLE) → RouterDecision
      ├─ Content Planner (MODEL_AGENTIC, thinking=low) → ContentPlan
+     ├─ Composition Architect (MODEL_AGENTIC) → CompositionPlan
      ├─ Qwen Layout Selector (optional, Node-only) → RouterDecision override
      ├─ Visual Designer (MODEL_AGENTIC, thinking=low) → VisualDesignSpec
      └─ Generator (MODEL_AGENTIC, thinking=none)
@@ -100,23 +101,31 @@ OUTPUT: EditableSlideDeck
 
 **Context Folding:** The last 2 slides are passed into content planning and generation as narrative trail.
 
+**Serendipity DNA:** On first slide, the Architect's styleGuide is converted to `SerendipityDNA` (motifs, texture, gridRhythm) which governs the variation strategy for the entire deck.
+
+**Variation Budgeting:** Each slide is assigned a `VariationBudget` (computeDetailedVariationBudget) based on its index and type, controlling how much the Composition Architect can deviate from standard patterns.
+
 **Circuit Breaker:** Low fit score or critical validation issues trigger reroute with layout constraints.
 
 ---
 
 ## 5) System 2 Visual Critique (Current)
 
-**Internal Critique (always available):**
-- `runVisualCritique()` → lightweight layout critique (MODEL_SIMPLE)
+**Vision-First Interior Designer (Qwen-VL Architect):**
+- `runQwenVisualArchitectLoop()` → Multi-turn visual optimization (Node-only)
+- SVG Proxy → PNG (resvg) → Qwen-VL → `RepairAction[]`
+- `applyRepairsToSlide()` → Normalizes repairs and injects layout hints (`_hintY`, `_hintPadding`, etc.)
+- Bounded recursion (MAX_ROUNDS=3) with improvement-delta tracking
 
-**External Critique (optional, Node-only):**
-- `visualCortex.getVisualCritiqueFromSvg()`
-- SVG proxy → PNG (resvg) → Qwen3-VL
-- Used for richer issue detection and spatial diagnostics
+**Internal QA Guard (always available):**
+- `runVisualCritique()` → Lightweight semantic/layout critique (MODEL_SIMPLE)
+- `ContentPlan` alignment verification and fit-score calculation
+- Circuit-breaker triggers on `ERR_ITEM_COUNT_CRITICAL` or low fit-score
 
-**Repair loop:**
-- Critique issues inform `runLayoutRepair()` when needed
-- Bounded recursion (MAX_ROUNDS=3) with persistent-issue detection
+**Fidelity Contract:**
+- Critique and repair use `svg-proxy` for speed and determinism
+- Final rendering uses `pptx-render` logic inside components
+- Spatial engine respects `RepairAction` hints to fix overlap/spacing issues
 
 ---
 
@@ -208,14 +217,18 @@ Cost tracking is centralized in `CostTracker`:
 | File | Purpose |
 |------|---------|
 | [services/slideAgentService.ts](../services/slideAgentService.ts) | Orchestrator: `generateAgenticDeck()`, reroute logic, System 2 loop |
+| [services/agents/compositionArchitect.ts](../services/agents/compositionArchitect.ts) | Composition Architect: Layer planning & surprise allocation |
 | [services/interactionsClient.ts](../services/interactionsClient.ts) | Interactions API client + CostTracker |
 | [services/visualDesignAgent.ts](../services/visualDesignAgent.ts) | Visual Designer + Critique + Repair |
 | [services/spatialRenderer.ts](../services/spatialRenderer.ts) | Layout templates + zone allocation |
 | [services/infographicRenderer.ts](../services/infographicRenderer.ts) | Slide compilation + color normalization |
+| [services/cardRenderer.ts](../services/cardRenderer.ts) | Glass card rendering logic |
+| [services/decorativeRenderer.ts](../services/decorativeRenderer.ts) | Badges, dividers, and accent shapes rendering |
 | [services/visualCortex.ts](../services/visualCortex.ts) | Qwen-VL integration (Node-only) |
 | [services/visualRasterizer.ts](../services/visualRasterizer.ts) | resvg-based SVG → PNG rasterization |
 | [services/image/imageGeneration.ts](../services/image/imageGeneration.ts) | Gemini Image generation (Flash → Pro fallback) |
 | [types/slideTypes.ts](../types/slideTypes.ts) | Zod schemas + shared types |
+| [types/serendipityTypes.ts](../types/serendipityTypes.ts) | Serendipity engine types & schemas |
 
 ---
 
@@ -227,6 +240,7 @@ Cost tracking is centralized in `CostTracker`:
 | Architect | gemini-3-flash-preview | medium | Narrative + outline planning |
 | Router | gemini-2.5-flash | none | Enum classification |
 | Content Planner | gemini-3-flash-preview | low | Key points & data points |
+| Composition Architect | gemini-3-flash-preview | low | Layered structure & surprises |
 | Visual Designer | gemini-3-flash-preview | low | Visual composition |
 | Generator | gemini-3-flash-preview | none | Final slide assembly |
 | Image Gen | gemini-2.5-flash-image → gemini-3-pro-image-preview | - | Background-only images |
@@ -247,6 +261,28 @@ App.tsx
               ├── BuilderCanvas.tsx (spatial preview)
               └── ActivityFeed.tsx (agent logs)
 ```
+
+---
+
+## 14) Serendipity Engine: Layered Composition
+
+The system has evolved from flat templates to a **Layered Composition Model** managed by the Composition Architect.
+
+### 14.1) Explicit Layer Stack
+1. **Background Layer**: Solid, gradients, or mesh patterns (generated via Image Gen).
+2. **Decorative Layer**: Non-content elements like **Badges**, **Dividers**, **Accent Shapes**, and **Glows**.
+3. **Content Layer**: The core data viz, cards, and text blocks.
+4. **Overlay Layer**: Floating highlights or micro-annotations.
+
+### 14.2) Surprise Slot System
+Based on the `VariationBudget`, slides are allocated "surprise slots" where specialized elements (like category badges or asymmetric spacing) are injected to break repetition.
+
+### 14.3) Compositional Primitives
+Moving beyond 6 rigid types to a vocabulary of atoms:
+- **Badge**: { icon, label, color } for categorization.
+- **Card**: { style: glass|solid|outline } with structured headers.
+- **Divider**: Gradient or glowing separators.
+- **IconContainer**: Circle, square, or rounded-square containers.
 
 ---
 

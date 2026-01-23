@@ -81,17 +81,96 @@ const LAYOUT_TEMPLATES: Record<string, SpatialZone[]> = {
   ]
 };
 
+// ============================================================================
+// PREMIUM THEME TOKENS
+// ============================================================================
+// These tokens define the visual language for premium-quality slides.
+// Designed based on analysis of Fortune 500 CEO presentations and TED talks.
+// Key principles: Breathing room, clear hierarchy, subtle sophistication.
+
 const DEFAULT_THEME_TOKENS = {
   typography: {
-    scale: { hero: 42, title: 32, subtitle: 20, body: 14, label: 10, metric: 24, micro: 9 },
-    weights: { hero: 700, title: 700, subtitle: 600, body: 400, label: 600, metric: 700 },
-    lineHeights: { title: 1.1, body: 1.25 },
-    letterSpacing: { title: 0.2, body: 0 }
+    // Scale refined for clear visual hierarchy
+    // Hero should POP, body should be comfortable, micro for annotations
+    scale: {
+      hero: 48,      // Increased from 42 for maximum impact
+      title: 36,     // Increased from 32 for better hierarchy
+      subtitle: 22,  // Increased from 20 for readability
+      body: 15,      // Increased from 14 for comfortable reading
+      label: 11,     // Increased from 10
+      metric: 28,    // Increased from 24 - metrics should be prominent
+      overline: 10,  // NEW: For category labels and badges
+      micro: 9
+    },
+    // Weights for typography hierarchy
+    // Notable: hero is extra bold, subtitle is lighter than title
+    weights: {
+      hero: 800,     // Extra bold for hero elements
+      title: 700,
+      subtitle: 500, // Lighter contrast with title (was 600)
+      body: 400,
+      label: 600,
+      metric: 700,
+      overline: 600
+    },
+    lineHeights: {
+      title: 1.15,   // Slightly increased from 1.1
+      body: 1.35     // Increased from 1.25 for readability
+    },
+    // NEW: Letter spacing for professional polish
+    // Overlines need spread out letters, hero gets slight breathing room
+    letterSpacing: {
+      hero: 0.5,     // Slight breathing room for hero
+      title: 0.3,
+      subtitle: 0.1,
+      overline: 1.5, // Spread out for category labels
+      body: 0
+    }
   },
-  spacing: { xs: 0.08, sm: 0.12, md: 0.2, lg: 0.32 },
-  radii: { card: 0.18, pill: 0.4 },
-  surfaces: { cardStyle: 'glass', borderWidth: 1.2, opacity: 0.65 }
+  // Spacing increased for breathing room (less cramped = more professional)
+  spacing: {
+    xs: 0.1,    // Was 0.08
+    sm: 0.16,   // Was 0.12 - increased for less cramped feel
+    md: 0.28,   // Was 0.2
+    lg: 0.4,    // Was 0.32 - allow generous whitespace
+    xl: 0.56    // NEW: Extra large spacing for major sections
+  },
+  // Premium radii - slightly larger for modern feel
+  radii: {
+    card: 0.2,    // Was 0.18
+    pill: 0.45,   // Was 0.4
+    badge: 0.5    // NEW: Fully rounded badge pills
+  },
+  // Premium surface treatments - much more subtle than before
+  surfaces: {
+    cardStyle: 'glass',
+    borderWidth: 1.0,    // Thinner, more elegant (was 1.2)
+    opacity: 0.12,       // Much lower opacity for subtlety (was 0.65!)
+    borderOpacity: 0.25  // NEW: Subtle borders
+  },
+  // NEW: Premium color tokens for consistent theming
+  premiumColors: {
+    // Dark corporate palette (from reference image analysis)
+    background: {
+      primary: '#0c1425',    // Deep navy
+      secondary: '#141f35',  // Slightly lighter navy
+      card: '#1a2744'        // Card backgrounds
+    },
+    accent: {
+      primary: '#3b82f6',    // Vibrant blue
+      secondary: '#22d3ee',  // Cyan accent
+      warning: '#fbbf24',    // Warm warning (amber)
+      success: '#10b981',    // Green
+      danger: '#ef4444'      // Red for problems/warnings
+    },
+    text: {
+      primary: '#f8fafc',    // Near-white
+      secondary: '#94a3b8',  // Muted slate
+      muted: '#64748b'       // Very muted for annotations
+    }
+  }
 };
+
 
 export class SpatialLayoutEngine {
   // GAP 5: Track rendering warnings (truncation, overflow, etc.)
@@ -409,7 +488,7 @@ export class SpatialLayoutEngine {
       // Filter out previous spatial warnings (those matching known patterns)
       const spatialPatterns = /truncated|hidden|unplaced|overflow|bullets.*requires/i;
       const existingNonSpatialWarnings = (slide.warnings || []).filter(w => !spatialPatterns.test(w));
-      
+
       // Combine non-spatial warnings with new spatial warnings
       slide.warnings = [...existingNonSpatialWarnings, ...spatialWarnings];
       console.warn(`[SPATIAL RENDERER] ${spatialWarnings.length} rendering warning(s) for slide "${slide.title}"`);
@@ -433,13 +512,13 @@ export class SpatialLayoutEngine {
     // At 14pt, typical character widths:
     // - Proportional (Inter, Arial): ~0.08 inches per char → ~12.5 chars/inch → 12.5 chars/unit
     // - Monospace (Fira Code, Courier): ~0.12 inches per char → ~8.3 chars/inch → 8.3 chars/unit
-    
+
     const isMonospace = fontFamily && /mono|code|courier|consolas|fira.*code|source.*code/i.test(fontFamily);
     const baseCharsPerUnit = isMonospace ? 8.3 : 12.5; // chars per unit at 14pt
-    
+
     // Scale by font size (smaller font = more chars per unit)
     const effectiveCharsPerUnit = baseCharsPerUnit * (14 / fontSizePoints);
-    
+
     // Account for zone padding (typically 5% on each side)
     const usableWidth = zoneWidthUnits * 0.9;
     const maxCharsPerLine = Math.max(10, Math.floor(usableWidth * effectiveCharsPerUnit));
@@ -466,29 +545,29 @@ export class SpatialLayoutEngine {
       accent: normalizeColor(styleGuide.colorPalette.accentHighContrast),
       background: normalizeColor(styleGuide.colorPalette.background)
     };
-    
+
     // Apply repair hints if present (from visual repair system)
     const compAny = comp as any;
     let { x, y, w, h } = zone;
-    
+
     // Apply position hints (override zone defaults)
     if (typeof compAny._hintX === 'number') x = compAny._hintX;
     if (typeof compAny._hintY === 'number') y = compAny._hintY;
-    
+
     // Apply size hints (clamp to zone bounds for safety)
     if (typeof compAny._hintWidth === 'number') w = Math.min(compAny._hintWidth, zone.w);
     if (typeof compAny._hintHeight === 'number') h = Math.min(compAny._hintHeight, zone.h);
-    
+
     // Apply color hints
     if (compAny._hintColor) {
       p.text = normalizeColor(compAny._hintColor);
     }
-    
+
     const els: VisualElement[] = [];
 
     // Get spacing values, applying hints if present
     const baseSpacing = themeTokens.spacing;
-    const spacingMultiplier = typeof compAny._hintPadding === 'number' 
+    const spacingMultiplier = typeof compAny._hintPadding === 'number'
       ? compAny._hintPadding / (baseSpacing.md * 10) // Normalize hint to multiplier
       : 1.0;
     const spacing = {
@@ -498,7 +577,7 @@ export class SpatialLayoutEngine {
       lg: baseSpacing.lg * spacingMultiplier,
       xl: baseSpacing.xl * spacingMultiplier
     };
-    
+
     const cardRadius = themeTokens.radii.card;
     const cardStyle = themeTokens.surfaces.cardStyle;
     const cardBorderWidth = themeTokens.surfaces.borderWidth;
@@ -516,12 +595,12 @@ export class SpatialLayoutEngine {
 
     // Scale fonts based on zone purpose (Hierarchy)
     const scale = zone.purpose === 'hero' ? 1.2 : (zone.purpose === 'accent' ? 0.85 : 1.0);
-    
+
     // Apply line height hint if present (affects text vertical spacing)
-    const lineHeightMultiplier = typeof compAny._hintLineHeight === 'number' 
-      ? compAny._hintLineHeight 
+    const lineHeightMultiplier = typeof compAny._hintLineHeight === 'number'
+      ? compAny._hintLineHeight
       : 1.0;
-    
+
     // Apply item spacing hint if present (affects spacing between list items)
     const itemSpacingMultiplier = typeof compAny._hintItemSpacing === 'number'
       ? compAny._hintItemSpacing
@@ -529,56 +608,60 @@ export class SpatialLayoutEngine {
 
     if (comp.type === 'text-bullets') {
       let contentScale = scale;
-      const lines = comp.content || [];
+      let lines = comp.content || [];
       const hasTitle = !!comp.title;
 
+      // ENHANCED OVERFLOW PREVENTION: If we have too many lines for the zone, try these in order:
+      // 1. Auto-scale text down to fit
+      // 2. If scaling isn't enough, truncate character count per line
+      // 3. As last resort, drop lines (current behavior)
+
       // Estimate wrapped line count BEFORE calculating fit
-      // Note: We use 14 * scale as approximate point size reference for wrapping
       const estimatedWrappedLines = this.estimateWrappedLineCount(lines, zone.w, 14 * scale);
 
       // Calculate required height WITH wrapping
       const titleHeightFactor = hasTitle ? 0.7 : 0;
-      // Each wrapped line takes space. 
-      // Logic: (TotalWrappedLines - 1) * spacing + height.
-      // Or simply: Sum of lines * height? 
-      // render loop uses: spacing (0.6) for each bullet item start, plus extra for wrapped lines.
-      // Let's approximate: 1 unit per bullet? No, spacing is 0.6.
-      // If 4 lines, 4 * 0.6 + 0.5 (last line height) = 2.9?
-      // With wrapping: 
-      // If we have 'estimatedWrappedLines' total visual lines.
-      // The spacing logic in loop is: curY += advance. 
-      // advance = 0.6 + (extra_wrapped_lines * 0.5).
-      // So total height ~= sum(advance).
-      // If N bullets, K total wrapped lines (where K >= N).
-      // (K - N) extra wrapped lines.
-      // Height = (N * 0.6) + ((K - N) * 0.5) roughly? Plus slight buffer.
-
-      // User's formula: (estimatedWrappedLines - 1) * 0.6 + 0.5
-      // This assumes uniform spacing 0.6 for ALL lines? 
-      // Actually standard spacing for wrapped lines might be tighter than between bullets.
-      // But let's stick to the user's requested formula structure if possible, 
-      // OR use a safe approximation.
-      // User provided: "wrappedLinesHeightFactor = (estimatedWrappedLines - 1) * 0.6 + 0.5"
-      // This is a safe upper bound assuming every line (bullet or wrapped) takes 0.6 spacing.
       const wrappedLinesHeightFactor = estimatedWrappedLines > 0 ? ((estimatedWrappedLines - 1) * 0.6) + 0.5 : 0;
-
       const requiredFactor = titleHeightFactor + wrappedLinesHeightFactor;
-
       const requiredH = requiredFactor * scale;
+
       if (requiredH > h) {
         const fitScale = h / requiredFactor;
-        const minScale = scale * 0.5;
+        const minScale = scale * 0.4; // More aggressive minimum (was 0.5)
 
         if (fitScale < minScale) {
-          this.addWarning(
-            `Text truncated in zone '${zone.id}': ` +
-            `${lines.length} bullets (${estimatedWrappedLines} wrapped lines) ` +
-            `requires ${(requiredH).toFixed(2)} units but only ${h} available`
-          );
-          contentScale = minScale;
+          // STRATEGY 1: Try truncating each line to fit
+          // Calculate how much we need to reduce
+          const overflowRatio = requiredH / h;
+          if (overflowRatio < 2.0 && lines.length <= 4) {
+            // Moderate overflow - try shortening lines instead of dropping
+            const targetCharsPerLine = Math.floor(60 / overflowRatio);
+            lines = lines.map(line => {
+              if (line.length > targetCharsPerLine) {
+                return line.slice(0, targetCharsPerLine - 1) + '…';
+              }
+              return line;
+            });
+            // Recalculate with shorter lines
+            const newWrapped = this.estimateWrappedLineCount(lines, zone.w, 14 * scale);
+            const newRequired = (titleHeightFactor + (newWrapped > 0 ? ((newWrapped - 1) * 0.6) + 0.5 : 0)) * scale;
+            if (newRequired <= h) {
+              contentScale = scale; // No scaling needed after truncation
+            } else {
+              // Still need some scaling
+              contentScale = Math.max(minScale, h / ((titleHeightFactor + (newWrapped > 0 ? ((newWrapped - 1) * 0.6) + 0.5 : 0))));
+            }
+          } else {
+            // STRATEGY 2: Heavy overflow - use minimum scale and will drop lines if needed
+            this.addWarning(
+              `Text truncated in zone '${zone.id}': ` +
+              `${lines.length} bullets (${estimatedWrappedLines} wrapped lines) ` +
+              `requires ${(requiredH).toFixed(2)} units but only ${h} available`
+            );
+            contentScale = minScale;
+          }
         } else {
           contentScale = fitScale;
-          // console.debug(`[SpatialRenderer] Auto-scaled text in '${zone.id}' from ${scale} to ${contentScale.toFixed(2)}`);
         }
       }
 
@@ -609,9 +692,9 @@ export class SpatialLayoutEngine {
         const line = lines[i];
 
         const currentFontSize = themeTokens.typography.scale.body * contentScale;
-        
+
         // Font-aware character width estimation
-        const isMonospace = styleGuide.fontFamilyBody && 
+        const isMonospace = styleGuide.fontFamilyBody &&
           /mono|code|courier|consolas|fira.*code|source.*code/i.test(styleGuide.fontFamilyBody);
         const baseCharsPerUnit = isMonospace ? 8.3 : 12.5; // chars per unit at 14pt
         const effectiveCharsPerUnit = baseCharsPerUnit * (14 / currentFontSize);
@@ -966,7 +1049,8 @@ export class SpatialLayoutEngine {
       },
       spacing: { ...DEFAULT_THEME_TOKENS.spacing, ...(tokens.spacing || {}) },
       radii: { ...DEFAULT_THEME_TOKENS.radii, ...(tokens.radii || {}) },
-      surfaces: { ...DEFAULT_THEME_TOKENS.surfaces, ...(tokens.surfaces || {}) }
+      surfaces: { ...DEFAULT_THEME_TOKENS.surfaces, ...(tokens.surfaces || {}) },
+      premiumColors: DEFAULT_THEME_TOKENS.premiumColors
     };
   }
 
@@ -1195,7 +1279,7 @@ export function createEnvironmentSnapshot(
   ).length;
 
   return {
-    slideId: slide.id || slide.title || 'unknown',
+    slideId: slide.title || `slide-${slide.order}` || 'unknown',
     fit_score,
     text_density: textDensity,
     visual_utilization: avgUtilization,
@@ -1240,12 +1324,12 @@ export function renderWithLayeredComposition(
   getDiagramUrl?: (comp: any) => string | undefined
 ): VisualElement[] {
   const elements: VisualElement[] = [];
-  
+
   // Import decorative and card renderers dynamically to avoid circular deps
   // In production, these would be imported at top of file
   let decorativeRenderers: typeof import('./decorativeRenderer') | null = null;
   let cardRenderers: typeof import('./cardRenderer') | null = null;
-  
+
   try {
     // Dynamic imports for optional serendipity renderers
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -1255,7 +1339,7 @@ export function renderWithLayeredComposition(
   } catch (e) {
     console.warn('[SpatialRenderer] Serendipity renderers not available, using fallback');
   }
-  
+
   const palette = {
     primary: normalizeColor(styleGuide?.colorPalette?.primary, '22C55E'),
     secondary: normalizeColor(styleGuide?.colorPalette?.secondary, '38BDF8'),
@@ -1264,7 +1348,7 @@ export function renderWithLayeredComposition(
     text: normalizeColor(styleGuide?.colorPalette?.text, 'F1F5F9'),
     textMuted: normalizeColor(styleGuide?.colorPalette?.text, 'A1A1AA')
   };
-  
+
   const iconCache = new Map<string, string>();
   // Pre-populate icon cache from getIconUrl callback
   const populateIcon = (name: string) => {
@@ -1273,14 +1357,14 @@ export function renderWithLayeredComposition(
       if (url) iconCache.set(name, url);
     }
   };
-  
+
   // Validate composition plan
   if (!compositionPlan || !compositionPlan.layerPlan) {
     console.warn('[renderWithLayeredComposition] Invalid composition plan, falling back to standard render');
     const engine = new SpatialLayoutEngine();
     return engine.renderWithSpatialAwareness(slide, styleGuide, getIconUrl, slide.visualDesignSpec, getDiagramUrl);
   }
-  
+
   // --- LAYER 1: DECORATIVE ELEMENTS (z-index 10-19) ---
   if (decorativeRenderers && compositionPlan.layerPlan.decorativeElements?.length > 0) {
     const decorativeContext = {
@@ -1288,19 +1372,19 @@ export function renderWithLayeredComposition(
       iconCache,
       baseZIndex: 10
     };
-    
+
     // Convert composition plan decorative elements to renderable format
     const decorativeElements = compositionPlan.layerPlan.decorativeElements
       .filter((el: any) => el && el.type)
       .map((el: any, idx: number) => {
         // Map placement strings to actual positions
         const position = mapPlacementToPosition(el.placement, el.type);
-        
+
         // Pre-populate icon if needed
         if (el.type === 'badge' && el.icon) {
           populateIcon(el.icon);
         }
-        
+
         return {
           type: el.type,
           position,
@@ -1313,15 +1397,34 @@ export function renderWithLayeredComposition(
           shape: 'underline'
         };
       });
-    
+
     elements.push(...decorativeRenderers.renderDecorativeLayer(decorativeElements, decorativeContext));
   }
-  
+
+  // --- SLIDE TITLE (z-index 15 - between decorative and content) ---
+  // Always render the slide title in layer-based mode
+  const titleElement: VisualElement = {
+    type: 'text',
+    content: slide.title || 'Untitled',
+    x: 0.5,
+    y: 0.5,
+    w: 9,
+    h: 0.9,
+    fontSize: DEFAULT_THEME_TOKENS.typography.scale.title,
+    color: palette.text,
+    bold: true,
+    align: 'left',
+    zIndex: 15,
+    letterSpacing: DEFAULT_THEME_TOKENS.typography.letterSpacing.title,
+    fontWeight: DEFAULT_THEME_TOKENS.typography.weights.title
+  };
+  elements.push(titleElement);
+
   // --- LAYER 2: CONTENT (z-index 20-59) ---
   // For now, delegate to standard component rendering
   // In full implementation, would use cardRenderers for card-based layouts
   const contentStructure = compositionPlan.layerPlan.contentStructure;
-  
+
   if (contentStructure.pattern === 'card-row' || contentStructure.pattern === 'narrative-flow') {
     // Use card-based rendering if available
     if (cardRenderers && slide.layoutPlan?.components) {
@@ -1330,16 +1433,16 @@ export function renderWithLayeredComposition(
         iconCache,
         baseZIndex: 20
       };
-      
+
       // Convert components to cards and render
       // This is a simplified version - full implementation would map component types to cards
       const components = slide.layoutPlan.components;
-      const cardCount = contentStructure.cardCount || components.length;
-      const gap = 0.2;
+      const cardCount = contentStructure.cardCount || Math.min(components.length, 4);
+      const gap = DEFAULT_THEME_TOKENS.spacing.md;
       const cardWidth = (9 - (gap * (cardCount - 1))) / cardCount;
-      const cardY = 1.5;
-      const cardH = 3.5;
-      
+      const cardY = 1.6; // Below title with breathing room
+      const cardH = 3.8;
+
       // Collect all icons from components for pre-caching
       components.forEach((comp: any) => {
         if (comp.type === 'metric-cards') {
@@ -1352,26 +1455,53 @@ export function renderWithLayeredComposition(
           (comp.items || []).forEach((item: any) => item.icon && populateIcon(item.icon));
         }
       });
-      
-      // For narrative-flow, render each component as a card
+
+      // Narrative-flow pattern: Specialized 3-card story layout
+      // Card 1: 🔺 THE PROBLEM - Card 2: 💡 THE INSIGHT - Card 3: 🚀 THE SOLUTION
+      const narrativeIcons = ['AlertTriangle', 'Lightbulb', 'Rocket'];
+      const narrativeOverlines = ['THE CHALLENGE', 'THE APPROACH', 'THE OUTCOME'];
+      const narrativeColors = [
+        palette.accent,    // Warning/problem color
+        palette.primary,   // Insight/solution color  
+        palette.secondary  // Vision/outcome color
+      ];
+
+      // For narrative-flow, render each component as a premium card
       components.slice(0, cardCount).forEach((comp: any, idx: number) => {
         const cardX = 0.5 + (idx * (cardWidth + gap));
-        
-        // Extract card content from component
+
+        // Smart content extraction based on component type
         let title = '';
         let body = '';
-        let icon = 'AlertCircle';
-        
-        if (comp.type === 'text-bullets' && comp.content?.length > 0) {
-          title = comp.title || comp.content[0];
-          body = comp.content.slice(1).join('. ');
+        let icon = narrativeIcons[idx] || 'HelpCircle';
+        let overline = narrativeOverlines[idx] || '';
+        let iconColor = narrativeColors[idx] || palette.primary;
+
+        if (comp.type === 'text-bullets') {
+          const content = Array.isArray(comp.content) ? comp.content : [];
+          title = comp.title || content[0] || 'Point';
+          body = content.slice(1, 4).join(' • ') || ''; // First 3 bullets as body
         } else if (comp.type === 'metric-cards' && comp.metrics?.length > 0) {
           const metric = comp.metrics[0];
-          title = metric.label;
-          body = metric.value;
-          icon = metric.icon || 'TrendingUp';
+          title = metric.label || 'Metric';
+          body = String(metric.value || '');
+          icon = metric.icon || icon;
+        } else if (comp.type === 'process-flow' && comp.steps?.length > 0) {
+          const step = comp.steps[idx] || comp.steps[0];
+          overline = `STEP ${idx + 1}`;
+          title = step.title || step.label || 'Step';
+          body = step.description || '';
+          icon = step.icon || icon;
+        } else if (comp.type === 'icon-grid' && comp.items?.length > 0) {
+          const item = comp.items[idx] || comp.items[0];
+          title = item.label || 'Item';
+          body = item.description || '';
+          icon = item.icon || icon;
         }
-        
+
+        // Use narrative-flow pattern only when appropriate
+        const isNarrativeFlow = contentStructure.pattern === 'narrative-flow';
+
         const cardElement = {
           id: `content-card-${idx}`,
           position: { x: cardX, y: cardY, w: cardWidth, h: cardH },
@@ -1379,13 +1509,14 @@ export function renderWithLayeredComposition(
           header: {
             icon,
             iconContainer: 'circle' as const,
-            iconColor: palette.primary,
+            iconColor: isNarrativeFlow ? iconColor : palette.primary,
+            overline: isNarrativeFlow ? overline : undefined,
             title
           },
           body,
           emphasis: idx === 0 ? 'primary' as const : 'secondary' as const
         };
-        
+
         elements.push(...cardRenderers.renderCard(cardElement, {
           ...cardContext,
           baseZIndex: 20 + (idx * 10)
@@ -1396,13 +1527,13 @@ export function renderWithLayeredComposition(
     // Fall back to standard spatial rendering for other patterns
     const engine = new SpatialLayoutEngine();
     const standardElements = engine.renderWithSpatialAwareness(
-      slide, 
-      styleGuide, 
-      getIconUrl, 
-      slide.visualDesignSpec, 
+      slide,
+      styleGuide,
+      getIconUrl,
+      slide.visualDesignSpec,
       getDiagramUrl
     );
-    
+
     // Adjust z-indices for layer ordering
     standardElements.forEach(el => {
       if ('zIndex' in el && typeof el.zIndex === 'number') {
@@ -1411,20 +1542,20 @@ export function renderWithLayeredComposition(
         (el as any).zIndex = 20;
       }
     });
-    
+
     elements.push(...standardElements);
   }
-  
+
   // --- LAYER 3: OVERLAY (z-index 80-99) ---
   // Reserved for future overlay elements (tooltips, callouts)
-  
+
   // Sort all elements by z-index for proper rendering order
   elements.sort((a, b) => {
     const zA = 'zIndex' in a ? (a.zIndex || 0) : 0;
     const zB = 'zIndex' in b ? (b.zIndex || 0) : 0;
     return zA - zB;
   });
-  
+
   return elements;
 }
 
@@ -1432,7 +1563,7 @@ export function renderWithLayeredComposition(
  * Maps placement strings from composition plan to actual slide coordinates
  */
 function mapPlacementToPosition(
-  placement: string | undefined, 
+  placement: string | undefined,
   elementType: string
 ): { x: number; y: number; w: number; h: number } {
   // Default positions for different placement strings
@@ -1445,7 +1576,7 @@ function mapPlacementToPosition(
     'bottom-left': { x: 0.5, y: 5.0, w: 2.5, h: 0.35 },
     'bottom-center': { x: 3.75, y: 5.0, w: 2.5, h: 0.35 }
   };
-  
+
   // Type-specific defaults
   const typeDefaults: Record<string, string> = {
     'badge': 'top-left',
@@ -1453,9 +1584,9 @@ function mapPlacementToPosition(
     'accent-shape': 'below-title',
     'glow': 'center'
   };
-  
+
   const normalizedPlacement = (placement || '').toLowerCase().replace(/\s+/g, '-');
   const defaultPlacement = typeDefaults[elementType] || 'top-left';
-  
+
   return positions[normalizedPlacement] || positions[defaultPlacement] || positions['top-left'];
 }

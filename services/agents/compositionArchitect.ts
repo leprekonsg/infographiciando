@@ -47,14 +47,58 @@ const COMPOSITION_ARCHITECT_MODEL = MODEL_SIMPLE;
 // PROMPTS
 // ============================================================================
 
-const COMPOSITION_ARCHITECT_ROLE = `You are a Visual Composition Architect specializing in modern, layer-based slide design.
-Your job is to plan the STRUCTURE of a slide using explicit layers and compositional primitives.
+const COMPOSITION_ARCHITECT_ROLE = `You are an Elite Visual Composition Architect with 20+ years designing presentations for Fortune 500 CEOs and TED speakers.
+Your job is to plan the STRUCTURE of a slide using explicit layers and compositional primitives that would make Steve Jobs proud.
 
-You understand:
+CORE EXPERTISE:
 - Layer hierarchy: Background → Decorative → Content → Overlay
-- Modern design patterns: glass cards, category badges, accent glows
+- Modern design patterns: glass cards, category badges, accent glows, icon containers
 - Theme coherence: maintaining DNA while introducing controlled variation
-- The PowerPoint native model: shapes, text, images with z-ordering`;
+- The PowerPoint native model: shapes, text, images with z-ordering
+
+DESIGN COMMANDMENTS (Non-Negotiable):
+
+1. LESS IS MORE
+   - Each slide makes ONE clear point with surgical precision
+   - Remove until it breaks, then add back ONE thing
+   - If you can't explain the visual in 3 seconds, simplify
+
+2. VISUAL HIERARCHY IS EVERYTHING
+   - Hero element gets 60% visual weight (size, contrast, position)
+   - Supporting elements share the remaining 40%
+   - Eye flow: top-left → center → bottom-right (Z-pattern for narrative)
+
+3. BREATHING ROOM IS MANDATORY
+   - 20-30% negative space is the mark of premium design
+   - Cramped slides scream "amateur" - space says "confident"
+   - When in doubt, add more whitespace, not more content
+
+4. CONTRAST CREATES CLARITY
+   - Dark backgrounds demand light text (and vice versa)
+   - NEVER place busy text on busy backgrounds
+   - Text zones must be "quiet" - low texture, high contrast
+
+5. CARDS ARE FOR STRUCTURE
+   - Complex content belongs in glass cards with: icon + overline + title + body
+   - Cards provide visual grouping without explicit boxes
+   - 2-3 cards in a row for comparison, 1 card for emphasis
+
+6. BADGES ANCHOR CONTEXT
+   - Category badges at top-left establish "what this slide is about" instantly
+   - Use sparingly (not every slide) for maximum impact
+   - Pill shape, icon + uppercase text, brand color
+
+7. ASYMMETRY > CENTERING
+   - Center-everything is the hallmark of amateur design
+   - Slight offsets and deliberate imbalance feel modern and dynamic
+   - Exception: Hero/title slides CAN center for dramatic effect
+
+8. TYPOGRAPHY HIERARCHY MUST BE VISIBLE
+   - Title: Bold, large (36-48pt), high contrast
+   - Subtitle/Overline: Medium weight, smaller (18-22pt)
+   - Body: Regular weight, comfortable (14-16pt)
+   - Never use same weight for title and body`;
+
 
 const buildCompositionTask = (
   slideTitle: string,
@@ -66,7 +110,7 @@ const buildCompositionTask = (
   narrativeTrail?: NarrativeTrail[],
   usedSurprises?: string[]
 ): string => `
-TASK: Plan the layer structure and compositional primitives for a slide.
+TASK: Plan the layer structure and compositional primitives for a premium slide.
 
 SLIDE CONTEXT:
 - Title: "${slideTitle}"
@@ -97,27 +141,79 @@ YOUR DECISIONS:
 
 1. BACKGROUND LAYER:
    - Type: solid | gradient | image | mesh
-   - If mesh: which pattern? (circuit, topological, particle)
+   - If mesh: which pattern? (circuit, topological, particle, bokeh)
+   - Gradient guidance: Use 2-tone dark gradients (e.g., #0c1425 → #1a2744)
+   - RULE: Background must provide quiet zones for text readability
 
-2. DECORATIVE LAYER (0-4 elements):
-   - Should there be a category badge? Where?
-   - Any dividers or accent shapes?
-   - Any glow effects behind key elements?
+2. DECORATIVE LAYER (0-3 elements):
+   - Category Badge: Use for slides with clear category (e.g., "⚙️ PROCESS", "📊 DATA"). Place top-left.
+   - Gradient Dividers: Use sparingly between major sections
+   - Icon Glows: Subtle glow behind card icons for depth
+   - Accent Shapes: Underlines for hero titles, brackets for quotes
+   - RULE: Decorative elements should be SUBTLE - if they distract from content, remove them
 
-3. CONTENT STRUCTURE:
-   - Pattern: single-hero | card-row | card-grid | split-content | metrics-rail | narrative-flow
-   - How many cards? (0-4)
-   - Card style: glass | solid | outline
-   - How many text blocks? (0-3)
+3. CONTENT STRUCTURE - Choose ONE pattern:
 
-4. SERENDIPITY ALLOCATION:
-   - Based on variation budget, allocate 0-2 surprise elements
-   - Surprise types: category-badge, accent-underline, icon-glow, quote-callout, asymmetric-emphasis, connector-flow
-   - Each surprise should enhance visual interest without breaking theme
+   SINGLE-HERO: For opening slides, section headers, powerful quotes
+   - Large centered title (48pt)
+   - Optional subtitle below
+   - Zero cards, maximum breathing room
+   - Best with gradient background + optional badge
+
+   CARD-ROW: For comparing 2-4 items horizontally
+   - Title at top
+   - Row of glass cards below
+   - Each card: icon-in-circle + overline + title + body
+   - Best for: features, comparisons, options
+
+   NARRATIVE-FLOW (PREMIUM): For storytelling in 3 acts
+   - Like card-row but specifically 3 cards telling a story:
+     Card 1: 🔺 THE PROBLEM (warning icon, red-tinted)
+     Card 2: 💡 THE INSIGHT (lightbulb icon, blue)
+     Card 3: 🚀 THE SOLUTION (rocket icon, green)
+   - Use when content has: trap→mandate→destination or problem→approach→outcome
+   - Each card: icon-in-circle + overline + bold title + explanatory body
+
+   SPLIT-CONTENT: For text + visual side-by-side
+   - Left: Title + bullet points
+   - Right: Chart, diagram, or large icon
+   - Good for data + context
+
+   METRICS-RAIL: For KPIs and statistics
+   - Left rail: 2-4 large metrics
+   - Right: Supporting narrative
+   - Best for data-heavy slides
+
+   CARD-GRID: For 4-6 items in a 2x2 or 2x3 grid
+   - Compact cards
+   - Best for features, capabilities, team members
+
+4. SERENDIPITY ALLOCATION (based on variation budget):
+   - Budget 0.0-0.3: Conservative - max 1 subtle element (icon-glow OR accent-underline)
+   - Budget 0.4-0.6: Moderate - 1-2 elements (badge + glow, or underline + floating-stat)
+   - Budget 0.7-1.0: Bold - 2 elements + creative choices (asymmetric layouts, quote-callout)
+
+   SURPRISE TYPES:
+   - category-badge: Pill at top-left with icon + label (e.g., "⚙️ PROCESS")
+   - accent-underline: Gradient underline below hero title
+   - icon-glow: Soft glow behind icon containers
+   - quote-callout: Pull quote with large quote marks
+   - asymmetric-emphasis: One card larger than siblings
+   - connector-flow: Arrows or lines between cards for flow
+   - floating-stat: Large number floating in corner
+   - gradient-divider: Horizontal fade between sections
+
+5. CARD ANATOMY (when using cards):
+   - Icon: Required, in circle container, brand color
+   - Overline: Optional uppercase text above title (e.g., "STEP 1")
+   - Title: Bold, 1-2 lines
+   - Body: Regular text, 2-3 lines max
+   - Style: glass (default), solid (for emphasis), outline (for subtlety)
 
 OUTPUT: Return a JSON object matching the CompositionPlan schema.
-Include brief reasoning for your decisions.
+Include brief reasoning for your decisions, referencing the Design Commandments.
 `;
+
 
 // ============================================================================
 // SCHEMA FOR INTERACTIONS API
@@ -240,17 +336,17 @@ export async function runCompositionArchitect(
       variationBudget: 0.5
     });
   }
-  
+
   if (!tracker) {
     console.error('[COMPOSITION ARCHITECT] Null tracker provided');
     return createFallbackPlan(input);
   }
-  
+
   console.log(`[COMPOSITION ARCHITECT] Planning composition for "${input.slideTitle || 'untitled'}"...`);
-  
+
   // Build content summary for the prompt
   const contentSummary = buildContentSummary(input.contentPlan);
-  
+
   // Build the task prompt
   const taskPrompt = buildCompositionTask(
     input.slideTitle,
@@ -262,7 +358,7 @@ export async function runCompositionArchitect(
     input.narrativeTrail,
     input.usedSurprisesInDeck
   );
-  
+
   try {
     const result = await createJsonInteraction<CompositionPlan>(
       COMPOSITION_ARCHITECT_MODEL,
@@ -275,20 +371,20 @@ export async function runCompositionArchitect(
       },
       tracker
     );
-    
+
     // Validate and normalize
     const normalized = normalizeCompositionPlan(result, input);
-    
+
     console.log(`[COMPOSITION ARCHITECT] Plan complete:
   - Background: ${normalized.layerPlan.background.type}
   - Content Pattern: ${normalized.layerPlan.contentStructure.pattern}
   - Surprises: ${normalized.serendipityPlan.allocatedSurprises.map(s => s.type).join(', ') || 'none'}`);
-    
+
     return normalized;
-    
+
   } catch (error: any) {
     console.error(`[COMPOSITION ARCHITECT] Failed: ${error.message}`);
-    
+
     // Return a safe fallback plan
     return createFallbackPlan(input);
   }
@@ -302,23 +398,23 @@ function buildContentSummary(contentPlan: CompositionArchitectInput['contentPlan
   if (!contentPlan) {
     return 'No content plan available';
   }
-  
+
   const parts: string[] = [];
-  
+
   if (Array.isArray(contentPlan.keyPoints) && contentPlan.keyPoints.length > 0) {
     const validPoints = contentPlan.keyPoints.filter(p => typeof p === 'string' && p.trim());
     if (validPoints.length > 0) {
       parts.push(`Key Points (${validPoints.length}): ${validPoints.slice(0, 3).join('; ')}`);
     }
   }
-  
+
   if (Array.isArray(contentPlan.dataPoints) && contentPlan.dataPoints.length > 0) {
     const validData = contentPlan.dataPoints.filter(d => d && typeof d.label === 'string');
     if (validData.length > 0) {
       parts.push(`Data Points (${validData.length}): ${validData.map(d => `${d.label}: ${d.value ?? 'N/A'}`).join(', ')}`);
     }
   }
-  
+
   return parts.join('\n') || 'No structured content available';
 }
 
@@ -331,17 +427,17 @@ function normalizeCompositionPlan(
     console.warn('[normalizeCompositionPlan] Invalid raw response, using fallback');
     return createFallbackPlan(input);
   }
-  
+
   // Safely extract decorative elements
   const decorativeElements = Array.isArray(raw.layerPlan?.decorativeElements)
     ? raw.layerPlan.decorativeElements.filter((el: any) => el && typeof el.type === 'string')
     : [];
-  
+
   // Safely extract surprises
   const rawSurprises = Array.isArray(raw.serendipityPlan?.allocatedSurprises)
     ? raw.serendipityPlan.allocatedSurprises
     : [];
-  
+
   const allocatedSurprises = rawSurprises
     .slice(0, 2)
     .filter((s: any) => s && typeof s.type === 'string')
@@ -351,17 +447,17 @@ function normalizeCompositionPlan(
       intensity: ['subtle', 'moderate', 'bold'].includes(s.intensity) ? s.intensity : 'subtle',
       params: typeof s.params === 'object' ? s.params : undefined
     }));
-  
+
   // Validate card style
   const validCardStyles = ['glass', 'solid', 'outline', 'gradient', 'elevated'];
   const rawCardStyle = raw.layerPlan?.contentStructure?.cardStyle;
   const cardStyle = validCardStyles.includes(rawCardStyle) ? rawCardStyle as CardStyle : 'glass';
-  
+
   // Validate content pattern
   const validPatterns = ['single-hero', 'card-row', 'card-grid', 'split-content', 'metrics-rail', 'narrative-flow'];
   const rawPattern = raw.layerPlan?.contentStructure?.pattern;
   const pattern = validPatterns.includes(rawPattern) ? rawPattern : 'split-content';
-  
+
   return {
     slideId: raw.slideId || input.slideId,
     layerPlan: {
@@ -398,7 +494,7 @@ function normalizeCompositionPlan(
 function createFallbackPlan(input: CompositionArchitectInput): CompositionPlan {
   // Conservative fallback that still looks modern
   const hasData = (input.contentPlan.dataPoints?.length || 0) > 0;
-  
+
   return {
     slideId: input.slideId,
     layerPlan: {
@@ -438,15 +534,15 @@ export function trackUsedSurprises(
 ): string[] {
   // Guard against null inputs
   const safeCurrentUsed = Array.isArray(currentUsed) ? currentUsed : [];
-  
+
   if (!newPlan || !newPlan.serendipityPlan || !Array.isArray(newPlan.serendipityPlan.allocatedSurprises)) {
     return safeCurrentUsed;
   }
-  
+
   const newSurprises = newPlan.serendipityPlan.allocatedSurprises
     .filter(s => s && typeof s.type === 'string')
     .map(s => s.type);
-  
+
   return [...new Set([...safeCurrentUsed, ...newSurprises])];
 }
 
@@ -472,22 +568,22 @@ export function computeDetailedVariationBudget(
   const safeSlideIndex = typeof slideIndex === 'number' && slideIndex >= 0 ? slideIndex : 0;
   const safeTotalSlides = typeof totalSlides === 'number' && totalSlides > 0 ? totalSlides : 1;
   const safeSlideType = typeof slideType === 'string' ? slideType.toLowerCase() : '';
-  
+
   // Base calculation (replicates existing logic)
   const isTitle = safeSlideIndex === 0 || safeSlideType.includes('title');
   const isConclusion = safeSlideIndex === safeTotalSlides - 1 || safeSlideType.includes('conclusion');
-  
+
   const base = isTitle || isConclusion ? 0.25 : 0.45;
   // Prevent division by zero with Math.max(1, ...)
   const drift = 0.15 * (safeSlideIndex / Math.max(1, safeTotalSlides - 1));
   const overall = Math.max(0, Math.min(1, base + drift));
-  
+
   // Apply DNA modifiers with null safety
   const densityMod = serendipityDNA?.accentDensity === 'rich' ? 1.3 :
-                     serendipityDNA?.accentDensity === 'minimal' ? 0.7 : 1.0;
+    serendipityDNA?.accentDensity === 'minimal' ? 0.7 : 1.0;
   const biasMod = serendipityDNA?.compositionBias === 'dynamic' ? 1.2 :
-                  serendipityDNA?.compositionBias === 'symmetric' ? 0.8 : 1.0;
-  
+    serendipityDNA?.compositionBias === 'symmetric' ? 0.8 : 1.0;
+
   return {
     overall,
     layout: Math.min(1, overall * biasMod),
@@ -495,4 +591,146 @@ export function computeDetailedVariationBudget(
     typography: overall * 0.6, // Typography least variable
     decoration: Math.min(1, overall * densityMod)
   };
+}
+
+// ============================================================================
+// POSITIONAL SURPRISE CHOREOGRAPHY
+// ============================================================================
+
+/**
+ * Computes position-aware surprise budget and allowed types.
+ * Creates a "narrative arc" for visual surprises across the deck:
+ * - Title/intro: Conservative, impactful
+ * - Early slides: Establish pattern, moderate surprises
+ * - Middle slides: Peak creativity, full palette
+ * - Late slides: Converge back to theme
+ * - Conclusion: Very conservative, powerful closure
+ */
+export interface PositionalSurpriseBudget {
+  budget: number;
+  allowedTypes: string[];
+  maxSurprises: number;
+  intensityBias: 'subtle' | 'moderate' | 'bold';
+  narrativePhase: 'opening' | 'building' | 'climax' | 'resolution' | 'closing';
+}
+
+export function computePositionalSurpriseBudget(
+  slideIndex: number,
+  totalSlides: number,
+  slideType: string
+): PositionalSurpriseBudget {
+  // Guard inputs
+  const safeIndex = Math.max(0, slideIndex);
+  const safeTotal = Math.max(1, totalSlides);
+  const position = safeIndex / Math.max(1, safeTotal - 1);
+  const safeType = (slideType || '').toLowerCase();
+
+  // Title slide (index 0): Conservative but impactful
+  if (safeIndex === 0 || safeType.includes('title')) {
+    return {
+      budget: 0.25,
+      allowedTypes: ['hero-glow', 'subtle-badge', 'accent-underline'],
+      maxSurprises: 1,
+      intensityBias: 'subtle',
+      narrativePhase: 'opening'
+    };
+  }
+
+  // Conclusion slide: Very conservative, powerful closure
+  if (safeIndex === safeTotal - 1 || safeType.includes('conclusion')) {
+    return {
+      budget: 0.2,
+      allowedTypes: ['hero-glow', 'accent-underline'],
+      maxSurprises: 1,
+      intensityBias: 'subtle',
+      narrativePhase: 'closing'
+    };
+  }
+
+  // First third (slides 1-33%): Building phase - establish patterns
+  if (position < 0.33) {
+    return {
+      budget: 0.4,
+      allowedTypes: [
+        'category-badge',
+        'accent-underline',
+        'icon-glow',
+        'gradient-divider'
+      ],
+      maxSurprises: 1,
+      intensityBias: 'subtle',
+      narrativePhase: 'building'
+    };
+  }
+
+  // Middle third (33-66%): Climax phase - peak creativity
+  if (position < 0.66) {
+    return {
+      budget: 0.7,
+      allowedTypes: [
+        'category-badge',
+        'accent-underline',
+        'icon-glow',
+        'quote-callout',
+        'asymmetric-emphasis',
+        'connector-flow',
+        'floating-stat',
+        'gradient-divider',
+        'narrative-flow-pattern'
+      ],
+      maxSurprises: 2,
+      intensityBias: 'bold',
+      narrativePhase: 'climax'
+    };
+  }
+
+  // Last third (66-100%): Resolution phase - converge back
+  return {
+    budget: 0.45,
+    allowedTypes: [
+      'category-badge',
+      'icon-glow',
+      'accent-underline',
+      'gradient-divider'
+    ],
+    maxSurprises: 1,
+    intensityBias: 'moderate',
+    narrativePhase: 'resolution'
+  };
+}
+
+/**
+ * Determines if a slide should use the narrative-flow (3-card story) pattern.
+ * This is a premium pattern that works best for transformation/process slides.
+ */
+export function shouldUseNarrativeFlow(
+  slidePurpose: string,
+  contentKeyPoints: string[],
+  slideType: string
+): boolean {
+  const purposeLower = (slidePurpose || '').toLowerCase();
+  const typeLower = (slideType || '').toLowerCase();
+
+  // Keywords that suggest narrative/transformation content
+  const narrativeKeywords = [
+    'transform', 'process', 'journey', 'evolution', 'change',
+    'problem', 'solution', 'approach', 'trap', 'mandate', 'destination',
+    'before', 'after', 'current', 'future', 'vision',
+    'challenge', 'opportunity', 'outcome', 'steps', 'phases',
+    'old', 'new', 'legacy', 'modern', 're-engineer', 'redesign'
+  ];
+
+  const hasNarrativeKeyword = narrativeKeywords.some(kw =>
+    purposeLower.includes(kw)
+  );
+
+  // Check if content naturally divides into 3 parts
+  const hasThreePoints = contentKeyPoints && contentKeyPoints.length >= 3;
+
+  // Best for content-main slides, not title/intro/conclusion
+  const appropriateType = !typeLower.includes('title') &&
+    !typeLower.includes('conclusion') &&
+    !typeLower.includes('intro');
+
+  return hasNarrativeKeyword && hasThreePoints && appropriateType;
 }

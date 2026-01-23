@@ -82,44 +82,68 @@ ANALYZE FOR:
 1. Spatial Issues - Overlap, out-of-bounds content, zone violations
 2. Contrast - WCAG AA compliance (4.5:1 for text)
 3. Alignment - Grid adherence, consistent margins
-4. Spacing - Crowding, negative space balance
+4. Spacing - Crowding, negative space balance (optimal: 10-15% margins)
 5. Hierarchy - Visual weight matches importance
+
+COMPONENT ID FORMAT: Look for data-component-id attributes in the SVG or use:
+- "text-title-0" for main title
+- "text-bullets-0", "text-bullets-1" for bullet lists
+- "metric-cards-0" for metric displays
+- "divider-0", "line-0" for separators
+- "shape-card-0" for shapes/cards
 
 OUTPUT JSON:
 {
   "overall_score": <0-100>,
   "repairs": [
     {
-      "component_id": "<component-type>-<index>",
-      "action": "resize" | "reposition" | "adjust_color" | "adjust_spacing" | "simplify_content",
-      "params": { <action-specific params> },
-      "reason": "<why this repair is needed>"
+      "component_id": "text-bullets-0",
+      "action": "reposition",
+      "params": { "x": 0.05, "y": 0.35 },
+      "reason": "Move down to y=0.35 to create breathing room from title"
     }
   ],
-  "issues": [
-    {
-      "category": "text_overlap" | "contrast" | "alignment" | "spacing" | "density",
-      "severity": "critical" | "warning" | "info",
-      "description": "...",
-      "suggested_fix": "..."
-    }
-  ],
-  "empty_regions": [
-    {
-      "bbox": { "x": <0-1>, "y": <0-1>, "w": <0-1>, "h": <0-1> },
-      "label": "safe_for_text" | "safe_for_image" | "marginal",
-      "area_percentage": <0-100>
-    }
-  ],
+  "issues": [...],
   "verdict": "accept" | "requires_repair" | "flag_for_review"
 }
 
-IMPORTANT:
-- Component IDs format: "{type}-{index}" (e.g., "text-bullets-0", "metric-cards-1")
-- Coordinates normalized 0-1 (not pixels) → will be converted to slide units
-- Only suggest repairs that improve score by ≥5 points
-- Preserve ALL text content (spatial changes only)
-- Output ONLY valid JSON`;
+ACTION PARAM SCHEMAS (MUST include numeric values):
+- reposition: { "x": <0-1 normalized>, "y": <0-1 normalized> }
+- resize: { "width": <0-1 fraction of slide>, "height": <0-1 fraction> }
+- adjust_spacing: { "lineHeight": <1.2-2.0>, "padding": <0.01-0.1 normalized> }
+- adjust_color: { "color": "#XXXXXX" }
+- simplify_content: { "removeCount": <1-3> }
+
+CRITICAL RULES:
+1. params MUST contain numeric values (NOT text descriptions)
+2. All coordinates/sizes normalized 0-1 (x=0 is left, y=0 is top)
+3. Title optimal y position: 0.08-0.15
+4. Bullets optimal y position: 0.25-0.40
+5. Line height 1.6-1.8 for readability
+6. Output ONLY valid JSON`;
+}
+
+function buildLayoutScorePrompt() {
+  return `/no_think
+
+Evaluate this slide layout for content accommodation and visual balance.
+
+Score 0-100 based on:
+- Content fit (40%): All content visible, no truncation, appropriate zones
+- Visual balance (30%): Distributed weight, no heavy clustering
+- Readability (30%): Text legible, adequate spacing, clear hierarchy
+
+OUTPUT (strict JSON):
+{
+  "overall_score": <0-100>,
+  "content_fit": <0-100>,
+  "visual_balance": <0-100>,
+  "readability": <0-100>,
+  "primary_issue": "none" | "overflow" | "sparse" | "misaligned" | "cramped",
+  "recommendation": "One sentence max"
+}
+
+This is a perception task - output score directly without lengthy reasoning.`;
 }
 
 async function callQwenVL({ imageBase64, prompt }) {
@@ -258,6 +282,31 @@ app.post('/api/qwen/critique-repairs', async (req, res) => {
     const { responseText, usage } = await callQwenVL({
       imageBase64: base64,
       prompt: buildRepairPrompt()
+    });
+
+    const result = parseJsonResponse(responseText);
+    res.json({ result, usage });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.post('/api/qwen/layout-score', async (req, res) => {
+  try {
+    const { svgString, imageBase64, slideWidth = 1920, slideHeight = 1080 } = req.body || {};
+
+    let base64 = imageBase64;
+    if (!base64 && svgString) {
+      base64 = rasterizeSvgToBase64(svgString, slideWidth, slideHeight);
+    }
+
+    if (!base64) {
+      return res.status(400).json({ error: 'Missing svgString or imageBase64' });
+    }
+
+    const { responseText, usage } = await callQwenVL({
+      imageBase64: base64,
+      prompt: buildLayoutScorePrompt()
     });
 
     const result = parseJsonResponse(responseText);

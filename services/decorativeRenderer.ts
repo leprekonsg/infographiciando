@@ -84,19 +84,68 @@ export function renderDecorativeElement(
 }
 
 // ============================================================================
+// PREMIUM BADGE CONSTANTS
+// ============================================================================
+
+const BADGE_TYPOGRAPHY = {
+  fontSize: 10,
+  letterSpacing: 1.5,  // Spread letters for professional look
+  fontWeight: 600
+};
+
+const BADGE_PREMIUM_STYLES: Record<string, {
+  radius: number;
+  fillAlpha: number;
+  borderAlpha: number;
+  borderWidth: number;
+  hasGlow: boolean;
+  glowAlpha: number;
+}> = {
+  'pill': { 
+    radius: 0.5, 
+    fillAlpha: 0.12, 
+    borderAlpha: 0.35, 
+    borderWidth: 1.0,
+    hasGlow: true,
+    glowAlpha: 0.08
+  },
+  'tag': { 
+    radius: 0.12, 
+    fillAlpha: 0.1, 
+    borderAlpha: 0.3, 
+    borderWidth: 1.0,
+    hasGlow: false,
+    glowAlpha: 0
+  },
+  'minimal': { 
+    radius: 0.08, 
+    fillAlpha: 0.06, 
+    borderAlpha: 0.15, 
+    borderWidth: 0.5,
+    hasGlow: false,
+    glowAlpha: 0
+  }
+};
+
+// ============================================================================
 // BADGE RENDERER
 // ============================================================================
 
 /**
- * Renders a category badge/pill like "⚙️ PROCESS TRANSFORMATION"
+ * Renders a PREMIUM category badge/pill like "⚙️ PROCESS TRANSFORMATION"
  * 
  * Structure:
  * ┌─────────────────────────────────┐
  * │ [icon] CATEGORY TEXT           │
  * └─────────────────────────────────┘
  * 
+ * Premium Features:
+ * - Letter-spacing for professional typography
+ * - Optional subtle glow behind badge for depth
+ * - Refined border and fill alphas
+ * 
  * Styles:
- * - pill: Full rounded ends (like iOS pills)
+ * - pill: Full rounded ends (like iOS pills) with subtle glow
  * - tag: Less rounded, more rectangular
  * - minimal: Just text with subtle background
  */
@@ -121,21 +170,37 @@ export function renderBadge(
     return [];
   }
   
-  const charWidth = 0.07; // Approximate width per character
-  const textWidth = contentText.length * charWidth;
-  const iconWidth = badge.icon ? 0.28 : 0;
-  const padding = 0.15;
+  // Improved character width calculation (accounting for letter-spacing)
+  const charWidth = 0.065; // Slightly narrower base
+  const letterSpacingWidth = (contentText.length - 1) * 0.015; // Extra width from spacing
+  const textWidth = (contentText.length * charWidth) + letterSpacingWidth;
+  const iconWidth = badge.icon ? 0.3 : 0;
+  const padding = 0.16;
   const totalWidth = textWidth + iconWidth + (padding * 2);
-  const height = 0.35;
+  const height = 0.38;
   
-  // Badge background with safe style lookup
-  const styleConfigs: Record<string, { radius: number; fillAlpha: number; borderAlpha: number }> = {
-    'pill': { radius: 0.5, fillAlpha: 0.15, borderAlpha: 0.4 },
-    'tag': { radius: 0.12, fillAlpha: 0.12, borderAlpha: 0.35 },
-    'minimal': { radius: 0.08, fillAlpha: 0.08, borderAlpha: 0.2 }
-  };
-  const styleConfig = styleConfigs[style] || styleConfigs['pill'];
+  // Get premium style config with safe lookup
+  const styleConfig = BADGE_PREMIUM_STYLES[style] || BADGE_PREMIUM_STYLES['pill'];
   
+  // 0. Premium: Subtle glow behind badge (rendered first, lowest z-index)
+  if (styleConfig.hasGlow) {
+    elements.push({
+      type: 'shape',
+      shapeType: 'roundRect',
+      x: badge.position.x - 0.03,
+      y: badge.position.y - 0.02,
+      w: totalWidth + 0.06,
+      h: height + 0.04,
+      fill: {
+        color: normalizeColor(color),
+        alpha: styleConfig.glowAlpha
+      },
+      rectRadius: styleConfig.radius + 0.1,
+      zIndex: context.baseZIndex - 1
+    });
+  }
+  
+  // 1. Badge background
   elements.push({
     type: 'shape',
     shapeType: 'roundRect',
@@ -149,24 +214,24 @@ export function renderBadge(
     },
     border: {
       color: normalizeColor(color),
-      width: 1.2,
+      width: styleConfig.borderWidth,
       alpha: styleConfig.borderAlpha
     },
     rectRadius: styleConfig.radius,
     zIndex: context.baseZIndex
   });
   
-  // Icon (if present)
+  // 2. Icon (if present)
   let textX = badge.position.x + padding;
   
   if (badge.icon) {
     const iconData = context.iconCache.get(badge.icon);
     if (iconData) {
-      const iconSize = 0.2;
+      const iconSize = 0.22;
       elements.push({
         type: 'image',
         data: iconData,
-        x: badge.position.x + 0.08,
+        x: badge.position.x + 0.09,
         y: badge.position.y + (height - iconSize) / 2,
         w: iconSize,
         h: iconSize,
@@ -176,19 +241,22 @@ export function renderBadge(
     }
   }
   
-  // Text
+  // 3. Text with premium letter-spacing
   elements.push({
     type: 'text',
     content: contentText.toUpperCase(),
     x: textX,
-    y: badge.position.y + 0.07,
+    y: badge.position.y + 0.08,
     w: textWidth + 0.1,
     h: height - 0.14,
-    fontSize: 10,
+    fontSize: BADGE_TYPOGRAPHY.fontSize,
     color: normalizeColor(color),
     bold: true,
     align: 'left',
-    zIndex: context.baseZIndex + 2
+    zIndex: context.baseZIndex + 2,
+    letterSpacing: BADGE_TYPOGRAPHY.letterSpacing,
+    fontWeight: BADGE_TYPOGRAPHY.fontWeight,
+    textTransform: 'uppercase'
   });
   
   return elements;

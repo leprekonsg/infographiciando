@@ -194,8 +194,11 @@ function extractLongestValidPrefix(text: string): { json: string; discarded: str
 }
 
 // Detect low-entropy/degenerate output patterns (e.g., "0-0-0", "o0o0o0", repeated chars, word loops)
+// NOTE: Must be careful not to flag legitimate JSON patterns like multiple "none" values
+// ENHANCED: Now catches CamelCase repetition and component type hallucinations
 function hasEntropyDegeneration(text: string): boolean {
-    const sample = text.slice(-500).toLowerCase(); // Increased window to catch word-level patterns
+    const sample = text.slice(-800).toLowerCase(); // Increased window to catch patterns
+    const originalSample = text.slice(-800); // Keep original case for CamelCase detection
     
     // Original character-level patterns
     if (/(\b0-){2,}0\b/.test(sample)) return true;
@@ -203,11 +206,38 @@ function hasEntropyDegeneration(text: string): boolean {
     if (/(?:o0){5,}/.test(sample)) return true;
     if (/([a-z0-9])\1{10,}/.test(sample)) return true;
 
-    // NEW: Word-level repetition detection (catches "and-no-icon-bullets-and-no-icon-bullets...")
-    // Split by common delimiters and check for repeated word sequences
+    // NEW: CamelCase repetition detection (catches "MetricCardsMetricCardsMetricCards...")
+    // This is a common LLM failure mode when generating component types
+    const camelCasePattern = /([A-Z][a-z]+(?:[A-Z][a-z]+)?)\1{3,}/;
+    if (camelCasePattern.test(originalSample)) {
+        const match = originalSample.match(camelCasePattern);
+        if (match) {
+            console.warn(`[DEGENERATION] CamelCase repetition detected: "${match[1]}..." repeated`);
+            return true;
+        }
+    }
+
+    // NEW: Component type hallucination detection
+    // Catches patterns like "text-bullets_safe-zone_text-safe-zone_text-safe-zone..."
+    const typeHallucinationPattern = /([-_][a-z]+-[a-z]+)\1{4,}/i;
+    if (typeHallucinationPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Component type hallucination detected`);
+        return true;
+    }
+
+    // NEW: Long string value detection - no valid component type should exceed 50 chars
+    // This catches cases where the model generates garbage in "type" field
+    const typeValuePattern = /"type"\s*:\s*"([^"]{60,})"/;
+    if (typeValuePattern.test(text)) {
+        console.warn(`[DEGENERATION] Oversized type value detected`);
+        return true;
+    }
+
+    // Word-level repetition detection (catches "and-no-icon-bullets-and-no-icon-bullets...")
     const words = sample.split(/[\s\-_]+/).filter(w => w.length > 2);
     if (words.length >= 10) {
-        // Check for 3+ consecutive repeated word patterns
+        const safeWords = new Set(['none', 'null', 'true', 'false', 'default', 'auto', 'inherit', 'normal']);
+        
         for (let patternLen = 1; patternLen <= 4; patternLen++) {
             let repeatCount = 1;
             for (let i = patternLen; i < words.length; i += patternLen) {
@@ -215,7 +245,11 @@ function hasEntropyDegeneration(text: string): boolean {
                 const current = words.slice(i, i + patternLen).join('-');
                 if (pattern === current) {
                     repeatCount++;
-                    if (repeatCount >= 4) {
+                    if (patternLen === 1 && safeWords.has(pattern)) {
+                        continue;
+                    }
+                    const threshold = patternLen === 1 ? 6 : 4;
+                    if (repeatCount >= threshold) {
                         console.warn(`[DEGENERATION] Detected word-level repetition: "${pattern}" repeated ${repeatCount}x`);
                         return true;
                     }
@@ -413,6 +447,95 @@ export const MODEL_AGENTIC = 'gemini-3-flash-preview';
 
 /** High-volume/simple tasks: classification, JSON structuring, pattern matching (79% cheaper than Flash) */
 export const MODEL_SIMPLE = 'gemini-2.5-flash';
+
+// --- QWEN FALLBACK CLIENT ---
+// Used when Gemini returns empty responses (content filtered, rate limited, or server errors)
+// API: DashScope OpenAI-compatible endpoint
+
+const QWEN_API_BASE = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+const QWEN_MODEL = 'qwen-plus-2025-01-25';  // Fast, reliable fallback model
+
+interface QwenFallbackOptions {
+    systemInstruction?: string;
+    temperature?: number;
+    maxTokens?: number;
+    responseFormat?: 'json' | 'text';
+}
+
+/**
+ * Call Qwen as a fallback when Gemini fails.
+ * Uses OpenAI-compatible API via DashScope.
+ * Returns null if DASHSCOPE_API_KEY is not configured.
+ */
+async function callQwenFallback(
+    prompt: string,
+    options: QwenFallbackOptions = {}
+): Promise<string | null> {
+    const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY;
+    
+    if (!apiKey) {
+        console.warn(`[QWEN FALLBACK] DASHSCOPE_API_KEY not configured. Skipping fallback.`);
+        return null;
+    }
+
+    console.log(`[QWEN FALLBACK] Gemini failed, trying Qwen (${QWEN_MODEL})...`);
+
+    const messages: Array<{ role: string; content: string }> = [];
+    
+    if (options.systemInstruction) {
+        messages.push({ role: 'system', content: options.systemInstruction });
+    }
+    messages.push({ role: 'user', content: prompt });
+
+    const requestBody: Record<string, any> = {
+        model: QWEN_MODEL,
+        messages,
+        temperature: options.temperature ?? 0.2,
+        max_tokens: options.maxTokens ?? 8192,
+    };
+
+    // Add JSON mode if requested
+    if (options.responseFormat === 'json') {
+        requestBody.response_format = { type: 'json_object' };
+    }
+
+    try {
+        const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${apiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error(`[QWEN FALLBACK] API error (${response.status}): ${errorText}`);
+            return null;
+        }
+
+        const data = await response.json();
+        const content = data.choices?.[0]?.message?.content;
+
+        if (!content) {
+            console.warn(`[QWEN FALLBACK] Empty response from Qwen`);
+            return null;
+        }
+
+        console.log(`[QWEN FALLBACK] Success! Got ${content.length} chars from Qwen`);
+        
+        // Log token usage if available
+        if (data.usage) {
+            console.log(`[QWEN FALLBACK] Usage: ${data.usage.prompt_tokens} in / ${data.usage.completion_tokens} out`);
+        }
+
+        return content;
+    } catch (err: any) {
+        console.error(`[QWEN FALLBACK] Request failed:`, err.message);
+        return null;
+    }
+}
 
 /** Reserved for complex reasoning (>1M context synthesis) - rarely needed for slide generation */
 export const MODEL_REASONING = 'gemini-3-pro-preview';
@@ -1260,7 +1383,27 @@ export async function createInteraction(
             console.error(`[INTERACTIONS CLIENT] Retry also failed:`, retryErr.message);
         }
 
-        console.error(`[INTERACTIONS CLIENT] Both attempts returned empty. Returning empty string for fallback handling.`);
+        // --- CASE 3: Qwen Fallback ---
+        // Both Gemini attempts failed. Try Qwen as last resort.
+        // This handles content filtering, persistent rate limits, and server outages.
+        console.warn(`[INTERACTIONS CLIENT] Both Gemini attempts failed. Trying Qwen fallback...`);
+        
+        const qwenResult = await callQwenFallback(
+            typeof prompt === 'string' ? prompt : JSON.stringify(prompt),
+            {
+                systemInstruction: options.systemInstruction,
+                temperature: options.temperature ?? 0.2,
+                maxTokens: options.maxOutputTokens ?? 8192,
+                responseFormat: options.responseMimeType === 'application/json' ? 'json' : 'text'
+            }
+        );
+
+        if (qwenResult) {
+            console.log(`[INTERACTIONS CLIENT] Qwen fallback succeeded!`);
+            return qwenResult;
+        }
+
+        console.error(`[INTERACTIONS CLIENT] All attempts (Gemini x2 + Qwen) failed. Returning empty string.`);
     }
 
     return '';

@@ -1,8 +1,8 @@
 /**
- * Visual Cortex Service - Qwen-VL Integration
+ * Visual Cortex Service - Qwen3-VL Integration
  *
  * Implements external visual validation using Qwen3-VL-Plus for:
- * - Bounding box detection
+ * - Bounding box detection with 0-1000 normalized coordinates
  * - Spatial issue identification
  * - Contrast analysis
  * - Empty region detection
@@ -10,6 +10,32 @@
  * Based on Alibaba Cloud's DashScope API (OpenAI-compatible)
  * Model: qwen3-vl-plus-2025-12-19
  * Pricing: Input $0.2/1M tokens, Output $1.6/1M tokens
+ *
+ * ============================================================================
+ * QWEN3-VL ARCHITECTURAL OPTIMIZATIONS (2026-01)
+ * ============================================================================
+ * 
+ * 1. DeepStack Architecture Integration:
+ *    - Multi-layer visual feature preservation enables fine-grained texture analysis
+ *    - Prompts explicitly handle rasterization noise/artifacts
+ *    - Texture-aware critique for glass cards, gradients, subtle effects
+ * 
+ * 2. Coordinate System (0-1000 Standard):
+ *    - All coordinates normalized to 0-1000 range regardless of image resolution
+ *    - (0,0) = top-left, (1000,1000) = bottom-right
+ *    - Post-processing converts to 0-1 for internal use: val / 1000
+ *    - NEVER prompt for pixel coordinates (causes hallucination)
+ * 
+ * 3. Thinking Mode Controls:
+ *    - /no_think for perception tasks (layout selection, quick scoring)
+ *    - /think for complex reasoning (repair planning, full critique)
+ *    - Avoids redundant "step by step" prompting (model already trained for CoT)
+ * 
+ * 4. Persona-Based System Prompts:
+ *    - VISUAL_ARCHITECT for spatial repair loops
+ *    - ART_DIRECTOR for aesthetic scoring
+ *    - LAYOUT_SELECTOR for fast template comparison
+ *    - Role definition sets boundary conditions for output quality
  *
  * ============================================================================
  * TWO-TIER RENDERING PIPELINE (Render Fidelity Contract)
@@ -57,6 +83,17 @@
  */
 
 import { CostTracker } from './interactionsClient';
+import {
+    QWEN_PERSONAS,
+    VISUAL_CRITIQUE_PROMPT,
+    VISUAL_ARCHITECT_REPAIR_PROMPT,
+    LAYOUT_SELECTOR_PROMPT,
+    buildQwenMessage,
+    getQwenRequestConfig,
+    parseQwenResponse,
+    getThinkingMode,
+    COORDINATE_SYSTEM
+} from './visual/qwenPromptConfig';
 
 // Qwen-VL Model Configuration
 const QWEN_VL_MODEL = 'qwen3-vl-plus-2025-12-19';
@@ -174,6 +211,11 @@ class QwenVLClient {
 
     /**
      * Get visual critique from Qwen-VL
+     * 
+     * Uses optimized prompts with:
+     * - Art Director persona for aesthetic evaluation
+     * - 0-1000 coordinate system for precise grounding
+     * - Explicit artifact noise handling (DeepStack awareness)
      */
     async getVisualCritique(
         slideImageBase64: string,
@@ -188,55 +230,14 @@ class QwenVLClient {
         console.log(`[QWEN-VL] Starting visual critique (dimensions: ${slideWidth}x${slideHeight})`);
         const startTime = Date.now();
 
-        const critiquePrompt = `Analyze this slide image and provide detailed visual feedback.
+        // Build message with Art Director persona for aesthetic critique
+        const messages = buildQwenMessage(
+            QWEN_PERSONAS.ART_DIRECTOR,
+            `${getThinkingMode('critique')}\n\n${VISUAL_CRITIQUE_PROMPT}`,
+            slideImageBase64
+        );
 
-ANALYZE FOR:
-1. Text Overlap - Any text that overlaps elements or runs off screen?
-2. Contrast - Is text readable against background (WCAG AA: 4.5:1)?
-3. Alignment - Are elements properly aligned? Consistent spacing?
-4. Spacing - Is there too much / too little whitespace?
-5. Density - Is content packed too tightly or spread out?
-
-OUTPUT JSON with structure:
-{
-  "overall_score": <0-100>,
-  "issues": [
-    {
-      "category": "text_overlap" | "contrast" | "alignment" | "spacing" | "density",
-      "severity": "critical" | "warning" | "info",
-      "location": { "x": <0-1>, "y": <0-1>, "w": <0-1>, "h": <0-1> },
-      "description": "...",
-      "suggested_fix": "..."
-    }
-  ],
-    "edit_instructions": [
-        {
-            "action": "move" | "resize" | "trim_text" | "simplify_content" | "increase_negative_space" | "swap_zones",
-            "target_region": "top-left" | "top-right" | "center" | "bottom-left" | "bottom-right" | "x:<0-1>,y:<0-1>,w:<0-1>,h:<0-1>",
-            "detail": "..."
-        }
-    ],
-  "empty_regions": [
-    {
-      "bbox": { "x": <0-1>, "y": <0-1>, "w": <0-1>, "h": <0-1> },
-      "label": "safe_for_text" | "safe_for_image" | "marginal",
-      "area_percentage": <0-100>
-    }
-  ],
-  "color_analysis": {
-    "primary_color": "#XXXXXX",
-    "secondary_colors": ["#XXXXXX"],
-    "contrast_ratio": <number>
-  },
-  "overall_verdict": "accept" | "flag_for_review" | "requires_repair"
-}
-
-IMPORTANT:
-- Coordinates are normalized 0-1 (not pixels)
-- Focus on actionable issues
-- Be concise in descriptions
-- If you can suggest edits, include 1-5 edit_instructions with target_region + action
-- Output ONLY valid JSON`;
+        const requestConfig = getQwenRequestConfig('critique');
 
         try {
             const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
@@ -246,26 +247,8 @@ IMPORTANT:
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    model: QWEN_VL_MODEL,
-                    messages: [
-                        {
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'image_url',
-                                    image_url: {
-                                        url: `data:image/jpeg;base64,${slideImageBase64}`
-                                    }
-                                },
-                                {
-                                    type: 'text',
-                                    text: critiquePrompt
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens: 2048,
-                    temperature: 0.1
+                    ...requestConfig,
+                    messages
                 })
             });
 
@@ -289,11 +272,12 @@ IMPORTANT:
 
             const responseText = data.choices?.[0]?.message?.content || '';
 
-            // Parse JSON response
+            // Parse JSON response and normalize coordinates from 0-1000 to 0-1
             const parsed = this.parseJsonResponse(responseText);
+            const normalized = parseQwenResponse(parsed);
 
             // Log critique summary
-            const result = parsed as VisualCritiqueResult;
+            const result = normalized as VisualCritiqueResult;
             console.log(`[QWEN-VL] Critique result: score=${result.overall_score}, verdict=${result.overall_verdict}, issues=${result.issues?.length || 0}`);
 
             return result;
@@ -305,6 +289,12 @@ IMPORTANT:
 
     /**
      * Get visual critique with structured repair instructions (Visual Architect mode)
+     * 
+     * Uses optimized prompts with:
+     * - Visual Architect persona for spatial repair planning
+     * - 0-1000 coordinate system with automatic normalization
+     * - /think mode for complex reasoning tasks
+     * - Component ID mapping for precise repair targeting
      */
     async getVisualCritiqueWithRepairs(
         slideImageBase64: string,
@@ -320,50 +310,19 @@ IMPORTANT:
         console.log(`[QWEN-VL ARCHITECT] Starting critique with repair output (${slideWidth}x${slideHeight})`);
         const startTime = Date.now();
 
-        const architectPrompt = `ANALYZE this slide for visual quality and output STRUCTURED REPAIRS.
+        // Build component manifest for the prompt
+        const componentManifest = currentComponents
+            .map((c, i) => `${c.type}-${i}`)
+            .join(', ');
 
-ANALYZE FOR:
-1. Spatial Issues - Overlap, out-of-bounds content, zone violations
-2. Contrast - WCAG AA compliance (4.5:1 for text)
-3. Alignment - Grid adherence, consistent margins
-4. Spacing - Crowding, negative space balance
-5. Hierarchy - Visual weight matches importance
+        // Build message with Visual Architect persona
+        const messages = buildQwenMessage(
+            QWEN_PERSONAS.VISUAL_ARCHITECT,
+            `${getThinkingMode('repair')}\n\nAVAILABLE COMPONENTS: ${componentManifest || 'none'}\n\n${VISUAL_ARCHITECT_REPAIR_PROMPT}`,
+            slideImageBase64
+        );
 
-OUTPUT JSON:
-{
-  "overall_score": <0-100>,
-  "repairs": [
-    {
-      "component_id": "<component-type>-<index>",
-      "action": "resize" | "reposition" | "adjust_color" | "adjust_spacing" | "simplify_content",
-      "params": { <action-specific params> },
-      "reason": "<why this repair is needed>"
-    }
-  ],
-  "issues": [
-    {
-      "category": "text_overlap" | "contrast" | "alignment" | "spacing" | "density",
-      "severity": "critical" | "warning" | "info",
-      "description": "...",
-      "suggested_fix": "..."
-    }
-  ],
-  "empty_regions": [
-    {
-      "bbox": { "x": <0-1>, "y": <0-1>, "w": <0-1>, "h": <0-1> },
-      "label": "safe_for_text" | "safe_for_image" | "marginal",
-      "area_percentage": <0-100>
-    }
-  ],
-  "verdict": "accept" | "requires_repair" | "flag_for_review"
-}
-
-IMPORTANT:
-- Component IDs format: "{type}-{index}" (e.g., "text-bullets-0", "metric-cards-1")
-- Coordinates normalized 0-1 (not pixels) → will be converted to slide units
-- Only suggest repairs that improve score by ≥5 points
-- Preserve ALL text content (spatial changes only)
-- Output ONLY valid JSON`;
+        const requestConfig = getQwenRequestConfig('repair');
 
         try {
             const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
@@ -373,26 +332,8 @@ IMPORTANT:
                     'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({
-                    model: QWEN_VL_MODEL,
-                    messages: [
-                        {
-                            role: 'user',
-                            content: [
-                                {
-                                    type: 'image_url',
-                                    image_url: {
-                                        url: `data:image/jpeg;base64,${slideImageBase64}`
-                                    }
-                                },
-                                {
-                                    type: 'text',
-                                    text: architectPrompt
-                                }
-                            ]
-                        }
-                    ],
-                    max_tokens: 2048,
-                    temperature: 0.1
+                    ...requestConfig,
+                    messages
                 })
             });
 
@@ -415,10 +356,13 @@ IMPORTANT:
 
             const responseText = data.choices?.[0]?.message?.content || '';
             const parsed = this.parseJsonResponse(responseText);
+            
+            // Normalize coordinates from 0-1000 to 0-1
+            const normalized = parseQwenResponse(parsed);
 
-            console.log(`[QWEN-VL ARCHITECT] Result: score=${parsed.overall_score}, verdict=${parsed.verdict}, repairs=${parsed.repairs?.length || 0}`);
+            console.log(`[QWEN-VL ARCHITECT] Result: score=${normalized.overall_score}, verdict=${normalized.verdict}, repairs=${normalized.repairs?.length || 0}`);
 
-            return parsed;
+            return normalized;
         } catch (error: any) {
             console.error('[QWEN-VL ARCHITECT] Critique error:', error.message);
             throw error;
@@ -689,6 +633,279 @@ export function isQwenVLAvailable(): boolean {
     return false;
 }
 
+// --- FAST-PATH LAYOUT SCORING ---
+
+/**
+ * Layout score result from fast-path evaluation
+ */
+export interface LayoutScoreResult {
+    overall_score: number;
+    content_fit?: number;
+    visual_balance?: number;
+    readability?: number;
+    primary_issue?: 'none' | 'overflow' | 'sparse' | 'misaligned' | 'cramped';
+    recommendation?: string;
+}
+
+/**
+ * Fast-path layout scoring using /no_think mode
+ * 
+ * Optimized for rapid iteration during layout selection:
+ * - Uses /no_think mode (perception-only, no reasoning chain)
+ * - Layout Selector persona for focused evaluation
+ * - Minimal token output (~256 tokens max)
+ * - ~100-200ms latency vs ~500ms for full critique
+ * 
+ * @param svgString - SVG proxy string
+ * @param costTracker - Optional cost tracker
+ * @returns Layout score result with breakdown
+ */
+export async function getLayoutScoreFast(
+    svgString: string,
+    costTracker?: CostTracker
+): Promise<LayoutScoreResult | null> {
+    if (!qwenVLClient.isAvailable() && !QWEN_VL_PROXY_URL) {
+        console.warn('[QWEN-VL] Fast scoring unavailable - API not configured');
+        return null;
+    }
+
+    const sanitizeSvg = (input: string) =>
+        input.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[a-fA-F0-9]+;)/g, '&amp;');
+
+    const safeSvg = sanitizeSvg(svgString);
+    const isBrowser = typeof window !== 'undefined';
+
+    try {
+        if (isBrowser) {
+            if (!QWEN_VL_PROXY_URL) {
+                return null;
+            }
+
+            console.log('[QWEN-VL] Fast score: SVG → Qwen-VL via proxy');
+            const result = await callQwenProxy<LayoutScoreResult>(
+                '/api/qwen/layout-score',
+                { svgString: safeSvg },
+                costTracker
+            );
+            return result;
+        }
+
+        // Node path: rasterize and score
+        console.log('[QWEN-VL] Fast score: SVG → PNG → Qwen-VL');
+        const pngBase64 = await svgToPngBase64(safeSvg, 1920, 1080);
+        
+        const messages = buildQwenMessage(
+            QWEN_PERSONAS.LAYOUT_SELECTOR,
+            LAYOUT_SELECTOR_PROMPT,
+            pngBase64
+        );
+
+        const requestConfig = getQwenRequestConfig('layout_select');
+
+        const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${qwenVLClient['apiKey']}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ...requestConfig,
+                messages
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Qwen-VL API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (costTracker && data.usage) {
+            costTracker.addQwenVLCost(
+                data.usage.prompt_tokens || 0,
+                data.usage.completion_tokens || 0
+            );
+        }
+
+        const responseText = data.choices?.[0]?.message?.content || '';
+        
+        // Parse JSON response
+        let parsed: any;
+        try {
+            parsed = JSON.parse(responseText.trim());
+        } catch {
+            // Try extracting from code blocks
+            const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+            if (jsonMatch) {
+                parsed = JSON.parse(jsonMatch[1].trim());
+            } else {
+                const rawMatch = responseText.match(/\{[\s\S]*\}/);
+                if (rawMatch) {
+                    parsed = JSON.parse(rawMatch[0]);
+                } else {
+                    throw new Error('Failed to parse layout score response');
+                }
+            }
+        }
+
+        console.log(`[QWEN-VL] Fast score: ${parsed.overall_score}/100`);
+        return parsed as LayoutScoreResult;
+
+    } catch (error: any) {
+        console.error('[QWEN-VL] Fast score failed:', error.message);
+        return null;
+    }
+}
+
+// --- REPAIR NORMALIZATION ---
+
+/**
+ * Extract numeric values from repair reason text when params are missing.
+ * Qwen-VL often describes values in natural language instead of providing them in params.
+ * 
+ * Examples:
+ * - "moving down to y=0.35" → { y: 0.35 }
+ * - "increasing line height to 1.8" → { lineHeight: 1.8 }
+ * - "y=0.26 creates balanced whitespace" → { y: 0.26 }
+ * - "shrinking to 40% width" → { width: 0.4 }
+ */
+function extractParamsFromReason(action: string, reason: string): Record<string, number | string> {
+    const extracted: Record<string, number | string> = {};
+    const reasonLower = reason.toLowerCase();
+    
+    // Pattern: y=0.XX or y position of 0.XX or ~XX% vertical
+    const yMatch = reason.match(/y[=:]?\s*(\d+\.?\d*)|(\d+\.?\d*)\s*vertical|~(\d+)%\s*vertical/i);
+    if (yMatch) {
+        const val = yMatch[1] || yMatch[2] || (yMatch[3] ? parseFloat(yMatch[3]) / 100 : null);
+        if (val !== null) {
+            const numVal = typeof val === 'string' ? parseFloat(val) : val;
+            if (!isNaN(numVal) && numVal >= 0 && numVal <= 1) {
+                extracted.y = numVal;
+            }
+        }
+    }
+    
+    // Pattern: x=0.XX or x position
+    const xMatch = reason.match(/x[=:]?\s*(\d+\.?\d*)/i);
+    if (xMatch) {
+        const val = parseFloat(xMatch[1]);
+        if (!isNaN(val) && val >= 0 && val <= 1) {
+            extracted.x = val;
+        }
+    }
+    
+    // Pattern: line height to 1.X or lineHeight: 1.X
+    const lineHeightMatch = reason.match(/line[\s-]?height[^0-9]*(\d+\.?\d*)/i);
+    if (lineHeightMatch) {
+        const val = parseFloat(lineHeightMatch[1]);
+        if (!isNaN(val) && val >= 1 && val <= 3) {
+            extracted.lineHeight = val;
+        }
+    }
+    
+    // Pattern: XX% width/height
+    const percentMatch = reason.match(/(\d+)%\s*(width|height)/gi);
+    if (percentMatch) {
+        for (const match of percentMatch) {
+            const parts = match.match(/(\d+)%\s*(width|height)/i);
+            if (parts) {
+                const val = parseFloat(parts[1]) / 100;
+                const dim = parts[2].toLowerCase();
+                if (!isNaN(val) && val > 0 && val <= 1) {
+                    extracted[dim] = val;
+                }
+            }
+        }
+    }
+    
+    // Pattern: padding/margin to X% or spacing of X%
+    const paddingMatch = reason.match(/(?:padding|margin|spacing)[^0-9]*(\d+)%/i);
+    if (paddingMatch) {
+        const val = parseFloat(paddingMatch[1]) / 100;
+        if (!isNaN(val) && val > 0 && val < 0.5) {
+            extracted.padding = val;
+        }
+    }
+    
+    // Pattern: gap of X% or gap to X%
+    const gapMatch = reason.match(/gap[^0-9]*(\d+)%/i);
+    if (gapMatch) {
+        const val = parseFloat(gapMatch[1]) / 100;
+        if (!isNaN(val) && val > 0 && val < 0.3) {
+            extracted.itemSpacing = val;
+        }
+    }
+    
+    // Pattern: color #XXXXXX
+    const colorMatch = reason.match(/#([A-Fa-f0-9]{6})/);
+    if (colorMatch && action === 'adjust_color') {
+        extracted.color = `#${colorMatch[1]}`;
+    }
+    
+    // Pattern: remove X items
+    const removeMatch = reason.match(/remov(?:e|ing)\s*(\d+)\s*items?/i);
+    if (removeMatch && action === 'simplify_content') {
+        const val = parseInt(removeMatch[1]);
+        if (!isNaN(val) && val > 0 && val <= 5) {
+            extracted.removeCount = val;
+        }
+    }
+    
+    return extracted;
+}
+
+/**
+ * Normalize repair action - merge params from structured data and extracted from reason.
+ * Ensures all repairs have valid numeric parameters.
+ */
+function normalizeRepair(repair: RepairAction): RepairAction {
+    const { action, params = {}, reason = '' } = repair;
+    
+    // Extract any values mentioned in reason text
+    const extractedParams = extractParamsFromReason(action, reason);
+    
+    // Merge: explicit params take precedence, then extracted from reason
+    const mergedParams: Record<string, any> = { ...extractedParams };
+    
+    // Only keep non-undefined params from original
+    for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) {
+            mergedParams[key] = value;
+        }
+    }
+    
+    // Apply sensible defaults for common repair types if still missing
+    if (action === 'adjust_spacing') {
+        if (mergedParams.lineHeight === undefined) {
+            mergedParams.lineHeight = 1.6; // Safe default
+        }
+    }
+    
+    return {
+        ...repair,
+        params: mergedParams
+    };
+}
+
+/**
+ * Normalize all repairs in a batch, logging what was extracted/defaulted.
+ */
+function normalizeRepairs(repairs: RepairAction[]): RepairAction[] {
+    return repairs.map(repair => {
+        const normalized = normalizeRepair(repair);
+        
+        // Log if we extracted values from reason
+        const originalHadParams = Object.values(repair.params || {}).some(v => v !== undefined);
+        const normalizedHasParams = Object.values(normalized.params || {}).some(v => v !== undefined);
+        
+        if (!originalHadParams && normalizedHasParams) {
+            console.log(`[REPAIR] Extracted params from reason: ${JSON.stringify(normalized.params)}`);
+        }
+        
+        return normalized;
+    });
+}
+
 // --- VISUAL ARCHITECT IMPLEMENTATION ---
 
 import type {
@@ -897,10 +1114,27 @@ function applyRepairsToSlide(
                 break;
 
             case 'adjust_spacing':
-                console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params?.padding}, lineHeight=${params?.lineHeight} (${reason})`);
-                // Add spacing hints
+                // CRITICAL FIX: Spacing increases cause overflow in tight layouts
+                // Only apply spacing adjustments that REDUCE space, not increase it
+                const currentLineHeight = (component as any)._hintLineHeight || 1.4;
+                const requestedLineHeight = params?.lineHeight;
+                
+                // SAFETY: Never increase line height above 1.5 (causes overflow)
+                // Qwen-VL often suggests 1.6-1.8 which breaks tight layouts
+                if (requestedLineHeight && requestedLineHeight > 1.5) {
+                    console.warn(`[REPAIR] Blocking line-height increase to ${requestedLineHeight} (max: 1.5) for ${component_id}`);
+                    // Cap at 1.5 instead of requested value
+                    if (requestedLineHeight > currentLineHeight) {
+                        (component as any)._hintLineHeight = Math.min(1.5, requestedLineHeight);
+                    }
+                } else if (params?.lineHeight !== undefined) {
+                    (component as any)._hintLineHeight = params.lineHeight;
+                }
+                
+                console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params?.padding}, lineHeight=${(component as any)._hintLineHeight || params?.lineHeight} (${reason})`);
+                
+                // Padding increases are generally safe
                 if (params?.padding !== undefined) (component as any)._hintPadding = params.padding;
-                if (params?.lineHeight !== undefined) (component as any)._hintLineHeight = params.lineHeight;
                 if (params?.itemSpacing !== undefined) (component as any)._hintItemSpacing = params.itemSpacing;
                 appliedCount++;
                 break;
@@ -1033,8 +1267,12 @@ export async function runQwenVisualArchitectLoop(
             totalOutputTokens = Math.max(0, postQwen.outputTokens - preQwen.outputTokens);
 
             const currentScore = critiqueResult.overall_score || 0;
-            const repairs = critiqueResult.repairs || [];
+            const rawRepairs = critiqueResult.repairs || [];
             const verdict = critiqueResult.verdict || 'flag_for_review';
+            
+            // CRITICAL: Normalize repairs to ensure params have numeric values
+            // Extracts values from reason text when Qwen-VL doesn't provide them in params
+            const repairs = normalizeRepairs(rawRepairs);
 
             console.log(`[VISUAL ARCHITECT] Score: ${currentScore}/100, Verdict: ${verdict}, Repairs: ${repairs.length}`);
 
@@ -1068,7 +1306,7 @@ export async function runQwenVisualArchitectLoop(
                 };
             }
 
-            // Step 4: Apply repairs
+            // Step 4: Apply repairs (already normalized)
             if (repairs.length > 0) {
                 console.log(`[VISUAL ARCHITECT] Applying ${repairs.length} repairs...`);
                 currentSlide = applyRepairsToSlide(currentSlide, repairs, styleGuide);

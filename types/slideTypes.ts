@@ -96,6 +96,38 @@ export const VISUAL_THRESHOLDS = {
   FALLBACK: 50          // Give up
 } as const;
 
+// Premium/Serendipity Mode Thresholds (higher bar for quality)
+// Used when SERENDIPITY_MODE_ENABLED is true
+export const PREMIUM_VISUAL_THRESHOLDS = {
+  EXCELLENT: 98,        // Near-perfect Steve Jobs quality
+  TARGET: 90,           // Premium target for iteration
+  REPAIR_REQUIRED: 75,  // Higher bar for repair trigger
+  CRITICAL: 65,         // Higher critical threshold
+  FALLBACK: 55          // Still give up, but slightly higher bar
+} as const;
+
+// Premium quality checks for serendipity mode
+export const PREMIUM_QUALITY_CHECKS = {
+  // Typography checks
+  MIN_TITLE_FONT_SIZE: 32,
+  MIN_BODY_FONT_SIZE: 14,
+  MAX_FONT_SIZE_RATIO: 3.5, // Title shouldn't be > 3.5x body size
+  
+  // Spacing checks (slide units)
+  MIN_PADDING: 0.15,
+  MIN_NEGATIVE_SPACE_PERCENT: 20,
+  MAX_ELEMENT_DENSITY: 12, // Max distinct elements per slide
+  
+  // Card checks
+  MAX_CARDS_PER_SLIDE: 4,
+  MIN_CARD_WIDTH: 1.8,
+  MIN_CARD_HEIGHT: 2.0,
+  
+  // Badge checks
+  MAX_BADGES_PER_SLIDE: 2,
+  MIN_BADGE_CONTRAST_RATIO: 4.5
+} as const;
+
 export type VisualThreshold = typeof VISUAL_THRESHOLDS[keyof typeof VISUAL_THRESHOLDS];
 
 // --- VISUAL & SPATIAL SCHEMAS (NEW) ---
@@ -590,6 +622,11 @@ export type VisualElement =
     align?: "left" | "center" | "right";
     rotation?: number;
     zIndex?: number;
+    // Premium typography enhancements
+    letterSpacing?: number; // Letter spacing in points (0 = normal, 1.5 = spread for overlines)
+    lineHeight?: number;    // Line height multiplier (1.0 = normal, 1.4 = comfortable body text)
+    fontWeight?: number;    // Explicit font weight (400 = regular, 700 = bold, 800 = extra bold)
+    textTransform?: 'uppercase' | 'lowercase' | 'capitalize' | 'none';
   }
   | {
     type: 'image';
