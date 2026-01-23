@@ -37,9 +37,19 @@ import { generateSvgProxy } from "./visual/svgProxy";
 import { runResearcher } from "./agents/researcher";
 import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
-import { runContentPlanner } from "./agents/contentPlanner";
+import { runContentPlanner, ContentDensityHint, ContentPlanResult } from "./agents/contentPlanner";
 import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
+import { 
+    runCompositionArchitect, 
+    trackUsedSurprises,
+    computeDetailedVariationBudget 
+} from "./agents/compositionArchitect";
+import { CompositionPlan, SerendipityDNA } from "../types/serendipityTypes";
 import { z } from "zod";
+
+// --- FEATURE FLAGS ---
+// Enable serendipity mode for high-variation slide generation
+export const SERENDIPITY_MODE_ENABLED = false; // Set to true to enable layer-based composition
 
 // --- CONSTANTS ---
 // Model tiers imported from interactionsClient for consistency
@@ -51,6 +61,95 @@ import { z } from "zod";
 import { MODEL_AGENTIC } from "./interactionsClient";
 
 const MAX_AGENT_ITERATIONS = 10; // Global escape hatch per Phil Schmid's recommendation (reduced from 15 for faster convergence)
+
+// --- AGENT DATA CONTRACT UTILITIES ---
+
+/**
+ * Creates a guaranteed-valid ContentPlanResult for use when actual planning fails
+ * or when we need defensive defaults. This is the canonical fallback shape.
+ */
+function createSafeContentPlan(meta: any, source: string = 'defensive'): ContentPlanResult {
+    return {
+        title: meta?.title || 'Slide Content',
+        keyPoints: [meta?.purpose || 'Key insight for this slide'],
+        dataPoints: [],
+        narrative: `Generated via ${source} fallback`
+    };
+}
+
+/**
+ * Validates and normalizes a content plan result, ensuring it matches the expected contract.
+ * This is the SINGLE source of truth for content plan validation across all agents.
+ */
+function ensureValidContentPlan(plan: any, meta: any): ContentPlanResult {
+    // Handle null/undefined
+    if (!plan || typeof plan !== 'object') {
+        console.warn('[ORCHESTRATOR] Content plan is null/undefined, using defensive fallback');
+        return createSafeContentPlan(meta, 'null-guard');
+    }
+
+    // Validate keyPoints - the most critical field
+    const hasValidKeyPoints = Array.isArray(plan.keyPoints) && 
+        plan.keyPoints.length > 0 && 
+        plan.keyPoints.some((kp: any) => typeof kp === 'string' && kp.trim().length > 0);
+
+    if (!hasValidKeyPoints) {
+        console.warn('[ORCHESTRATOR] Content plan has invalid keyPoints, using defensive fallback');
+        return createSafeContentPlan(meta, 'keyPoints-guard');
+    }
+
+    // Return normalized plan with guaranteed shape
+    return {
+        title: typeof plan.title === 'string' && plan.title.trim() 
+            ? plan.title.trim() 
+            : (meta?.title || 'Slide Content'),
+        keyPoints: plan.keyPoints
+            .filter((kp: any) => typeof kp === 'string' && kp.trim().length > 0)
+            .map((kp: string) => kp.trim()),
+        dataPoints: Array.isArray(plan.dataPoints) 
+            ? plan.dataPoints.filter((dp: any) => dp && typeof dp === 'object' && dp.label)
+            : [],
+        narrative: typeof plan.narrative === 'string' ? plan.narrative : undefined,
+        chartSpec: plan.chartSpec && typeof plan.chartSpec === 'object' && plan.chartSpec.type
+            ? plan.chartSpec
+            : undefined
+    };
+}
+
+const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+
+const hashStringToUnit = (input: string): number => {
+    let hash = 0;
+    for (let i = 0; i < input.length; i++) {
+        hash = ((hash << 5) - hash) + input.charCodeAt(i);
+        hash |= 0;
+    }
+    return clamp01((Math.abs(hash) % 1000) / 1000);
+};
+
+const computeVariationBudget = (
+    slideIndex: number,
+    totalSlides: number,
+    slideType?: string,
+    seed?: string
+): number => {
+    const isTitle = slideIndex === 0 || slideType === SLIDE_TYPES.TITLE;
+    const isConclusion = slideIndex === totalSlides - 1 || slideType === SLIDE_TYPES.CONCLUSION;
+    const base = isTitle || isConclusion ? 0.25 : 0.45;
+    const drift = 0.15 * (slideIndex / Math.max(1, totalSlides - 1));
+    const jitter = seed ? (hashStringToUnit(seed) - 0.5) * 0.2 : 0;
+    return clamp01(base + drift + jitter);
+};
+
+const buildStyleHints = (
+    styleGuide: GlobalStyleGuide | undefined,
+    variationBudget: number
+) => ({
+    themeName: styleGuide?.themeName,
+    colorPalette: styleGuide?.colorPalette,
+    styleDNA: styleGuide?.styleDNA,
+    variationBudget: clamp01(variationBudget)
+});
 
 // Deterministic visual focus enforcement for visual design spec
 function enforceVisualFocusInSpec(
@@ -117,6 +216,33 @@ function trimText(input: string, max: number): string {
     return input.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
 }
 
+function getBodyFontSize(styleGuide?: GlobalStyleGuide): number {
+    const body = styleGuide?.themeTokens?.typography?.scale?.body;
+    if (typeof body === 'number' && body > 6) return body;
+    return 14;
+}
+
+function isMonospaceFont(fontFamily?: string): boolean {
+    if (!fontFamily) return false;
+    return /mono|code|courier|consolas|fira.*code|source.*code/i.test(fontFamily);
+}
+
+function computeDynamicBulletCharCap(
+    baseCap: number,
+    bulletCount: number,
+    styleGuide?: GlobalStyleGuide
+): number {
+    const fontSize = getBodyFontSize(styleGuide);
+    const fontFamily = styleGuide?.fontFamilyBody;
+    
+    // Font-aware adjustment: monospace fonts are ~30% wider per character
+    const monospacePenalty = isMonospaceFont(fontFamily) ? 0.7 : 1.0;
+    
+    const fontAdjusted = Math.round(baseCap * (14 / fontSize) * monospacePenalty);
+    const countAdjusted = bulletCount >= 3 ? Math.round(fontAdjusted * 0.9) : fontAdjusted;
+    return Math.max(30, Math.min(countAdjusted, 100)); // Tighter limits for safety
+}
+
 function applySpatialPreflightAdjustments(
     slide: SlideNode,
     styleGuide: GlobalStyleGuide
@@ -144,15 +270,28 @@ function applySpatialPreflightAdjustments(
     const variant = updatedSlide.routerConfig?.layoutVariant || 'standard-vertical';
     const limits = VARIANT_LIMITS[variant] || VARIANT_LIMITS['standard-vertical'];
     const tightenedBulletLimit = hasTruncation ? Math.max(1, limits.bullets - 1) : limits.bullets;
-    const tightenedBulletChars = hasTruncation ? Math.min(limits.bulletChars, 60) : limits.bulletChars;
 
     const components = updatedSlide.layoutPlan?.components || [];
+    const baseBulletCharCap = computeDynamicBulletCharCap(limits.bulletChars, 2, styleGuide);
+    const tightenedBulletCharsForDescriptions = hasTruncation
+        ? Math.max(40, Math.round(baseBulletCharCap * 0.9))
+        : baseBulletCharCap;
 
     components.forEach((c: any) => {
         if (c.type === 'text-bullets') {
             if (Array.isArray(c.content)) {
                 const before = c.content.length;
-                c.content = c.content.slice(0, tightenedBulletLimit).map((t: string) => trimText(String(t), tightenedBulletChars));
+                const bulletCharCap = computeDynamicBulletCharCap(
+                    limits.bulletChars,
+                    c.content.length,
+                    styleGuide
+                );
+                const tightenedBulletChars = hasTruncation
+                    ? Math.max(40, Math.round(bulletCharCap * 0.9))
+                    : bulletCharCap;
+                c.content = c.content
+                    .slice(0, tightenedBulletLimit)
+                    .map((t: string) => trimText(String(t), tightenedBulletChars));
                 if (before !== c.content.length) adjustments.push('reduced bullets');
             }
             if (c.title) c.title = trimText(String(c.title), 50);
@@ -167,7 +306,7 @@ function applySpatialPreflightAdjustments(
             c.steps = c.steps.slice(0, limits.steps).map((s: any) => ({
                 ...s,
                 title: s.title ? trimText(String(s.title), 18) : s.title,
-                description: s.description ? trimText(String(s.description), tightenedBulletChars) : s.description
+                description: s.description ? trimText(String(s.description), tightenedBulletCharsForDescriptions) : s.description
             }));
             if (before !== c.steps.length) adjustments.push('reduced steps');
         }
@@ -203,7 +342,7 @@ function applySpatialPreflightAdjustments(
     const existingWarnings = updatedSlide.warnings || [];
     updatedSlide.warnings = existingWarnings.filter(w => !spatialWarningRegex.test(String(w)));
 
-    const repaired = autoRepairSlide(updatedSlide);
+    const repaired = autoRepairSlide(updatedSlide, styleGuide);
     const rerender = new SpatialLayoutEngine();
     rerender.renderWithSpatialAwareness(
         repaired,
@@ -590,7 +729,7 @@ async function runRecursiveVisualCritique(
                 }
 
                 // Apply deterministic repair normalization
-                const normalizedRepair = autoRepairSlide(repairedCandidate);
+                const normalizedRepair = autoRepairSlide(repairedCandidate, styleGuide);
 
                 // ... (rest of the block)
                 const repairedValidation = validateSlide(normalizedRepair);
@@ -694,7 +833,7 @@ async function runRecursiveVisualCritique(
  *
  * @param meta - Slide metadata
  * @param routerConfig - Router decision (layout, density, etc.)
- * @param contentPlan - Content plan from planner
+ * @param contentPlan - Content plan from planner (should be validated ContentPlanResult)
  * @param visualDesignSpec - Visual design spec (optional)
  * @param facts - Research facts
  * @param factClusters - Fact clusters from architect
@@ -705,7 +844,7 @@ async function runRecursiveVisualCritique(
 async function runGenerator(
     meta: any,
     routerConfig: RouterDecision,
-    contentPlan: any,
+    contentPlan: ContentPlanResult | any, // Accept typed or untyped for backwards compatibility
     visualDesignSpec: VisualDesignSpec | undefined,
     facts: ResearchFact[],
     factClusters: z.infer<typeof FactClusterSchema>[],
@@ -759,23 +898,32 @@ async function runGenerator(
     let lastValidation: any = null;
     let generatorFailures = 0;
 
+    // CRITICAL: Ensure contentPlan has valid shape before processing
+    // The caller should already pass validated ContentPlanResult, but we guard defensively
+    const safeContentPlan: ContentPlanResult = (contentPlan && typeof contentPlan === 'object' && Array.isArray(contentPlan.keyPoints))
+        ? {
+            title: String(contentPlan.title || meta?.title || 'Slide'),
+            keyPoints: contentPlan.keyPoints.filter((kp: any) => typeof kp === 'string' && kp.trim()),
+            dataPoints: Array.isArray(contentPlan.dataPoints) ? contentPlan.dataPoints : [],
+            narrative: contentPlan.narrative,
+            chartSpec: contentPlan.chartSpec
+          }
+        : createSafeContentPlan(meta, 'generator-guard');
+    
     // AGGRESSIVE PRE-TRUNCATION: Limit contentPlan size before prompt construction
     // Reduced limits to prevent token exhaustion causing "o0o0o0" degeneration
-    let safeContentPlan = { ...contentPlan };
-    if (safeContentPlan.keyPoints && safeContentPlan.keyPoints.length > 4) {
+    if (safeContentPlan.keyPoints.length > 4) {
         console.warn(`[GENERATOR] Truncating keyPoints from ${safeContentPlan.keyPoints.length} to 4`);
         safeContentPlan.keyPoints = safeContentPlan.keyPoints.slice(0, 4);
     }
-    if (safeContentPlan.dataPoints && safeContentPlan.dataPoints.length > 3) {
+    if (safeContentPlan.dataPoints.length > 3) {
         console.warn(`[GENERATOR] Truncating dataPoints from ${safeContentPlan.dataPoints.length} to 3`);
         safeContentPlan.dataPoints = safeContentPlan.dataPoints.slice(0, 3);
     }
     // Truncate individual key points if too long (prevent verbose LLM inputs)
-    if (safeContentPlan.keyPoints) {
-        safeContentPlan.keyPoints = safeContentPlan.keyPoints.map((kp: string) =>
-            kp.length > 150 ? kp.slice(0, 147) + '...' : kp
-        );
-    }
+    safeContentPlan.keyPoints = safeContentPlan.keyPoints.map((kp: string) =>
+        kp.length > 150 ? kp.slice(0, 147) + '...' : kp
+    );
 
     // Apply deterministic visual focus enforcement early to avoid repeated validation loops
     const enforcedVisualDesignSpec = enforceVisualFocusInSpec(visualDesignSpec, routerConfig.visualFocus);
@@ -832,6 +980,11 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                 mainPoint: h.mainPoint.substring(0, 50)
             }));
 
+            const totalSlidesForBudget = progress?.totalSlides || (meta?.totalSlides as number) || 10;
+            const slideIndexForBudget = progress?.slideIndex ?? (meta.order ? meta.order - 1 : 0);
+            const variationBudget = computeVariationBudget(slideIndexForBudget, totalSlidesForBudget, meta.type, meta.title);
+            const styleHints = buildStyleHints(styleGuide, variationBudget);
+
             let basePrompt: string;
             if (isRecoveryAttempt && lastValidation?.errors) {
                 // Compact repair prompt
@@ -845,7 +998,8 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                     JSON.stringify(safeContentPlan),
                     compressedRouterConfig,
                     compressedVisualSpec,
-                    compressedHistory
+                    compressedHistory,
+                    styleHints
                 );
             }
 
@@ -867,7 +1021,8 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                     JSON.stringify(safeContentPlan),
                     compressedRouterConfig,
                     undefined, // Drop visual spec
-                    compressedHistory
+                    compressedHistory,
+                    styleHints
                 );
                 prompt = basePrompt;
             }
@@ -883,7 +1038,8 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                     JSON.stringify(safeContentPlan),
                     ultraRouter,
                     undefined,
-                    compressedHistory
+                    compressedHistory,
+                    styleHints
                 );
                 prompt = basePrompt;
             }
@@ -926,8 +1082,9 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                 warnings: []
             };
 
-            if (Array.isArray(contentPlan?.keyPoints) && contentPlan.keyPoints.length > 0) {
-                candidate.content = contentPlan.keyPoints;
+            // Use safeContentPlan (not raw contentPlan) for guaranteed-valid keyPoints
+            if (Array.isArray(safeContentPlan.keyPoints) && safeContentPlan.keyPoints.length > 0) {
+                candidate.content = safeContentPlan.keyPoints;
             }
 
             // Auto-add chart frame if needed
@@ -943,7 +1100,7 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                 }
             }
 
-            candidate = autoRepairSlide(candidate);
+            candidate = autoRepairSlide(candidate, styleGuide);
             const preflight = applySpatialPreflightAdjustments(candidate, styleGuide);
             candidate = preflight.slide;
             if (preflight.adjustments.length > 0) {
@@ -1058,7 +1215,19 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
                 /Qwen QA flagged|Auto-rerouted layout|Converted .* to text-bullets|Preflight adjustments|Validation:/i.test(String(w))
             );
 
+            // CRITICAL: Check for STRUCTURAL issues (overflow/truncation) vs COSMETIC issues
+            // Visual Architect can only fix cosmetic issues (spacing, positioning, colors)
+            // Structural issues require content reduction or layout change - Visual Architect cannot help
+            const hasStructuralIssues = (candidate.warnings || []).some(w =>
+                /truncated|hidden|overflow|requires \d+\.\d+ units but only/i.test(String(w))
+            );
+            
+            if (hasStructuralIssues) {
+                console.log(`[GENERATOR] Skipping Visual Architect: structural issues detected (overflow/truncation). Visual repairs won't help.`);
+            }
+
             const shouldRunVisualRepair = VISUAL_REPAIR_ENABLED
+                && !hasStructuralIssues // Skip if structural issues exist
                 && (validation.passed || qualityFlags)
                 && (validation.score < VISUAL_THRESHOLDS.TARGET || hasSpatialWarnings || qualityFlags);
 
@@ -1396,7 +1565,7 @@ chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"l
             components: [{
                 type: 'text-bullets',
                 title: "Key Insights",
-                content: safeContentPlan.keyPoints || contentPlan.keyPoints || ["Data unavailable."],
+                content: safeContentPlan.keyPoints || ["Data unavailable."],
                 style: 'standard'
             }]
         },
@@ -1437,6 +1606,10 @@ export const generateAgenticDeck = async (
 
     // --- PHASE 1: CONTEXT FOLDING STATE ---
     const narrativeHistory: NarrativeTrail[] = [];
+
+    // --- SERENDIPITY STATE (Layer-based composition) ---
+    let usedSurprisesInDeck: string[] = []; // Track used surprise types to avoid repetition
+    let serendipityDNA: SerendipityDNA | undefined;
 
     // --- RELIABILITY METRICS ---
     let fallbackSlides = 0;
@@ -1495,13 +1668,28 @@ export const generateAgenticDeck = async (
             }
             const factsContext = relevantClusterFacts.join('\n') || "No specific facts found.";
 
+            // Compute density hints based on slide type and position
+            // Earlier slides and hero-centered get tighter budgets
+            const isHeroOrIntro = slideMeta.type === 'title-slide' || slideMeta.type === 'section-header' || i === 0;
+            const densityHint: ContentDensityHint = {
+                maxBullets: isHeroOrIntro ? 2 : 3,
+                maxCharsPerBullet: isHeroOrIntro ? 60 : 80,
+                maxDataPoints: 3
+            };
+
             onProgress(`Agent 3b/5: Content Planning Slide ${i + 1}...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
-            const contentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
+            
+            // CRITICAL: Content Planner now returns typed ContentPlanResult
+            // We still validate with ensureValidContentPlan for defense-in-depth
+            const rawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, densityHint);
+            const safeContentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, slideMeta);
+            
+            console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints`);
 
             // 3b.1 Qwen Layout Selector (visual QA-driven layout selection)
             routerConfig = await runQwenLayoutSelector(
                 slideMeta,
-                contentPlan,
+                safeContentPlan,
                 routerConfig,
                 outline.styleGuide,
                 costTracker,
@@ -1511,12 +1699,15 @@ export const generateAgenticDeck = async (
             // 3c. Visual Design (using Interactions API) - Track first-pass success
             onProgress(`Agent 3c/5: Visual Design Slide ${i + 1}...`, 34 + Math.floor((i / (totalSlides * 2)) * 30));
             totalVisualDesignAttempts++;
+            const variationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
-                contentPlan,
+                safeContentPlan,
                 routerConfig,
                 facts,
-                costTracker
+                costTracker,
+                outline.styleGuide,
+                variationBudget
             );
 
             // Phase 2: Track visual alignment first-pass success
@@ -1528,14 +1719,65 @@ export const generateAgenticDeck = async (
                 console.log(`[ORCHESTRATOR] Visual design needs improvement (score: ${visualValidation.score})`);
             }
 
+            // 3c.1 COMPOSITION ARCHITECT (Serendipity Mode - Layer-based composition)
+            // Runs only when SERENDIPITY_MODE_ENABLED is true
+            let compositionPlan: CompositionPlan | undefined;
+            if (SERENDIPITY_MODE_ENABLED) {
+                onProgress(`Agent 3c.1/5: Composition Architecture Slide ${i + 1}...`, 36 + Math.floor((i / (totalSlides * 2)) * 30));
+                
+                // Extract serendipity DNA from style guide on first slide
+                if (i === 0 && outline.styleGuide.styleDNA) {
+                    serendipityDNA = {
+                        motifs: outline.styleGuide.styleDNA.motifs || [],
+                        texture: outline.styleGuide.styleDNA.texture,
+                        gridRhythm: outline.styleGuide.styleDNA.gridRhythm,
+                        accentRule: outline.styleGuide.styleDNA.accentRule,
+                        cardStyle: outline.styleGuide.styleDNA.cardStyle || 'glass',
+                        surpriseCues: outline.styleGuide.styleDNA.surpriseCues
+                    };
+                }
+                
+                const detailedBudget = computeDetailedVariationBudget(
+                    i, 
+                    totalSlides, 
+                    slideMeta.type,
+                    serendipityDNA
+                );
+                
+                compositionPlan = await runCompositionArchitect({
+                    slideId: `slide-${i}`,
+                    slideTitle: slideMeta.title,
+                    slidePurpose: slideMeta.purpose,
+                    routerConfig,
+                    contentPlan: {
+                        keyPoints: safeContentPlan.keyPoints || [],
+                        dataPoints: (safeContentPlan as any).dataPoints || []
+                    },
+                    serendipityDNA,
+                    variationBudget: detailedBudget.overall,
+                    narrativeTrail: recentHistory,
+                    usedSurprisesInDeck
+                }, costTracker);
+                
+                // Track used surprises to avoid repetition
+                usedSurprisesInDeck = trackUsedSurprises(usedSurprisesInDeck, compositionPlan);
+                
+                console.log(`[ORCHESTRATOR] Composition plan: ${compositionPlan.layerPlan.contentStructure.pattern}, surprises: ${compositionPlan.serendipityPlan.allocatedSurprises.length}`);
+            }
+
             // 3d. Final Generation (with narrative history + circuit breaker)
             // GAP 3: Bounded reroute loop to prevent infinite reroutes
             const MAX_REROUTES_PER_SLIDE = 2;
             let slideRerouteCount = 0;
-            let generatorResult: any;
-            let currentContentPlan = contentPlan;
+            let generatorResult: GeneratorResult;
+            
+            // CRITICAL: Use typed ContentPlanResult throughout the generation loop
+            // This ensures all downstream consumers (generator, visual designer, layout selector)
+            // receive a guaranteed-valid content plan shape
+            let currentContentPlan: ContentPlanResult = safeContentPlan;
             let currentVisualDesign = visualDesign;
             let currentRouterConfig = routerConfig;
+            let currentCompositionPlan = compositionPlan; // Pass composition plan to generator
 
             while (slideRerouteCount <= MAX_REROUTES_PER_SLIDE) {
                 onProgress(`Agent 4/5: Generating Slide ${i + 1}...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
@@ -1579,8 +1821,17 @@ export const generateAgenticDeck = async (
                     };
                     currentRouterConfig = await runRouter(slideMeta, costTracker, newConstraints);
 
-                    // Re-run content planner and visual designer with new route
-                    currentContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory);
+                    // TIGHTER density hints on reroute - content overflow was likely the issue
+                    const rerouteDensityHint: ContentDensityHint = {
+                        maxBullets: 2, // Stricter on reroute
+                        maxCharsPerBullet: 60, // Shorter bullets
+                        maxDataPoints: 2
+                    };
+                    
+                    // Re-run content planner with tighter constraints and validate result
+                    const rerouteRawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, rerouteDensityHint);
+                    currentContentPlan = ensureValidContentPlan(rerouteRawContentPlan, slideMeta);
+                    console.log(`[ORCHESTRATOR] Reroute content plan: ${currentContentPlan.keyPoints.length} keyPoints`);
 
                     // Re-run Qwen layout selector (visual QA-driven)
                     currentRouterConfig = await runQwenLayoutSelector(
@@ -1591,12 +1842,15 @@ export const generateAgenticDeck = async (
                         costTracker,
                         newConstraints
                     );
+                    const rerouteVariationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
                     currentVisualDesign = await runVisualDesigner(
                         slideMeta.title,
                         currentContentPlan,
                         currentRouterConfig,
                         facts,
-                        costTracker
+                        costTracker,
+                        outline.styleGuide,
+                        rerouteVariationBudget
                     );
 
                     // Continue loop for another attempt
@@ -1617,6 +1871,11 @@ export const generateAgenticDeck = async (
             }
 
             const slideNode = generatorResult.slide;
+            
+            // Attach composition plan to slide for layer-aware rendering
+            if (SERENDIPITY_MODE_ENABLED && currentCompositionPlan) {
+                slideNode.compositionPlan = currentCompositionPlan;
+            }
 
             // Track if this is a fallback slide
             if (slideNode.visualReasoning?.includes('Fallback')) {
@@ -1831,7 +2090,11 @@ export const regenerateSingleSlide = async (
     };
 
     let routerConfig = await runRouter(meta, costTracker);
-    const contentPlan = await runContentPlanner(meta, "", costTracker);
+    
+    // Use typed content plan with validation for single slide regeneration
+    const rawContentPlan = await runContentPlanner(meta, "", costTracker);
+    const contentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, meta);
+    
     routerConfig = await runQwenLayoutSelector(
         meta,
         contentPlan,
@@ -1844,7 +2107,9 @@ export const regenerateSingleSlide = async (
         contentPlan,
         routerConfig,
         facts,
-        costTracker
+        costTracker,
+        defaultStyleGuide,
+        computeVariationBudget(0, 1, meta.type, meta.title)
     );
 
     // Generator now returns GeneratorResult, extract the slide

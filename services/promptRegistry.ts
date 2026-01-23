@@ -46,6 +46,18 @@ export const PROMPTS = {
       - Spacing (slide units): xs 0.06-0.1, sm 0.1-0.14, md 0.18-0.24, lg 0.28-0.36.
       - Radii: card 0.14-0.22, pill 0.32-0.45.
       - Surfaces: cardStyle = 'glass' or 'outline' for a modern feel, opacity 0.5-0.75, borderWidth 1.0-1.6.
+      
+      SERENDIPITY DNA (for delightful surprises):
+      Include a "serendipityDNA" object with these fields for tasteful variation across the deck:
+      - motifs: 1-3 abstract visual motifs that thread through the deck (e.g., "circuit patterns", "flowing waves", "geometric fragments")
+      - texture: Choose ONE consistent texture: mesh | circuit | soft-bands | bokeh | minimal-lines | gradient-ribbons | abstract-geo
+      - gridRhythm: Layout density: tight | balanced | airy
+      - accentRule: Color emphasis: single | dual | highlight
+      - cardStyle: Modern card treatment: glass | outline | solid
+      - surpriseBudget: Number 1-3 indicating how many "wow" moments to allow per deck
+      - surpriseCues: Array of short phrases describing tasteful novelty opportunities (e.g., "floating metric badge", "gradient divider", "glowing accent")
+      
+      These DNA values create cohesion while enabling controlled variation - each slide can surprise within the theme.
     `,
     OUTPUT_SCHEMA: "JSON OutlineSchema"
   },
@@ -66,7 +78,8 @@ export const PROMPTS = {
   CONTENT_PLANNER: {
     ROLE: "Senior Editor",
     // Phase 1: Content Planner now receives recentHistory for narrative arc awareness
-    TASK: (title: string, purpose: string, facts: string, recentHistory?: Array<{ title: string, mainPoint: string }>) => `
+    // Phase 2: Added density constraints to prevent overflow
+    TASK: (title: string, purpose: string, facts: string, recentHistory?: Array<{ title: string, mainPoint: string }>, densityHint?: { maxBullets?: number; maxCharsPerBullet?: number }) => `
         TASK: Draft the core semantic content for slide "${title}".
         PURPOSE: ${purpose}
         ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}` : ''}
@@ -74,10 +87,12 @@ export const PROMPTS = {
         
         CONSTRAINTS:
         - Extract ONLY the key facts needed.
-        - Create a list of 'keyPoints' (strings). Max 4 items.
-        - If numbers exist, extract 'dataPoints' ({label, value}).
+        - Create a list of 'keyPoints' (strings). MAXIMUM ${densityHint?.maxBullets || 3} items.
+        - Each keyPoint must be UNDER ${densityHint?.maxCharsPerBullet || 80} characters. Be concise!
+        - If numbers exist, extract 'dataPoints' ({label, value}). Max 3 items.
         - NO VISUALS. NO LAYOUT. TEXT ONLY.
         - Build on the narrative so far - avoid repeating what was already covered.
+        - BREVITY IS KEY: Slides have limited space. Prioritize impact over completeness.
       `
   },
 
@@ -99,6 +114,8 @@ SLIDE CONTEXT:
 - Title Theme: ${context.title}
 - Visual Focus: ${context.visualFocus}
 - Layout Variant: ${context.layoutVariant}
+${context.styleDNA ? `- Style DNA: ${JSON.stringify(context.styleDNA)}` : ''}
+${typeof context.variationBudget === 'number' ? `- Variation Budget: ${context.variationBudget} (0=conservative, 1=bold)` : ''}
 
 BACKGROUND DESIGN REQUIREMENTS:
 
@@ -106,6 +123,7 @@ BACKGROUND DESIGN REQUIREMENTS:
   - Color gradients (e.g., "dark blue to purple gradient")
   - Lighting effects (e.g., "soft ambient glow", "cinematic lighting")
   - Abstract textures (e.g., "subtle mesh pattern", "soft bokeh")
+  - Layered structure: background layer → motif layer → accent glow → micro-detail layer
   - Mood/atmosphere (e.g., "professional", "modern", "sophisticated")
   - Text-safe contrast planning (e.g., "dark vignette band for text area", "low-contrast texture in text zone")
   - Visual focus cues: MUST include the exact phrase "${context.visualFocus}" verbatim in prompt_with_composition
@@ -136,6 +154,7 @@ OPTIONAL CREATIVE INSPIRATION (use when fitting, not mandatory):
 - Dark corporate palette (#0f172a base, #1e293b surfaces, #38bdf8 accent)
 - Clean, professional, PPTX-safe look (no gradients inside text areas; gradients only in background)
 - Serendipity is encouraged: introduce subtle abstract motifs tied to the slide theme
+ - Use styleDNA motifs and texture to keep theme consistent across slides while varying intensity based on variationBudget
 
 COLOR HARMONY:
 - background_tone: Dark or light hex, but must support readable text with contrast plan
@@ -155,7 +174,7 @@ OUTPUT: Return JSON with:
   VISUAL_DESIGNER: {
     ROLE: "Information Designer",
     // Phase 1+2: Generator receives narrative history and validator awareness
-    TASK: (contentPlanJson: string, routerConfig: any, visualDesignSpec?: any, recentHistory?: Array<{ title: string, mainPoint: string }>) => `
+    TASK: (contentPlanJson: string, routerConfig: any, visualDesignSpec?: any, recentHistory?: Array<{ title: string, mainPoint: string }>, styleHints?: any) => `
       You produce structured slide data that must validate against the provided response schema.
 
       ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}
@@ -185,6 +204,11 @@ OUTPUT: Return JSON with:
       - split-left-text / split-right-text: exactly 2 components.
       - bento-grid: prefer metric-cards (max 4) or icon-grid.
       - Default: stack 1–2 components vertically.
+
+      Serendipity guardrails (keep theme, vary composition):
+      - Maintain theme consistency with STYLE_HINTS.styleDNA if provided.
+      - Use the Variation Budget to adjust novelty: 0.2-0.4 subtle; 0.5-0.7 moderate; 0.8+ bold.
+      - Prefer layout micro-variation (alignment shifts, card grouping, emphasis) over changing content.
 
       Visual order + contrast rules:
       - Maintain strong foreground/background contrast. Use light text on dark backgrounds and dark text on light backgrounds.
@@ -246,6 +270,7 @@ OUTPUT: Return JSON with:
       INPUTS:
       CONTENT_PLAN: ${contentPlanJson}
       ROUTER_CONFIG: ${JSON.stringify(routerConfig)}
+      ${styleHints ? `STYLE_HINTS: ${JSON.stringify(styleHints)}` : ''}
 
       ${visualDesignSpec ? `VISUAL DESIGN SPEC AVAILABLE: YES
       Use the following visual guidance for color harmony and composition:

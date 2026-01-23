@@ -5,7 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import * as LucideIcons from 'lucide-react';
 import pptxgen from 'pptxgenjs';
 import { SlideNode, GlobalStyleGuide, TemplateComponent, VisualElement, LayoutVariant } from '../types/slideTypes';
-import { SpatialLayoutEngine } from './spatialRenderer';
+import { SpatialLayoutEngine, renderWithLayeredComposition } from './spatialRenderer';
 import { buildDiagramSVG, DiagramPalette } from './diagramBuilder';
 import { svgToPngBase64 } from './visualCortex';
 
@@ -263,7 +263,18 @@ export class InfographicRenderer {
 
   // --- COMPILER: THE RENDERING ENVIRONMENT ---
   public compileSlide(slide: SlideNode, styleGuide: GlobalStyleGuide): VisualElement[] {
-    // Use the new Spatial Layout Engine with VisualDesignSpec for color overrides
+    // Use layer-aware rendering when composition plan is available (Serendipity mode)
+    if (slide.compositionPlan) {
+      return renderWithLayeredComposition(
+        slide,
+        styleGuide,
+        slide.compositionPlan,
+        (name: string) => this.iconCache.get(name),
+        (comp: any) => this.getDiagramFromCache(comp, styleGuide)
+      );
+    }
+    
+    // Standard rendering: Use the Spatial Layout Engine with VisualDesignSpec for color overrides
     return this.layoutEngine.renderWithSpatialAwareness(
       slide,
       styleGuide,

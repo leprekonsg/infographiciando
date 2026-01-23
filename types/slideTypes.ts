@@ -1,5 +1,6 @@
 
 import { z } from "zod";
+import { CompositionPlanSchema } from "./serendipityTypes";
 
 export const SLIDE_TYPES = {
   TITLE: 'title-slide',
@@ -125,6 +126,46 @@ export const VisualDesignSpecSchema = z.object({
     background_tone: z.string()
   })
 });
+
+export const SlideStyleDNASchema = z.object({
+  motifs: z.array(z.string()).min(1).max(3),
+  texture: z.enum(['mesh', 'circuit', 'soft-bands', 'bokeh', 'minimal-lines', 'gradient-ribbons', 'abstract-geo']).optional(),
+  gridRhythm: z.enum(['tight', 'balanced', 'airy']).optional(),
+  accentRule: z.enum(['single', 'dual', 'highlight']).optional(),
+  cardStyle: z.enum(['glass', 'outline', 'solid']).optional(),
+  surpriseBudget: z.number().min(1).max(3).optional(), // Max "wow" moments per deck
+  surpriseCues: z.array(z.string()).optional() // Short phrases for tasteful novelty
+});
+
+// --- AGENT DATA CONTRACT SCHEMAS ---
+
+/**
+ * Content Plan Schema - The contract between Content Planner and downstream agents
+ * This is the canonical shape that generators, visual designers, and layout selectors depend on.
+ * 
+ * CRITICAL: All consumers of content plan data MUST validate against this schema
+ * or use ensureValidContentPlan() from slideAgentService.ts
+ */
+export const ContentPlanSchema = z.object({
+  title: z.string().min(1),
+  keyPoints: z.array(z.string().min(1)).min(1).max(10),
+  dataPoints: z.array(z.object({
+    label: z.string().min(1).max(40),
+    value: z.union([z.number(), z.string()])
+  })).default([]),
+  narrative: z.string().optional(),
+  chartSpec: z.object({
+    type: z.enum(['bar', 'line', 'pie', 'doughnut', 'stat-big']),
+    title: z.string().optional(),
+    data: z.array(z.object({
+      label: z.string(),
+      value: z.number(),
+      color: z.string().optional()
+    }))
+  }).optional()
+});
+
+export type ContentPlan = z.infer<typeof ContentPlanSchema>;
 
 // --- CORE DATA SCHEMAS ---
 
@@ -255,6 +296,7 @@ export const StyleGuideSchema = z.object({
   }),
   imageStyle: z.string(),
   layoutStrategy: z.string(),
+  styleDNA: SlideStyleDNASchema.optional(),
   themeTokens: z.object({
     typography: z.object({
       scale: z.object({
@@ -324,6 +366,7 @@ export const SlideNodeSchema = z.object({
 
   layoutPlan: SlideLayoutPlanSchema.optional(),
   visualDesignSpec: VisualDesignSpecSchema.optional(), // New: Detailed visual spec
+  compositionPlan: CompositionPlanSchema.optional(), // Serendipity: Layer-based composition
   agentLayout: AgentLayoutSchema.optional(), // Legacy/Advanced
 
   // Content & Evidence
@@ -475,6 +518,7 @@ export type FactCluster = z.infer<typeof FactClusterSchema>;
 export type VisualDesignSpec = z.infer<typeof VisualDesignSpecSchema>;
 export type SpatialZone = z.infer<typeof SpatialZoneSchema>;
 export type SpatialStrategy = z.infer<typeof SpatialStrategySchema>;
+export type SlideStyleDNA = z.infer<typeof SlideStyleDNASchema>;
 
 // --- ENVIRONMENT STATE (Shadow State Pattern for Agent Visibility) ---
 

@@ -222,7 +222,7 @@ export async function runQwenLayoutSelector(
             readabilityCheck: 'pass',
             validation: undefined,
             warnings: []
-        });
+        }, styleGuide);
 
         try {
             const svgProxy = generateSvgProxy(mockSlide, styleGuide);

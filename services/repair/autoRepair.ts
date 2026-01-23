@@ -1,4 +1,4 @@
-import { SlideNode } from "../../types/slideTypes";
+import { GlobalStyleGuide, SlideNode } from "../../types/slideTypes";
 
 // --- DETERMINISTIC AUTO-REPAIR ---
 
@@ -101,6 +101,55 @@ const COMPONENT_TYPE_MAP: Record<string, string> = {
 const SUPPORTED_COMPONENT_TYPES = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
 
 /**
+ * Pre-sanitize component type string before normalization.
+ * Handles malformed types like:
+ * - 'diagram-svg, ' (trailing punctuation)
+ * - 'text-bulletsLookupError: ...' (error messages embedded)
+ * - 'text-bullets-and-no-icon-bullets-and-...' (LLM degeneration)
+ */
+function preSanitizeComponentType(rawType: string): string {
+    if (!rawType || typeof rawType !== 'string') return 'text-bullets';
+    
+    // Strip trailing punctuation and whitespace
+    let cleaned = rawType.trim().replace(/[,;:\s]+$/, '').trim();
+    
+    // If an error message is embedded, extract the first valid-looking type
+    if (cleaned.includes('LookupError') || cleaned.includes('is not a valid')) {
+        const match = cleaned.match(/^([a-z-]+)/i);
+        cleaned = match ? match[1] : 'text-bullets';
+    }
+    
+    // Detect degeneration pattern: check for repeated word sequences (e.g., "and-no-icon-bullets" repeated)
+    if (cleaned.length > 50) {
+        // Check if any valid component type appears at the start
+        const validStart = SUPPORTED_COMPONENT_TYPES.find(t => cleaned.toLowerCase().startsWith(t));
+        if (validStart) {
+            // Check if there's garbage after the valid type
+            if (cleaned.length > validStart.length + 10) {
+                console.warn(`[AUTO-REPAIR] Detected degenerated component type, extracting base: "${cleaned.slice(0, 40)}..."`);
+                return validStart;
+            }
+        } else {
+            // Check for word-level repetition pattern
+            const words = cleaned.split(/[-_\s]+/);
+            if (words.length > 6) {
+                const wordCounts: Record<string, number> = {};
+                for (const w of words) {
+                    if (w.length > 2) wordCounts[w] = (wordCounts[w] || 0) + 1;
+                }
+                const maxRepeat = Math.max(...Object.values(wordCounts));
+                if (maxRepeat >= 4) {
+                    console.warn(`[AUTO-REPAIR] Detected degenerated component type (${maxRepeat}x repetition), defaulting to text-bullets`);
+                    return 'text-bullets';
+                }
+            }
+        }
+    }
+    
+    return cleaned;
+}
+
+/**
  * Normalizes an array item that might be a string, JSON string, or object.
  * Returns a proper object with expected properties.
  */
@@ -179,7 +228,7 @@ function deepParseJsonStrings(obj: any): any {
     return obj;
 }
 
-export function autoRepairSlide(slide: SlideNode): SlideNode {
+export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide): SlideNode {
     // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
 
     const CONTENT_LIMITS = {
@@ -216,6 +265,26 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
         const trimmed = text.substring(0, Math.max(0, max - 1)).trimEnd() + '…';
         if (label) addWarning(`Auto-trimmed ${label} to ${max} chars`);
         return trimmed;
+    };
+
+    const getBodyFontSize = () => {
+        const body = styleGuide?.themeTokens?.typography?.scale?.body;
+        if (typeof body === 'number' && body > 6) return body;
+        return 14;
+    };
+
+    const computeBulletCharCap = (
+        baseCap: number,
+        bulletCount: number,
+        densityBudget?: { maxChars?: number; maxItems?: number }
+    ) => {
+        const fontSize = getBodyFontSize();
+        const fontAdjusted = Math.round(baseCap * (14 / fontSize));
+        const countAdjusted = bulletCount >= 3 ? Math.round(fontAdjusted * 0.9) : fontAdjusted;
+        const perItemDensity = densityBudget?.maxChars
+            ? Math.floor(densityBudget.maxChars / Math.max(1, densityBudget.maxItems || bulletCount || 1))
+            : undefined;
+        return Math.max(40, Math.min(perItemDensity || countAdjusted, 120));
     };
 
     const capList = <T>(list: T[], max: number, label?: string): T[] => {
@@ -383,10 +452,12 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
 
     const normalizeComponentType = (rawType: string | undefined | null): string => {
         if (!rawType || typeof rawType !== 'string') return 'text-bullets';
-        const trimmed = rawType.trim();
-        if (!trimmed) return 'text-bullets';
+        
+        // PRE-SANITIZE: Handle malformed types (trailing chars, embedded errors, degeneration)
+        const sanitized = preSanitizeComponentType(rawType);
+        if (!sanitized) return 'text-bullets';
 
-        const lower = trimmed.toLowerCase();
+        const lower = sanitized.toLowerCase();
         if (SUPPORTED_COMPONENT_TYPES.includes(lower)) return lower;
 
         const directMapped = COMPONENT_TYPE_MAP[lower];
@@ -589,9 +660,30 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
             'timeline-horizontal': 3,
             'standard-vertical': LIST_LIMITS.textBullets
         };
+        const layoutBulletCharCaps: Record<string, number> = {
+            'split-left-text': 55,
+            'split-right-text': 55,
+            'asymmetric-grid': 60,
+            'bento-grid': 50,
+            'metrics-rail': 55,
+            'hero-centered': 50,
+            'dashboard-tiles': 50,
+            'timeline-horizontal': 55,
+            'standard-vertical': 70
+        };
         const layoutCap = layoutBulletCaps[layoutVariant] ?? LIST_LIMITS.textBullets;
+        const baseCharCap = layoutBulletCharCaps[layoutVariant] ?? 70;
         merged.title = merged.title || 'Key Points';
-        merged.content = capList(mergedContent.map(t => truncateText(t, CONTENT_LIMITS.bullet, 'bullet text')), layoutCap, 'bullet items');
+        const mergedCharCap = computeBulletCharCap(
+            baseCharCap,
+            mergedContent.length,
+            slide.routerConfig?.densityBudget
+        );
+        merged.content = capList(
+            mergedContent.map(t => truncateText(t, mergedCharCap, 'bullet text')),
+            layoutCap,
+            'bullet items'
+        );
 
         addWarning(`Auto-merged ${textComponents.length} text-bullets components`);
         return componentList.filter(c => c.type !== 'text-bullets').concat([merged]);
@@ -799,12 +891,12 @@ export function autoRepairSlide(slide: SlideNode): SlideNode {
                     'timeline-horizontal': 55,
                     'standard-vertical': 70
                 };
-                const densityMaxChars = slide.routerConfig?.densityBudget?.maxChars;
-                const densityMaxItems = slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.textBullets;
-                const perItemDensity = densityMaxChars ? Math.floor(densityMaxChars / Math.max(1, densityMaxItems)) : undefined;
                 const baseCap = layoutBulletCharCaps[layoutVariantForText] ?? 70;
-                const countAdjustedCap = bulletCount >= 3 ? Math.min(baseCap, 55) : baseCap;
-                const bulletCharCap = Math.max(40, Math.min(countAdjustedCap, perItemDensity || countAdjustedCap));
+                const bulletCharCap = computeBulletCharCap(
+                    baseCap,
+                    bulletCount,
+                    slide.routerConfig?.densityBudget
+                );
 
                 norm = truncateText(norm, bulletCharCap, 'bullet text');
                 const key = norm.toLowerCase();

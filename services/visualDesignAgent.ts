@@ -32,12 +32,13 @@ import { SpatialLayoutEngine } from "./spatialRenderer";
 
 // Helper to determine component types for the prompt before they exist
 function estimateComponentTypes(routerConfig: RouterDecision, contentPlan: any): string[] {
+    const safeContentPlan = contentPlan && typeof contentPlan === 'object' ? contentPlan : {};
     const types: Set<string> = new Set();
     const layout = routerConfig.layoutVariant;
     const mode = routerConfig.renderMode;
 
     // 1. Data-Viz priority
-    if (mode === 'data-viz' || (contentPlan.chartSpec && contentPlan.chartSpec.type)) {
+    if (mode === 'data-viz' || (safeContentPlan.chartSpec && safeContentPlan.chartSpec.type)) {
         types.add('chart-frame');
     }
 
@@ -50,8 +51,8 @@ function estimateComponentTypes(routerConfig: RouterDecision, contentPlan: any):
     }
 
     // 3. Content heuristics
-    const numKeyPoints = contentPlan.keyPoints?.length || 0;
-    const hasData = contentPlan.dataPoints && contentPlan.dataPoints.length > 0;
+    const numKeyPoints = safeContentPlan.keyPoints?.length || 0;
+    const hasData = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length > 0;
 
     if (hasData && !types.has('chart-frame')) {
         types.add('metric-cards');
@@ -112,7 +113,9 @@ export const runVisualDesigner = async (
     contentPlan: any,
     routerConfig: RouterDecision,
     facts: ResearchFact[],
-    tracker: CostTracker
+    tracker: CostTracker,
+    styleGuide?: { styleDNA?: any },
+    variationBudget?: number
 ): Promise<VisualDesignSpec> => {
     const MAX_ATTEMPTS = 2;
     const layoutEngine = new SpatialLayoutEngine();
@@ -175,7 +178,11 @@ export const runVisualDesigner = async (
                 spatialStrategy: spatialStrategy,
                 componentTypes: componentTypes,
                 densityContext: routerConfig.densityBudget,
-                styleGuide: "Modern Professional"
+                styleGuide: "Modern Professional",
+                styleDNA: styleGuide?.styleDNA,
+                variationBudget: typeof variationBudget === 'number'
+                    ? Math.max(0, Math.min(1, variationBudget))
+                    : undefined
             });
 
             if (previousErrors.length > 0) {
@@ -261,7 +268,7 @@ Abstract background gradient for professional presentation slide.
 Theme: ${routerConfig.visualFocus || 'Corporate Technology'}.
 Style: Dark gradient from #0f172a to #1e293b with subtle ${routerConfig.visualFocus ? routerConfig.visualFocus.toLowerCase() : 'blue'} accent glow.
 Mood: Modern, premium, sophisticated.
-Texture: Soft ambient lighting, subtle geometric patterns fading into background.
+Texture: Soft ambient lighting, subtle ${styleGuide?.styleDNA?.texture || 'geometric'} patterns fading into background.
 IMPORTANT: No text, no icons, no diagrams, no charts - abstract gradient ONLY.
 `.trim();
 

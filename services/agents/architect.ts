@@ -45,7 +45,8 @@ export async function runArchitect(
                     // Color palette flattened to avoid depth issues
                     colorPalette: { type: "object" },
                     imageStyle: { type: "string" },
-                    layoutStrategy: { type: "string" }
+                    layoutStrategy: { type: "string" },
+                    styleDNA: { type: "object" }
                 },
                 required: ["themeName", "colorPalette"]
             },
@@ -149,7 +150,15 @@ export async function runArchitect(
                     accentHighContrast: "#f59e0b"
                 },
                 imageStyle: "Clean",
-                layoutStrategy: "Standard"
+                layoutStrategy: "Standard",
+                styleDNA: {
+                    motifs: ["soft gradient bands"],
+                    texture: "mesh",
+                    gridRhythm: "balanced",
+                    accentRule: "single",
+                    cardStyle: "glass",
+                    surpriseCues: ["subtle light trails"]
+                }
             },
             slides: [{ order: 1, type: SLIDE_TYPES.TITLE, title: topic, purpose: "Title", relevantClusterIds: [] }]
         };

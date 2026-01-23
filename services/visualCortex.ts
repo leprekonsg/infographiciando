@@ -62,6 +62,19 @@ import { CostTracker } from './interactionsClient';
 const QWEN_VL_MODEL = 'qwen3-vl-plus-2025-12-19';
 const QWEN_API_BASE = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
 const QWEN_VL_PROXY_URL = process.env.QWEN_VL_PROXY_URL || '';
+const QWEN_PROXY_COOLDOWN_MS = 60_000;
+let qwenProxyCooldownUntil = 0;
+let qwenProxyLastLog = 0;
+
+function markQwenProxyFailure(reason?: string) {
+    qwenProxyCooldownUntil = Date.now() + QWEN_PROXY_COOLDOWN_MS;
+    const now = Date.now();
+    if (now - qwenProxyLastLog > 5000) {
+        const detail = reason ? ` (${reason})` : '';
+        console.warn(`[QWEN-VL] Proxy failure detected. Cooling down for ${Math.round(QWEN_PROXY_COOLDOWN_MS / 1000)}s${detail}`);
+        qwenProxyLastLog = now;
+    }
+}
 
 // Note: Pricing ($0.2/$1.6 per 1M tokens) is handled by CostTracker.addQwenVLCost()
 
@@ -481,10 +494,18 @@ async function callQwenProxy<T = any>(
 
     if (!response.ok) {
         const errorText = await response.text();
+        markQwenProxyFailure(`HTTP ${response.status}`);
         throw new Error(`Qwen-VL proxy error (${response.status}): ${errorText}`);
     }
 
-    const data = await response.json();
+    let data: any;
+    try {
+        data = await response.json();
+    } catch (parseErr: any) {
+        markQwenProxyFailure('Invalid JSON');
+        const fallbackText = await response.text().catch(() => '');
+        throw new Error(`Qwen-VL proxy JSON parse error: ${parseErr.message}. Body: ${fallbackText}`);
+    }
 
     if (costTracker && data?.usage) {
         costTracker.addQwenVLCost(data.usage.inputTokens || 0, data.usage.outputTokens || 0);
@@ -539,6 +560,7 @@ export async function getVisualCritiqueFromSvg(
             return { ...critique, renderFidelity: 'svg-proxy' as RenderFidelity };
         } catch (error: any) {
             console.error('[QWEN-VL] Proxy SVG critique failed:', error.message);
+            markQwenProxyFailure(error.message);
             return null;
         }
     }
@@ -625,6 +647,7 @@ export async function getVisualCritiqueFromImage(
         };
     } catch (error: any) {
         console.error('[QWEN-VL] Image critique failed:', error.message);
+        markQwenProxyFailure(error.message);
         return null;
     }
 }
@@ -653,7 +676,14 @@ export function isQwenVLAvailable(): boolean {
         return qwenVLClient.isAvailable();
     }
 
-    if (QWEN_VL_PROXY_URL) return true;
+    if (QWEN_VL_PROXY_URL) {
+        if (Date.now() < qwenProxyCooldownUntil) {
+            const remaining = Math.max(0, Math.ceil((qwenProxyCooldownUntil - Date.now()) / 1000));
+            console.warn(`[QWEN-VL] Proxy in cooldown (${remaining}s remaining). Skipping visual critique.`);
+            return false;
+        }
+        return true;
+    }
 
     console.warn('[QWEN-VL] Visual critique unavailable in browser. Configure QWEN_VL_PROXY_URL for backend proxy.');
     return false;

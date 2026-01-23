@@ -402,10 +402,17 @@ export class SpatialLayoutEngine {
     });
 
     // GAP 5: Apply rendering warnings to slide
-    const warnings = this.getWarnings();
-    if (warnings.length > 0) {
-      slide.warnings = [...(slide.warnings || []), ...warnings];
-      console.warn(`[SPATIAL RENDERER] ${warnings.length} rendering warning(s) for slide "${slide.title}"`);
+    // FIXED: Replace spatial warnings instead of accumulating them across render passes
+    // This prevents warning count inflation when the same slide is re-rendered multiple times
+    const spatialWarnings = this.getWarnings();
+    if (spatialWarnings.length > 0) {
+      // Filter out previous spatial warnings (those matching known patterns)
+      const spatialPatterns = /truncated|hidden|unplaced|overflow|bullets.*requires/i;
+      const existingNonSpatialWarnings = (slide.warnings || []).filter(w => !spatialPatterns.test(w));
+      
+      // Combine non-spatial warnings with new spatial warnings
+      slide.warnings = [...existingNonSpatialWarnings, ...spatialWarnings];
+      console.warn(`[SPATIAL RENDERER] ${spatialWarnings.length} rendering warning(s) for slide "${slide.title}"`);
     }
 
     return elements;
@@ -413,20 +420,29 @@ export class SpatialLayoutEngine {
 
   /**
    * Estimate how many lines will be rendered after text wrapping.
-   * Rough heuristic based on zone width and font size.
+   * Uses font-aware character width estimation.
    */
   private estimateWrappedLineCount(
     lines: string[],
     zoneWidthUnits: number,
-    fontSizePoints: number
+    fontSizePoints: number,
+    fontFamily?: string
   ): number {
-    // Empirical: ~2.5 characters per unit width at default font size
-    // At 14pt (standard bullet), ~3.5 chars per unit
-    // Adjust avgCharsPerUnitWidth based on the actual fontSizePoints relative to 14pt
-    const baseCharsPerUnitWidth = 3.5; // For 14pt font
-    const effectiveCharsPerUnitWidth = baseCharsPerUnitWidth * (14 / fontSizePoints);
-
-    const maxCharsPerLine = Math.max(10, Math.floor(zoneWidthUnits * effectiveCharsPerUnitWidth));
+    // Font-aware character width estimation
+    // PowerPoint uses inches internally, 1 unit ≈ 1 inch
+    // At 14pt, typical character widths:
+    // - Proportional (Inter, Arial): ~0.08 inches per char → ~12.5 chars/inch → 12.5 chars/unit
+    // - Monospace (Fira Code, Courier): ~0.12 inches per char → ~8.3 chars/inch → 8.3 chars/unit
+    
+    const isMonospace = fontFamily && /mono|code|courier|consolas|fira.*code|source.*code/i.test(fontFamily);
+    const baseCharsPerUnit = isMonospace ? 8.3 : 12.5; // chars per unit at 14pt
+    
+    // Scale by font size (smaller font = more chars per unit)
+    const effectiveCharsPerUnit = baseCharsPerUnit * (14 / fontSizePoints);
+    
+    // Account for zone padding (typically 5% on each side)
+    const usableWidth = zoneWidthUnits * 0.9;
+    const maxCharsPerLine = Math.max(10, Math.floor(usableWidth * effectiveCharsPerUnit));
 
     return lines.reduce((wrappedCount, line) => {
       const visibleText = line.replace(/^•\s*/, ''); // Remove bullet
@@ -554,10 +570,14 @@ export class SpatialLayoutEngine {
         const line = lines[i];
 
         const currentFontSize = themeTokens.typography.scale.body * contentScale;
-        // Improve heuristic: 3.5 is for 14pt.
-        const baseCharsPerUnitWidth = 3.5; // For 14pt font
-        const effectiveCharsPerUnitWidth = baseCharsPerUnitWidth * (14 / currentFontSize);
-        const maxCharsPerLine = Math.max(10, Math.floor(zone.w * effectiveCharsPerUnitWidth));
+        
+        // Font-aware character width estimation
+        const isMonospace = styleGuide.fontFamilyBody && 
+          /mono|code|courier|consolas|fira.*code|source.*code/i.test(styleGuide.fontFamilyBody);
+        const baseCharsPerUnit = isMonospace ? 8.3 : 12.5; // chars per unit at 14pt
+        const effectiveCharsPerUnit = baseCharsPerUnit * (14 / currentFontSize);
+        const usableWidth = zone.w * 0.9; // Account for padding
+        const maxCharsPerLine = Math.max(10, Math.floor(usableWidth * effectiveCharsPerUnit));
 
         const visibleText = line.replace(/^•\s*/, '');
         const wrappedLinesCount = Math.ceil(visibleText.length / maxCharsPerLine);
@@ -1150,4 +1170,253 @@ export function createEnvironmentSnapshot(
     warnings_count: warnings.length,
     errors_count: errorsCount
   };
+}
+// ============================================================================
+// LAYER-AWARE RENDERING (Serendipity Architecture)
+// ============================================================================
+
+/**
+ * Renders a slide using the layer-based composition model.
+ * This is the new rendering path for serendipity mode.
+ * 
+ * Layer Order (z-index):
+ * 0-9: Background layer (handled by image generation)
+ * 10-19: Decorative layer (badges, dividers, accents, glows)
+ * 20-59: Content layer (cards, text blocks, charts)
+ * 60-79: Data viz layer (charts, diagrams)
+ * 80-99: Overlay layer (tooltips, callouts)
+ * 
+ * @param slide - The slide to render
+ * @param styleGuide - Global style guide
+ * @param compositionPlan - Layer-based composition plan from Composition Architect
+ * @param getIconUrl - Callback to get cached icon URLs
+ * @param getDiagramUrl - Callback to get cached diagram URLs
+ * @returns Array of VisualElements with proper z-ordering
+ */
+export function renderWithLayeredComposition(
+  slide: SlideNode,
+  styleGuide: GlobalStyleGuide,
+  compositionPlan: any, // CompositionPlan type
+  getIconUrl: (name: string) => string | undefined,
+  getDiagramUrl?: (comp: any) => string | undefined
+): VisualElement[] {
+  const elements: VisualElement[] = [];
+  
+  // Import decorative and card renderers dynamically to avoid circular deps
+  // In production, these would be imported at top of file
+  let decorativeRenderers: typeof import('./decorativeRenderer') | null = null;
+  let cardRenderers: typeof import('./cardRenderer') | null = null;
+  
+  try {
+    // Dynamic imports for optional serendipity renderers
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    decorativeRenderers = require('./decorativeRenderer');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    cardRenderers = require('./cardRenderer');
+  } catch (e) {
+    console.warn('[SpatialRenderer] Serendipity renderers not available, using fallback');
+  }
+  
+  const palette = {
+    primary: normalizeColor(styleGuide?.colorPalette?.primary, '22C55E'),
+    secondary: normalizeColor(styleGuide?.colorPalette?.secondary, '38BDF8'),
+    accent: normalizeColor(styleGuide?.colorPalette?.accentHighContrast, 'F59E0B'),
+    background: normalizeColor(styleGuide?.colorPalette?.background, '0F172A'),
+    text: normalizeColor(styleGuide?.colorPalette?.text, 'F1F5F9'),
+    textMuted: normalizeColor(styleGuide?.colorPalette?.text, 'A1A1AA')
+  };
+  
+  const iconCache = new Map<string, string>();
+  // Pre-populate icon cache from getIconUrl callback
+  const populateIcon = (name: string) => {
+    if (name && !iconCache.has(name)) {
+      const url = getIconUrl(name);
+      if (url) iconCache.set(name, url);
+    }
+  };
+  
+  // Validate composition plan
+  if (!compositionPlan || !compositionPlan.layerPlan) {
+    console.warn('[renderWithLayeredComposition] Invalid composition plan, falling back to standard render');
+    const engine = new SpatialLayoutEngine();
+    return engine.renderWithSpatialAwareness(slide, styleGuide, getIconUrl, slide.visualDesignSpec, getDiagramUrl);
+  }
+  
+  // --- LAYER 1: DECORATIVE ELEMENTS (z-index 10-19) ---
+  if (decorativeRenderers && compositionPlan.layerPlan.decorativeElements?.length > 0) {
+    const decorativeContext = {
+      palette,
+      iconCache,
+      baseZIndex: 10
+    };
+    
+    // Convert composition plan decorative elements to renderable format
+    const decorativeElements = compositionPlan.layerPlan.decorativeElements
+      .filter((el: any) => el && el.type)
+      .map((el: any, idx: number) => {
+        // Map placement strings to actual positions
+        const position = mapPlacementToPosition(el.placement, el.type);
+        
+        // Pre-populate icon if needed
+        if (el.type === 'badge' && el.icon) {
+          populateIcon(el.icon);
+        }
+        
+        return {
+          type: el.type,
+          position,
+          content: el.content || el.purpose || 'Category',
+          icon: el.icon,
+          color: palette.primary,
+          style: 'pill',
+          orientation: 'horizontal',
+          intensity: 'subtle',
+          shape: 'underline'
+        };
+      });
+    
+    elements.push(...decorativeRenderers.renderDecorativeLayer(decorativeElements, decorativeContext));
+  }
+  
+  // --- LAYER 2: CONTENT (z-index 20-59) ---
+  // For now, delegate to standard component rendering
+  // In full implementation, would use cardRenderers for card-based layouts
+  const contentStructure = compositionPlan.layerPlan.contentStructure;
+  
+  if (contentStructure.pattern === 'card-row' || contentStructure.pattern === 'narrative-flow') {
+    // Use card-based rendering if available
+    if (cardRenderers && slide.layoutPlan?.components) {
+      const cardContext = {
+        palette,
+        iconCache,
+        baseZIndex: 20
+      };
+      
+      // Convert components to cards and render
+      // This is a simplified version - full implementation would map component types to cards
+      const components = slide.layoutPlan.components;
+      const cardCount = contentStructure.cardCount || components.length;
+      const gap = 0.2;
+      const cardWidth = (9 - (gap * (cardCount - 1))) / cardCount;
+      const cardY = 1.5;
+      const cardH = 3.5;
+      
+      // Collect all icons from components for pre-caching
+      components.forEach((comp: any) => {
+        if (comp.type === 'metric-cards') {
+          (comp.metrics || []).forEach((m: any) => m.icon && populateIcon(m.icon));
+        }
+        if (comp.type === 'process-flow') {
+          (comp.steps || []).forEach((s: any) => s.icon && populateIcon(s.icon));
+        }
+        if (comp.type === 'icon-grid') {
+          (comp.items || []).forEach((item: any) => item.icon && populateIcon(item.icon));
+        }
+      });
+      
+      // For narrative-flow, render each component as a card
+      components.slice(0, cardCount).forEach((comp: any, idx: number) => {
+        const cardX = 0.5 + (idx * (cardWidth + gap));
+        
+        // Extract card content from component
+        let title = '';
+        let body = '';
+        let icon = 'AlertCircle';
+        
+        if (comp.type === 'text-bullets' && comp.content?.length > 0) {
+          title = comp.title || comp.content[0];
+          body = comp.content.slice(1).join('. ');
+        } else if (comp.type === 'metric-cards' && comp.metrics?.length > 0) {
+          const metric = comp.metrics[0];
+          title = metric.label;
+          body = metric.value;
+          icon = metric.icon || 'TrendingUp';
+        }
+        
+        const cardElement = {
+          id: `content-card-${idx}`,
+          position: { x: cardX, y: cardY, w: cardWidth, h: cardH },
+          style: contentStructure.cardStyle || 'glass',
+          header: {
+            icon,
+            iconContainer: 'circle' as const,
+            iconColor: palette.primary,
+            title
+          },
+          body,
+          emphasis: idx === 0 ? 'primary' as const : 'secondary' as const
+        };
+        
+        elements.push(...cardRenderers.renderCard(cardElement, {
+          ...cardContext,
+          baseZIndex: 20 + (idx * 10)
+        }));
+      });
+    }
+  } else {
+    // Fall back to standard spatial rendering for other patterns
+    const engine = new SpatialLayoutEngine();
+    const standardElements = engine.renderWithSpatialAwareness(
+      slide, 
+      styleGuide, 
+      getIconUrl, 
+      slide.visualDesignSpec, 
+      getDiagramUrl
+    );
+    
+    // Adjust z-indices for layer ordering
+    standardElements.forEach(el => {
+      if ('zIndex' in el && typeof el.zIndex === 'number') {
+        el.zIndex = 20 + el.zIndex;
+      } else {
+        (el as any).zIndex = 20;
+      }
+    });
+    
+    elements.push(...standardElements);
+  }
+  
+  // --- LAYER 3: OVERLAY (z-index 80-99) ---
+  // Reserved for future overlay elements (tooltips, callouts)
+  
+  // Sort all elements by z-index for proper rendering order
+  elements.sort((a, b) => {
+    const zA = 'zIndex' in a ? (a.zIndex || 0) : 0;
+    const zB = 'zIndex' in b ? (b.zIndex || 0) : 0;
+    return zA - zB;
+  });
+  
+  return elements;
+}
+
+/**
+ * Maps placement strings from composition plan to actual slide coordinates
+ */
+function mapPlacementToPosition(
+  placement: string | undefined, 
+  elementType: string
+): { x: number; y: number; w: number; h: number } {
+  // Default positions for different placement strings
+  const positions: Record<string, { x: number; y: number; w: number; h: number }> = {
+    'top-left': { x: 0.5, y: 0.3, w: 2.5, h: 0.35 },
+    'top-center': { x: 3.75, y: 0.3, w: 2.5, h: 0.35 },
+    'top-right': { x: 7.0, y: 0.3, w: 2.5, h: 0.35 },
+    'below-title': { x: 0.5, y: 1.2, w: 9, h: 0.05 },
+    'center': { x: 2, y: 2.5, w: 6, h: 1 },
+    'bottom-left': { x: 0.5, y: 5.0, w: 2.5, h: 0.35 },
+    'bottom-center': { x: 3.75, y: 5.0, w: 2.5, h: 0.35 }
+  };
+  
+  // Type-specific defaults
+  const typeDefaults: Record<string, string> = {
+    'badge': 'top-left',
+    'divider': 'below-title',
+    'accent-shape': 'below-title',
+    'glow': 'center'
+  };
+  
+  const normalizedPlacement = (placement || '').toLowerCase().replace(/\s+/g, '-');
+  const defaultPlacement = typeDefaults[elementType] || 'top-left';
+  
+  return positions[normalizedPlacement] || positions[defaultPlacement] || positions['top-left'];
 }

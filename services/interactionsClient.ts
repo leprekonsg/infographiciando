@@ -174,14 +174,40 @@ function extractLongestValidPrefix(text: string): { json: string; discarded: str
     return null;
 }
 
-// Detect low-entropy/degenerate output patterns (e.g., "0-0-0", "o0o0o0", repeated chars)
+// Detect low-entropy/degenerate output patterns (e.g., "0-0-0", "o0o0o0", repeated chars, word loops)
 function hasEntropyDegeneration(text: string): boolean {
-    const sample = text.slice(-200).toLowerCase();
+    const sample = text.slice(-500).toLowerCase(); // Increased window to catch word-level patterns
+    
+    // Original character-level patterns
     if (/(\b0-){2,}0\b/.test(sample)) return true;
     if (/(?:\b0\b[\s,\-]*){6,}/.test(sample)) return true;
     if (/(?:o0){5,}/.test(sample)) return true;
     if (/([a-z0-9])\1{10,}/.test(sample)) return true;
 
+    // NEW: Word-level repetition detection (catches "and-no-icon-bullets-and-no-icon-bullets...")
+    // Split by common delimiters and check for repeated word sequences
+    const words = sample.split(/[\s\-_]+/).filter(w => w.length > 2);
+    if (words.length >= 10) {
+        // Check for 3+ consecutive repeated word patterns
+        for (let patternLen = 1; patternLen <= 4; patternLen++) {
+            let repeatCount = 1;
+            for (let i = patternLen; i < words.length; i += patternLen) {
+                const pattern = words.slice(i - patternLen, i).join('-');
+                const current = words.slice(i, i + patternLen).join('-');
+                if (pattern === current) {
+                    repeatCount++;
+                    if (repeatCount >= 4) {
+                        console.warn(`[DEGENERATION] Detected word-level repetition: "${pattern}" repeated ${repeatCount}x`);
+                        return true;
+                    }
+                } else {
+                    repeatCount = 1;
+                }
+            }
+        }
+    }
+
+    // Character entropy check
     const alnum = sample.replace(/[^a-z0-9]/g, '');
     if (alnum.length >= 30) {
         const uniqueChars = new Set(alnum.split('')).size;
