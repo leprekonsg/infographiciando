@@ -35,7 +35,7 @@ import {
 } from "./interactionsClient";
 import { PROMPTS } from "./promptRegistry";
 import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence, validateContentCompleteness, checkNoPlaceholderShippingGate } from "./validators";
-import { runVisualDesigner } from "./visualDesignAgent";
+import { runVisualDesigner, runVisualCritique, runLayoutRepair } from "./visualDesignAgent";
 import { SpatialLayoutEngine, createEnvironmentSnapshot } from "./spatialRenderer";
 import { autoRepairSlide } from "./repair/autoRepair";
 import { generateImageFromPrompt } from "./image/imageGeneration";
@@ -427,7 +427,7 @@ async function runRecursiveVisualCritique(
     const preSystem2OutputTokens = preSystem2Summary.totalOutputTokens;
 
     // Import visual cortex functions (including style-aware critique)
-    const { runVisualCritique, runLayoutRepair } = await import('./visualDesignAgent');
+    // visualDesignAgent functions are now imported statically to avoid mixed-import warnings
     const { getStyleAwareCritiqueFromSvg, isQwenVLAvailable } = await import('./visualCortex');
 
     let currentSlide = candidate;
@@ -802,7 +802,8 @@ async function runRecursiveVisualCritique(
     // --- PHASE 2: ENVIRONMENT STATE SNAPSHOT ---
     // Capture the final rendered state (Visual Elements + Spatial Zones) for context folding.
     try {
-        const { SpatialLayoutEngine } = await import('./spatialRenderer');
+        // SpatialLayoutEngine is imported statically
+        // const { SpatialLayoutEngine } = await import('./spatialRenderer');
         const renderer = new SpatialLayoutEngine();
 
         // Render final elements
@@ -903,16 +904,19 @@ async function runGenerator(
                             properties: {
                                 type: { type: "string" }
                             },
-                            required: ["type"]
+                            required: ["type"],
+                            additionalProperties: true
                         }
                     }
                 },
-                required: ["title", "components"]
+                required: ["title", "components"],
+                additionalProperties: false
             },
             // Removed speakerNotesLines - generated automatically in autoRepairSlide
             // Removed selfCritique - not critical for generation, added by autoRepairSlide
         },
-        required: ["layoutPlan"]
+        required: ["layoutPlan"],
+        additionalProperties: false
     };
 
     const MAX_RETRIES = 2;
@@ -975,7 +979,7 @@ async function runGenerator(
             // The model outputs empty metrics:[] because the minimal schema doesn't define inner structure
             const metricExample = hasValidDataPoints
                 ? `metric-cards: {"type":"metric-cards","metrics":[{"value":"${safeContentPlan.dataPoints[0]?.value || '42M'}","label":"${safeContentPlan.dataPoints[0]?.label || 'Metric'}","icon":"TrendingUp"},{"value":"${safeContentPlan.dataPoints[1]?.value || '85%'}","label":"${safeContentPlan.dataPoints[1]?.label || 'Growth'}","icon":"Activity"}]}`
-                : `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}  // (use text-bullets when no dataPoints)`;
+                : `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}`;
 
             const componentExamples = `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
 text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
@@ -984,7 +988,7 @@ process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"D
 icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}
 chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}
 
-CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with value, label, and icon. Empty metrics:[] will fail validation.`;
+CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with value, label, and icon. Empty metrics:[] will fail validation. If you lack dataPoints, DO NOT use metric-cards. Use text-bullets instead.`;
 
             // CONTEXT COMPRESSION: Only pass essential fields to prevent "constraint too tall" errors
             // Problem: Full routerConfig + visualDesignSpec can exceed Gemini's FST constraint (5888 height)
@@ -1087,7 +1091,8 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                 {
                     systemInstruction: PROMPTS.VISUAL_DESIGNER.ROLE,
                     temperature: isRecoveryAttempt ? 0.0 : 0.1,
-                    maxOutputTokens: maxTokens
+                    maxOutputTokens: maxTokens,
+                    thinkingLevel: undefined
                 },
                 costTracker
             );
@@ -1219,10 +1224,10 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                     suggestedFix: issue.severity === 'critical' ? 'Add substantive content or remove placeholder' : undefined
                 }));
                 validation.errors.push(...contentErrors);
-                
+
                 // Cap score based on content completeness (cannot exceed content score)
                 validation.score = Math.min(validation.score, contentCompleteness.score);
-                
+
                 // Critical content issues should fail the slide
                 if (!contentCompleteness.passed) {
                     validation.passed = false;
@@ -1700,8 +1705,8 @@ function blueprintToEditableDeck(
 
         const slideNode: SlideNode = {
             order: bpSlide.order,
-            type: index === 0 ? SLIDE_TYPES['title-slide'] : 
-                  index === blueprint.slides.length - 1 ? SLIDE_TYPES['conclusion'] : SLIDE_TYPES['content-main'],
+            type: index === 0 ? SLIDE_TYPES['title-slide'] :
+                index === blueprint.slides.length - 1 ? SLIDE_TYPES['conclusion'] : SLIDE_TYPES['content-main'],
             title: bpSlide.title,
             purpose: bpSlide.purpose,
             routerConfig: {
@@ -1800,9 +1805,9 @@ export const generateAgenticDeck = async (
     // Extract style mode with fallback to default
     const styleMode: StyleMode = options?.styleMode || DEFAULT_STYLE_MODE;
     const styleProfile = getStyleProfile(styleMode);
-    
+
     console.log(`[ORCHESTRATOR] Style mode: ${styleMode} (variation multiplier: ${styleProfile.variationBudgetMultiplier}, negative space: ${styleProfile.negativeSpaceMinRatio})`);
-    
+
     // =========================================================================
     // DIRECTOR PIPELINE (Phase 3 Integration)
     // Silent fallback to legacy pipeline on failure - critical for reliability
@@ -1812,13 +1817,13 @@ export const generateAgenticDeck = async (
         try {
             const { runDirector, DeckBlueprintSchema } = await import('./DirectorAgent');
             const costTracker = new CostTracker();
-            
+
             const blueprint = await runDirector(
                 { topic, styleMode }, // Pass styleMode to Director
                 costTracker,
                 onProgress
             );
-            
+
             // JSON Hallucination Trap: Validate blueprint before proceeding
             const parseResult = DeckBlueprintSchema.safeParse(blueprint);
             if (parseResult.success) {
@@ -1940,9 +1945,11 @@ export const generateAgenticDeck = async (
                 getBulletsMax(styleProfile, inferredArchetype)
             );
 
+            // FIX: Ensure minimal floor for bullets and chars to prevent "Content Too Sparse" loops
+            // Even hero slides need at least 2 bullets and 60 chars to avoid empty component arrays
             const densityHint: ContentDensityHint = {
-                maxBullets: isHeroOrIntro ? Math.min(2, styleAdjustedBullets) : styleAdjustedBullets,
-                maxCharsPerBullet: isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet,
+                maxBullets: Math.max(2, isHeroOrIntro ? Math.min(2, styleAdjustedBullets) : styleAdjustedBullets),
+                maxCharsPerBullet: Math.max(60, isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet),
                 maxDataPoints: layoutVariant === 'bento-grid' ? 4 : 3
             };
 
@@ -1978,7 +1985,7 @@ export const generateAgenticDeck = async (
                     ...metricHeavyLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
                 ];
                 console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding metric-heavy layouts`);
-                
+
                 // STYLE-AWARE FALLBACK: Corporate mode without data degrades to professional
                 if (styleMode === 'corporate' && !hasValidDataPoints) {
                     console.log(`[ORCHESTRATOR] Corporate mode with no data - degrading to professional for this slide`);
@@ -1999,12 +2006,12 @@ export const generateAgenticDeck = async (
             // 3c. Visual Design (using Interactions API) - Track first-pass success
             onProgress(`Agent 3c/5: Visual Design Slide ${i + 1} [${styleMode}]...`, 34 + Math.floor((i / (totalSlides * 2)) * 30));
             totalVisualDesignAttempts++;
-            
+
             // Apply style multiplier to variation budget
             const baseVariationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
             const variationBudget = applyStyleMultiplierToVariationBudget(baseVariationBudget, styleMode);
             console.log(`[ORCHESTRATOR] Variation budget: ${baseVariationBudget.toFixed(2)} → ${variationBudget.toFixed(2)} (${styleMode} multiplier)`);
-            
+
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
                 safeContentPlan,
@@ -2299,27 +2306,27 @@ export const generateAgenticDeck = async (
     // Final check: ensure no placeholder content escapes to export.
     // Slides with placeholders are either fixed (component removal) or flagged.
     console.log("[ORCHESTRATOR] Checking no-placeholder shipping gate...");
-    
+
     let placeholderBlockCount = 0;
     slides.forEach((slide, idx) => {
         const shippingGate = checkNoPlaceholderShippingGate(slide);
-        
+
         if (!shippingGate.canShip) {
             placeholderBlockCount++;
             console.warn(`[ORCHESTRATOR] ⚠️  Slide ${idx + 1} blocked by shipping gate: ${shippingGate.blockedContent.map(b => b.placeholderFound).join(', ')}`);
             console.warn(`[ORCHESTRATOR]    Recommendation: ${shippingGate.recommendation}`);
-            
+
             // Apply auto-fix based on recommendation
             if (shippingGate.recommendation === 'remove_component' || shippingGate.recommendation === 'convert_to_text') {
                 const indicesToRemove = [...new Set(shippingGate.blockedContent.map(b => b.componentIndex))];
-                
+
                 // For chart-frame/metric-cards with placeholder data, convert to simple text fallback
                 indicesToRemove.forEach(compIdx => {
                     const comp = slide.layoutPlan?.components?.[compIdx];
                     if (comp && (comp.type === 'chart-frame' || comp.type === 'metric-cards')) {
                         // Convert to text-bullets fallback
                         // Note: metric-cards doesn't have title, use intro or generic fallback
-                        const fallbackTitle = comp.type === 'chart-frame' 
+                        const fallbackTitle = comp.type === 'chart-frame'
                             ? (comp as any).title || 'Content'
                             : (comp as any).intro || 'Data';
                         const fallbackComp = {
@@ -2332,7 +2339,7 @@ export const generateAgenticDeck = async (
                         console.log(`[ORCHESTRATOR]    Auto-converted ${comp.type} at index ${compIdx} to text-bullets fallback`);
                     }
                 });
-                
+
                 slide.warnings = [
                     ...(slide.warnings || []),
                     `Shipping gate: Placeholder content auto-fixed (${shippingGate.blockedContent.length} issues)`
@@ -2347,7 +2354,7 @@ export const generateAgenticDeck = async (
             }
         }
     });
-    
+
     if (placeholderBlockCount > 0) {
         console.warn(`[ORCHESTRATOR] Shipping gate: ${placeholderBlockCount}/${slides.length} slides had placeholder content (auto-fixed or flagged)`);
     } else {

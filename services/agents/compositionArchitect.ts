@@ -377,7 +377,10 @@ const COMPOSITION_PLAN_SCHEMA = {
               type: { type: "string" },
               target: { type: "string" },
               intensity: { type: "string", enum: ["subtle", "moderate", "bold"] },
-              params: { type: "object" }
+              // FIX: Replace empty params object with explicit color/scale properties
+              // Gemini requires non-empty properties for OBJECT type
+              color: { type: "string" },  // For glows, borders
+              scale: { type: "number" }   // For asymmetric emphasis (1.0-1.5)
             },
             required: ["type", "intensity"]
           }

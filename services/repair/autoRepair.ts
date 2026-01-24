@@ -842,10 +842,13 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             let list: any[] = c.metrics || c.items || c.cards || [];
             if (!Array.isArray(list)) list = [list];
 
-            // If array is empty, convert to text-bullets instead of injecting placeholders
-            if (list.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty metric-cards array, converting to text-bullets`);
-                convertMetricsToTextBullets(c, 'no metrics available');
+            // FIX: Early detection of empty OR placeholder-only arrays
+            // Check before normalization to catch more edge cases
+            const validItems = list.filter(i => i && !isPlaceholderValue(i?.value) && !isPlaceholderValue(i?.label));
+            
+            if (list.length === 0 || validItems.length === 0) {
+                console.warn(`[AUTO-REPAIR] Empty or placeholder metric-cards array, converting to text-bullets`);
+                convertMetricsToTextBullets(c, 'no valid metrics available');
                 return;
             }
 

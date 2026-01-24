@@ -714,8 +714,11 @@ export class SpatialLayoutEngine {
 
       if (comp.title) {
         const titleH = 0.6 * contentScale;
-        const nextY = curY + (0.7 * contentScale);
-        if (nextY <= maxY) {
+        // REDUCED PADDING: Was 0.7 * contentScale, now 0.65 to fit tighter zones
+        const nextY = curY + (0.65 * contentScale);
+        
+        // RELAXED CHECK: Allow rendering if it's *close* to fitting (within 0.2 units)
+        if (nextY <= maxY + 0.2) {
           els.push({
             type: 'text',
             content: comp.title,
@@ -728,7 +731,19 @@ export class SpatialLayoutEngine {
           });
           curY = nextY;
         } else {
-          this.addWarning(`Title dropped in zone '${zone.id}' due to space constraints.`);
+          // FALLBACK: Render smaller title instead of dropping completely
+          els.push({
+            type: 'text',
+            content: comp.title,
+            x, y: curY, w, h: titleH * 0.8,
+            fontSize: themeTokens.typography.scale.subtitle * contentScale * 0.8,
+            bold: this.isBold(themeTokens.typography.weights.subtitle),
+            color: p.text,
+            fontFamily: styleGuide.fontFamilyTitle,
+            zIndex: 10
+          });
+          curY += titleH * 0.85;
+          this.addWarning(`Title scaled down in zone '${zone.id}' to fit.`);
         }
       }
 
@@ -1219,6 +1234,9 @@ function calculateTextDensity(components: TemplateComponent[]): number {
 /**
  * Calculate fit score based on warnings, utilization, and density.
  * Returns a 0-1 score where 1 = perfect, 0 = critical issues.
+ * 
+ * TUNED: Reduced warning penalty to differentiate "ugly" (warnings) from "broken" (errors).
+ * This prevents infinite repair loops when slides have minor cosmetic issues.
  */
 function calculateFitScore(
   warningsCount: number,
@@ -1228,19 +1246,20 @@ function calculateFitScore(
   // Start with perfect score
   let score = 1.0;
 
-  // Penalize for warnings (each warning reduces score)
+  // Penalize for warnings (TUNED: -5% per warning instead of -15%)
+  // We want to differentiate between "ugly" (warnings) and "broken" (errors)
   if (warningsCount > 0) {
-    score -= warningsCount * 0.15; // -15% per warning
+    score -= warningsCount * 0.05; // -5% per warning (was -15%)
   }
 
-  // Penalize for high utilization (>0.9 is risky)
-  if (avgUtilization > 0.9) {
-    score -= (avgUtilization - 0.9) * 0.5; // -50% for full utilization
+  // Penalize for high utilization (RELAXED: >0.95 is risky, was 0.9)
+  if (avgUtilization > 0.95) {
+    score -= (avgUtilization - 0.95) * 0.5;
   }
 
-  // Penalize for high text density (>0.8 is packed)
-  if (textDensity > 0.8) {
-    score -= (textDensity - 0.8) * 0.3; // -30% for dense text
+  // Penalize for high text density (RELAXED: >0.9 is packed, was 0.8)
+  if (textDensity > 0.9) {
+    score -= (textDensity - 0.9) * 0.3;
   }
 
   // Clamp to 0-1

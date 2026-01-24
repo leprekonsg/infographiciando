@@ -7,7 +7,8 @@ import pptxgen from 'pptxgenjs';
 import { SlideNode, GlobalStyleGuide, TemplateComponent, VisualElement, LayoutVariant } from '../types/slideTypes';
 import { SpatialLayoutEngine, renderWithLayeredComposition } from './spatialRenderer';
 import { buildDiagramSVG, DiagramPalette } from './diagramBuilder';
-import { svgToPngBase64 } from './visualCortex';
+// Removed static import of visualCortex to break circular dependency
+// import { svgToPngBase64 } from './visualCortex';
 
 const DEFAULT_COLORS = { background: "0F172A", text: "F1F5F9", primary: "22C55E", secondary: "38BDF8", accent: "F59E0B" };
 
@@ -199,6 +200,8 @@ export class InfographicRenderer {
               );
 
               // Rasterize to PNG (1920x1080 for high quality)
+              // Dynamically import to avoid circular dependency
+              const { svgToPngBase64 } = await import('./visualCortex');
               const pngBase64 = await svgToPngBase64(svgString, 1920, 1080);
 
               this.diagramCache.set(cacheKey, pngBase64);
@@ -273,7 +276,7 @@ export class InfographicRenderer {
         (comp: any) => this.getDiagramFromCache(comp, styleGuide)
       );
     }
-    
+
     // Standard rendering: Use the Spatial Layout Engine with VisualDesignSpec for color overrides
     return this.layoutEngine.renderWithSpatialAwareness(
       slide,
@@ -312,7 +315,7 @@ export class InfographicRenderer {
           align: el.align,
           rotate: el.rotation
         };
-        
+
         // Note: PptxGenJS doesn't natively support letterSpacing
         // For premium typography, we apply font weight mapping
         // letterSpacing and lineHeight are visual-only (used in preview renderer)
@@ -320,7 +323,7 @@ export class InfographicRenderer {
           // Map fontWeight to bold (700+) or regular
           textOpts.bold = el.fontWeight >= 700;
         }
-        
+
         // Transform content if textTransform is specified
         let content = el.content;
         if ((el as any).textTransform === 'uppercase') {
@@ -328,7 +331,7 @@ export class InfographicRenderer {
         } else if ((el as any).textTransform === 'lowercase') {
           content = content.toLowerCase();
         }
-        
+
         pptSlide.addText(content, textOpts);
       } else if (el.type === 'image') {
         // Render icons/images

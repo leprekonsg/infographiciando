@@ -67,6 +67,30 @@ function classifyJsonFailure(text: string): JsonClassification {
         return { type: 'degeneration', confidence: 'high' };
     }
 
+    // NEW: Check for underscore-separated repetition (catches "id_icon_label_id_icon_label...")
+    // This is a common hallucination pattern where the LLM repeats JSON field names
+    const underscoreRepeatPattern = /([a-z]{2,}_[a-z]{2,}_[a-z]{2,}_)\1{2,}/i;
+    if (underscoreRepeatPattern.test(last500)) {
+        console.warn(`[JSON CLASSIFY] Detected degeneration pattern (underscore-separated field repetition)`);
+        return { type: 'degeneration', confidence: 'high' };
+    }
+
+    // NEW: Check for any short pattern repeated many times (generic repetition catch-all)
+    // Pattern: any 8-30 char sequence repeated 4+ times consecutively
+    const genericRepeatPattern = /(.{8,30})\1{3,}/;
+    if (genericRepeatPattern.test(last500)) {
+        const match = last500.match(genericRepeatPattern);
+        if (match && match[1]) {
+            // Avoid false positives on legitimate repeated JSON patterns like `},{`
+            const repeatedPattern = match[1];
+            const isLegitimate = /^[\s{}\[\],":]+$/.test(repeatedPattern);
+            if (!isLegitimate) {
+                console.warn(`[JSON CLASSIFY] Detected degeneration pattern (generic repetition: "${repeatedPattern.slice(0, 20)}...")`);
+                return { type: 'degeneration', confidence: 'high' };
+            }
+        }
+    }
+
     // NEW: Check for enum value concatenation pattern
     // Example: "metric-cards-left-text-bullets-right-metric-cards-left-text-bullets-right-..."
     const enumConcatPattern = /((?:text-bullets|metric-cards|process-flow|icon-grid|chart-frame|diagram-svg)[-_]){4,}/i;
@@ -222,6 +246,21 @@ function hasEntropyDegeneration(text: string): boolean {
     const typeHallucinationPattern = /([-_][a-z]+-[a-z]+)\1{4,}/i;
     if (typeHallucinationPattern.test(sample)) {
         console.warn(`[DEGENERATION] Component type hallucination detected`);
+        return true;
+    }
+
+    // NEW: Underscore-separated repetition (catches "id_icon_label_id_icon_label...")
+    const underscoreRepeatPattern = /([a-z]{2,}_[a-z]{2,}_[a-z]{2,}_)\1{2,}/i;
+    if (underscoreRepeatPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Underscore-separated field repetition detected`);
+        return true;
+    }
+
+    // NEW: Generic repetition catch-all (any 8-30 char pattern repeated 4+ times)
+    const genericRepeatPattern = /(.{8,30})\1{3,}/;
+    const genericMatch = sample.match(genericRepeatPattern);
+    if (genericMatch && genericMatch[1] && !/^[\s{}\[\],":]+$/.test(genericMatch[1])) {
+        console.warn(`[DEGENERATION] Generic repetition detected: "${genericMatch[1].slice(0, 20)}..."`);
         return true;
     }
 
@@ -395,6 +434,28 @@ export interface AgentConfig {
     temperature?: number;
     maxOutputTokens?: number;
     onToolCall?: (name: string, args: any, result: any) => void;
+    
+    // =========================================================================
+    // CONTEXT FOLDING OPTIONS (Phil Schmid Best Practices)
+    // =========================================================================
+    /** 
+     * Context mode controls how conversation history is managed:
+     * - 'server': Use previous_interaction_id; only send deltas (tool results) after turn 1
+     * - 'client': Send full history every turn (legacy behavior, useful for debugging)
+     * Default: 'server' for efficiency
+     */
+    contextMode?: 'server' | 'client';
+    
+    /**
+     * Initial thought signature from a previous agent (for cross-agent context transfer)
+     */
+    initialThoughtSignature?: string;
+    
+    /**
+     * Maximum retries per tool before marking it as non-retryable
+     * Default: 2
+     */
+    maxToolRetries?: number;
 }
 
 // --- LOGGING ---
@@ -792,14 +853,14 @@ export function estimateTokenBudget(
  * Quick token estimation for common agent patterns
  */
 export const TOKEN_BUDGETS = {
-    /** Router: simple classification, small output (increased from 512 for safety) */
-    ROUTER: 1024,
-    /** Content Planner: structured extraction, moderate output */
-    CONTENT_PLANNER: 2048,
+    /** Router: simple classification, small output (increased for Interactions API buffer) */
+    ROUTER: 2048,
+    /** Content Planner: structured extraction, moderate output (increased to fix truncation) */
+    CONTENT_PLANNER: 3072,
     /** Visual Designer: design spec, moderate output */
     VISUAL_DESIGNER: 2048,
-    /** Composition Architect: layer planning, small output */
-    COMPOSITION_ARCHITECT: 1536,
+    /** Composition Architect: layer planning (increased for nested schema) */
+    COMPOSITION_ARCHITECT: 2048,
     /** Generator: full slide JSON, largest output */
     GENERATOR: 8192,
     /** Generator with complex layout: extra buffer for bento/dashboard */
@@ -987,6 +1048,128 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
     }
 }
 
+// --- Context Folding & Error Unrolling (Phil Schmid + OpenAI Codex patterns) ---
+
+/**
+ * Structured tool error result for Error Unrolling pattern.
+ * Instead of simple { error: message }, we provide actionable observations
+ * that help the model self-correct.
+ */
+export interface ToolErrorResult {
+    success: false;
+    error_type: 'validation' | 'runtime' | 'network' | 'not_found' | 'rate_limit' | 'timeout';
+    message: string;
+    retryable: boolean;
+    hint?: string;
+    context?: Record<string, unknown>;
+}
+
+export interface ToolSuccessResult<T = unknown> {
+    success: true;
+    data: T;
+}
+
+export type ToolResult<T = unknown> = ToolSuccessResult<T> | ToolErrorResult;
+
+/**
+ * Classify tool execution errors into structured observations.
+ * This helps the model understand WHY a tool failed and HOW to recover.
+ */
+function classifyToolError(error: Error, toolName: string): ToolErrorResult {
+    const msg = error.message.toLowerCase();
+    
+    if (msg.includes('rate limit') || msg.includes('429') || msg.includes('quota')) {
+        return {
+            success: false,
+            error_type: 'rate_limit',
+            message: error.message,
+            retryable: true,
+            hint: 'Wait a moment before retrying this tool call'
+        };
+    }
+    
+    if (msg.includes('timeout') || msg.includes('timed out') || msg.includes('deadline')) {
+        return {
+            success: false,
+            error_type: 'timeout',
+            message: error.message,
+            retryable: true,
+            hint: 'The operation took too long. Try with smaller input or simpler query'
+        };
+    }
+    
+    if (msg.includes('not found') || msg.includes('404') || msg.includes('does not exist')) {
+        return {
+            success: false,
+            error_type: 'not_found',
+            message: error.message,
+            retryable: false,
+            hint: 'The requested resource does not exist. Check the identifier or try a different query'
+        };
+    }
+    
+    if (msg.includes('validation') || msg.includes('invalid') || msg.includes('schema') || msg.includes('required')) {
+        return {
+            success: false,
+            error_type: 'validation',
+            message: error.message,
+            retryable: true,
+            hint: 'The input did not match expected format. Review the tool schema and correct the arguments'
+        };
+    }
+    
+    if (msg.includes('network') || msg.includes('fetch') || msg.includes('connection') || msg.includes('503')) {
+        return {
+            success: false,
+            error_type: 'network',
+            message: error.message,
+            retryable: true,
+            hint: 'Network error occurred. This may be transient - retry may succeed'
+        };
+    }
+    
+    // Default to runtime error
+    return {
+        success: false,
+        error_type: 'runtime',
+        message: error.message,
+        retryable: false,
+        hint: `Tool "${toolName}" encountered an unexpected error. Try alternative approach`,
+        context: { originalError: error.name }
+    };
+}
+
+/**
+ * Build the input for a multi-turn interaction with Context Folding.
+ * 
+ * Context Folding (Phil Schmid pattern):
+ * - Turn 1: Send full prompt
+ * - Turn N>1 with server mode: Send ONLY the tool result (delta), rely on previous_interaction_id
+ * - Turn N>1 with client mode: Send full accumulated history
+ * 
+ * This reduces token costs from O(n²) to O(n) for long agent loops.
+ */
+function buildContextFoldedInput(
+    fullHistory: ContentType[],
+    currentDelta: ContentType[],
+    mode: 'server' | 'client',
+    hasPreviousInteractionId: boolean,
+    iteration: number
+): ContentType[] {
+    // First turn: always send full prompt
+    if (iteration === 1) {
+        return fullHistory;
+    }
+    
+    // Server mode with valid previous_interaction_id: send only delta
+    if (mode === 'server' && hasPreviousInteractionId && currentDelta.length > 0) {
+        return currentDelta;
+    }
+    
+    // Client mode or fallback: send full history
+    return fullHistory;
+}
+
 // --- AGENT RUNNER (Core Loop) ---
 
 /**
@@ -1011,165 +1194,55 @@ export async function runAgentLoop(
     // Build tool declarations for the API
     const toolDeclarations = Object.values(config.tools).map(t => t.definition);
 
-    // Conversation contents (multi-turn)
-    let contents: ContentType[] = [{ type: 'text', text: prompt }];
+    // Context Folding setup (Phil Schmid pattern)
+    const contextMode = config.contextMode || 'server'; // Default to server-side context
+    const maxToolRetries = config.maxToolRetries || 3;  // Per-tool retry cap
+    
+    // Full conversation history (always maintained for fallback)
+    let fullHistory: ContentType[] = [{ type: 'text', text: prompt }];
+    
+    // Delta for current turn (tool results from last iteration)
+    let currentDelta: ContentType[] = [];
+    
     let previousInteractionId: string | undefined;
-    let thoughtSignature: string | undefined;
+    let thoughtSignature: string | undefined = config.initialThoughtSignature;
+    
+    // Tool error tracking for retry caps
+    const toolErrorCounts: Record<string, number> = {};
+    
+    // Token savings estimation
+    let tokensSentWithFolding = 0;
+    let tokensSentWithoutFolding = 0;
 
     for (let iteration = 1; iteration <= maxIterations; iteration++) {
         logger.logIteration(iteration, 'calling model');
 
         try {
-            // Inject thought signature if available from previous turn (Gemini 3)
-            // This maintains the reasoning chain across multi-turn interactions
-            let loopInputs = contents;
-            if (thoughtSignature) {
-                // Add thought signature to the LAST content block if it's not already there
-                // Limit thought history to prevent context bloat? 
-                // Currently API recommends just passing it back. 
-                // We construct a specific ContentType for thought restoration.
-            }
+            // Build context-folded input (Phil Schmid pattern)
+            // Turn 1: Full prompt | Turn N with server mode: Only tool results (delta)
+            const input = buildContextFoldedInput(
+                fullHistory,
+                currentDelta,
+                contextMode,
+                !!previousInteractionId,
+                iteration
+            );
+            
+            // Estimate token savings
+            const inputTokenEstimate = JSON.stringify(input).length / 4;
+            const fullHistoryTokenEstimate = JSON.stringify(fullHistory).length / 4;
+            tokensSentWithFolding += inputTokenEstimate;
+            tokensSentWithoutFolding += fullHistoryTokenEstimate;
 
-            // Actually, for Gemini Interactions API context restoration:
-            // We usually append the previous interaction ID. But 'thought' preservation often requires passing the thought back.
-            // However, the `previous_interaction_id` field handles the server-side context in many cases.
-            // If we are managing history client-side (which we are, via `contents`), we need to insert the thought.
-            // BUT `ContentType` definition includes `type: 'thought'`.
-
-            // Re-construct request.input
-            // If we have a thought signature from previous turn, we should probably let the API handle it via previous_interaction_id?
-            // The user specific request "Implement thought signature propagation" typically means:
-            // "if (thoughtSignature) contents.push({ type: 'thought', signature: thoughtSignature });"
-            // But strict types might not allow 'signature' alone. 
-            // Checking ContentType definition: | { type: 'thought'; summary?: ...; signature?: string }
-
-            // Correct approach:
-            if (thoughtSignature && iteration > 1) {
-                // Check if the last item is already a thought? No, last items are outputs.
-                // We add it to the interaction history we send back.
-                // However, `contents` accumulates `response.outputs`. 
-                // `response.outputs` ALREADY contains the thought object if the model produced it!
-                // So `contents` should already have it.
-                // The issue is: The Loop logic: `contents = [...contents, ...response.outputs, ...functionResults];`
-                // IF `response.outputs` includes the thought, it is propagated!
-
-                // SO PROBABLY the issue is that `response.outputs` might NOT include the thought if we don't handle it, 
-                // OR we strictly filter it?
-                // Let's check lines 666-680 in `interactionsClient.ts`.
-                // We iterate outputs.
-                // We capture `thoughtSignature`.
-                // `contents` includes `response.outputs`.
-
-                // So if `outputs` has the thought, we are good?
-                // Maybe the user wants us to EXPLICITLY ensure it's passed if we *prune* history?
-                // Or maybe specifically strictly ensure `previous_interaction_id` is used?
-                // We ARE using `previous_interaction_id` (Line 635).
-
-                // Let's look closer at `runAgentLoop` implementation constraints or missing pieces.
-                // The specific detailed guide for Thought Signatures usually says:
-                // "Pass the thought content block back in the history."
-                // My code does `contents = [...contents, ...response.outputs]`.
-                // If `outputs` contains the thought block, it is passed.
-
-                // PERHAPS the issue is that `thoughtSignature` needs to be *extracted* and used in `generation_config`? 
-                // No, standard usage is just history.
-
-                // Wait, maybe the user means "Ensure we extract it and return it" so the Orchestrator can use it?
-                // The return type is `{ text, logger, thoughtSignature }`. We *are* returning it.
-
-                // Let's re-read the code I viewed in Step 131.
-                // Line 666: `for (const output of response.outputs) { ... if (output.type === 'thought'...) thoughtSignature = output.signature; }`
-                // Line 718: `contents = [...contents, ...response.outputs, ...functionResults];`
-
-                // It seems ALREADY implemented?
-                // "Recommendation 4: Implement thought signature propagation in agent loop"
-                // Maybe I missed something. 
-                // Ah, `interaction.previous_interaction_id` is passed.
-                // Is it possible the tool output loop needs the thought?
-
-                // Let's try to be safer. Some APIs require the thought signature to be in a specific field?
-                // No, usually just content.
-
-                // Maybe the user thinks it's MISSING because I just copied the file content in Step 131 
-                // and it *looked* like I implemented it?
-                // Wait, I *read* the file. I didn't write it. 
-                // Step 131 viewed lines 1-800. 
-                // If the code IS there, then it IS implemented.
-
-                // CHECK: Did I implement this in a *previous* session?
-                // "Step Id: 131 ... content ... 667: if (output.type === 'thought' && output.signature) { ... thoughtSignature = output.signature; }"
-
-                // Okay, so valid logic IS present. 
-                // The User Request says "Recommend 4: Implement ...".
-                // This implies it is NOT done or needs refinement.
-
-                // Let's look at `createInteraction` (Single Turn) vs `runAgentLoop` (Multi Turn).
-                // `createInteraction` lines 755++.
-                // It does NOT take `thoughtSignature` as input options?
-                // It takes `previous_interaction_id`? No.
-                // `createInteraction` (lines 755-800+) creates a usage with `new InteractionsClient()`.
-                // It builds `request`.
-                // It does NOT support `previous_interaction_id` argument! 
-                // `runAgentLoop` uses it. `createInteraction` does NOT.
-
-                // The Orchestrator uses `createJsonInteraction` -> `createInteraction`.
-                // `createJsonInteraction` calls `createInteraction`.
-                // If `createInteraction` drops context (single turn), we lose thoughts.
-                // `runAgentLoop` handles multi-turn *within* the agent (e.g. Researcher).
-
-                // BUT `runGenerator` (Orchestrator Level) calls `createJsonInteraction`.
-                // `createJsonInteraction` calls `createInteraction`.
-                // Does `createInteraction` support Context Folding (passing previous thoughts)?
-                // NO. It takes `prompt`.
-
-                // The "Recommendation 4" likely refers to making `runAgentLoop` or `createInteraction` 
-                // capable of accepting an *external* thought signature (from a previous agent) 
-                // and injecting it.
-
-                // Orchestrator: "Context Folding". We want to pass thoughts from Agent A to Agent B?
-                // Or just preserve thought across retries?
-                // "Implement thought signature propagation in agent loop" usually refers to the loop.
-
-                // Let's verify if `previous_interaction_id` is correctly updated in `runAgentLoop`.
-                // Line 655: `previous_interaction_id = response.id;`
-                // Line 645: `previous_interaction_id: previousInteractionId`
-                // This looks correct for *internal* loop history.
-
-                // What if the user means: "Add `thoughtSignature` param to `runAgentLoop`"?
-                // So we can initialize the loop *with* a thought?
-                // StartLine 612 `export async function runAgentLoop(...)`
-                // Arguments: `prompt, config, costTracker`.
-                // No `thoughtSignature` or `previousContext`.
-
-                // I will add `previousState` or `thoughtContext` to `runAgentLoop` config?
-                // Or specifically to `AgentConfig`.
-
-                // Let's modify `AgentConfig` to accept `initialThoughtSignature`?
-
-                // Actually, looking at the user instructions "Refine thought signature propagation..."
-                // I will explicitly add logic to ensure thought blocks are retained in `contents`.
-                // (They are retained by `...response.outputs`).
-
-                // Maybe I should focus on `createInteraction` (single turn helpers) being upgraded?
-                // `createInteraction` does NOT have `previous_interaction_id` support.
-                // This breaks "Context Folding" if we rely on IDs.
-                // But we use "NarrativeTrail" (text) for context folding.
-
-                // Let's look at `interactionsClient.ts`.
-                // I will add `initialThoughtSignature` to `AgentConfig` 
-                // and inject it into the first request inputs if present.
-                // { type: 'thought', signature: ... }
-
-            }
-
-            // Log thought signature propagation
-            if (previousInteractionId && thoughtSignature) {
-                console.log(`[AGENT LOOP] Returning thought signature to model for iteration ${iteration} (via previous_interaction_id)`);
+            // Log context folding status
+            if (iteration > 1 && contextMode === 'server' && previousInteractionId) {
+                const savedTokens = Math.round(fullHistoryTokenEstimate - inputTokenEstimate);
+                console.log(`[CONTEXT FOLDING] Iteration ${iteration}: Sending delta only (${Math.round(inputTokenEstimate)} tokens vs ${Math.round(fullHistoryTokenEstimate)} full). Saved ~${savedTokens} tokens`);
             }
 
             const request: InteractionRequest = {
                 model: config.model,
-                input: contents,
+                input: input, // Context-folded input
                 system_instruction: config.systemInstruction,
                 tools: toolDeclarations.length > 0
                     ? [{ function_declarations: toolDeclarations }]
@@ -1182,7 +1255,27 @@ export async function runAgentLoop(
                 previous_interaction_id: previousInteractionId
             };
 
-            const response = await client.create(request);
+            let response: InteractionResponse;
+            try {
+                response = await client.create(request);
+            } catch (err: any) {
+                // Handle server rejecting previous_interaction_id (expired, invalid, etc.)
+                if (previousInteractionId && (
+                    err.message.includes('previous_interaction_id') ||
+                    err.message.includes('interaction not found') ||
+                    err.message.includes('invalid interaction')
+                )) {
+                    console.warn(`[CONTEXT FOLDING] Server rejected previous_interaction_id. Falling back to full history for iteration ${iteration}`);
+                    
+                    // Retry with full history and no previous_interaction_id
+                    request.input = fullHistory;
+                    request.previous_interaction_id = undefined;
+                    previousInteractionId = undefined; // Reset for future iterations
+                    response = await client.create(request);
+                } else {
+                    throw err;
+                }
+            }
 
             const requestedModel = normalizeModelName(config.model);
             const resolvedModel = normalizeModelName(response.model || config.model);
@@ -1244,17 +1337,49 @@ export async function runAgentLoop(
 
                 for (const call of functionCalls) {
                     const tool = config.tools[call.name];
-                    let result: any;
+                    let result: ToolResult<unknown>;
                     const startTime = Date.now();
 
-                    if (tool) {
-                        try {
-                            result = await tool.execute(call.arguments);
-                        } catch (err: any) {
-                            result = { error: `Tool execution failed: ${err.message}` };
-                        }
+                    if (!tool) {
+                        // Tool not found - not retryable
+                        result = {
+                            success: false,
+                            error_type: 'not_found',
+                            message: `Tool "${call.name}" not found`,
+                            retryable: false,
+                            hint: `Available tools: ${Object.keys(config.tools).join(', ')}`
+                        };
                     } else {
-                        result = { error: `Tool "${call.name}" not found` };
+                        // Check tool retry cap (Error Unrolling pattern)
+                        const errorCount = toolErrorCounts[call.name] || 0;
+                        if (errorCount >= maxToolRetries) {
+                            result = {
+                                success: false,
+                                error_type: 'runtime',
+                                message: `Tool "${call.name}" has failed ${errorCount} times. Giving up.`,
+                                retryable: false,
+                                hint: 'This tool is not working reliably. Try an alternative approach or skip this step.'
+                            };
+                            console.warn(`[ERROR UNROLLING] Tool "${call.name}" exceeded retry cap (${maxToolRetries}). Blocking further attempts.`);
+                        } else {
+                            try {
+                                const data = await tool.execute(call.arguments);
+                                result = { success: true, data };
+                                // Reset error count on success
+                                toolErrorCounts[call.name] = 0;
+                            } catch (err: any) {
+                                // Increment error count
+                                toolErrorCounts[call.name] = errorCount + 1;
+                                
+                                // Classify error for structured observation (Error Unrolling)
+                                result = classifyToolError(err, call.name);
+                                
+                                console.warn(`[ERROR UNROLLING] Tool "${call.name}" failed (attempt ${errorCount + 1}/${maxToolRetries}): ${result.error_type} - ${result.message}`);
+                                if (result.hint) {
+                                    console.warn(`[ERROR UNROLLING] Hint to model: ${result.hint}`);
+                                }
+                            }
+                        }
                     }
 
                     const durationMs = Date.now() - startTime;
@@ -1274,14 +1399,28 @@ export async function runAgentLoop(
                     });
                 }
 
-                // Add model response and our tool results to conversation
-                contents = [...contents, ...response.outputs, ...functionResults];
+                // Update full history with model response and tool results
+                fullHistory = [...fullHistory, ...response.outputs, ...functionResults];
+                
+                // Set delta for next iteration (Context Folding - only send tool results)
+                currentDelta = functionResults;
+                
                 continue;
             }
 
             // If status is completed or we have final text, return
             if (response.status === 'completed' || finalText) {
                 logger.logIteration(iteration, 'completed');
+                
+                // Log context folding savings
+                const totalSaved = Math.round(tokensSentWithoutFolding - tokensSentWithFolding);
+                const savingsPercent = tokensSentWithoutFolding > 0 
+                    ? Math.round((totalSaved / tokensSentWithoutFolding) * 100)
+                    : 0;
+                if (totalSaved > 0) {
+                    console.log(`[CONTEXT FOLDING] Total savings: ~${totalSaved} tokens (${savingsPercent}% reduction from O(n²) to O(n))`);
+                }
+                
                 return { text: finalText, logger, thoughtSignature };
             }
 
@@ -1476,8 +1615,23 @@ export async function createInteraction(
 
             for (const output of retryResponse.outputs || []) {
                 if (output.type === 'text') {
+                    const retryText = output.text;
+                    
+                    // CRITICAL: Check if retry also produced degenerated output
+                    // Don't return garbage - let it fall through to Qwen or error handling
+                    if (hasEntropyDegeneration(retryText)) {
+                        console.warn(`[INTERACTIONS CLIENT] Retry also produced degenerated output - skipping`);
+                        break; // Fall through to Qwen fallback
+                    }
+                    
+                    // Check for oversized response (likely degeneration)
+                    if (retryText.length > 15000) {
+                        console.warn(`[INTERACTIONS CLIENT] Retry produced oversized response (${retryText.length} chars) - skipping`);
+                        break; // Fall through to Qwen fallback
+                    }
+                    
                     console.log(`[INTERACTIONS CLIENT] Retry succeeded with ${MODEL_SIMPLE}`);
-                    return output.text;
+                    return retryText;
                 }
             }
         } catch (retryErr: any) {
@@ -1557,6 +1711,55 @@ export async function createJsonInteraction<T = any>(
         const classification = classifyJsonFailure(text);
         console.log(`[JSON REPAIR] Classified as: ${classification.type} (${classification.confidence} confidence)`);
 
+        // --- CRITICAL: Hard limit on response length to prevent browser hang ---
+        // Degenerated responses can be 100KB+ and freeze the browser during repair attempts
+        const MAX_RESPONSE_LENGTH = 15000; // 15KB is more than enough for any valid slide JSON
+        if (text.length > MAX_RESPONSE_LENGTH) {
+            console.error(`[JSON REPAIR] Response too long (${text.length} chars > ${MAX_RESPONSE_LENGTH} limit)`);
+            console.error(`[JSON REPAIR] This indicates severe LLM degeneration - aborting repair and returning fallback`);
+            
+            // Return a safe fallback immediately without attempting expensive repairs
+            return {
+                layoutPlan: {
+                    title: "Content Recovery",
+                    background: "solid",
+                    components: [{
+                        type: "text-bullets",
+                        title: "Content",
+                        content: ["Content generation encountered an issue.", "Please try regenerating this slide."]
+                    }]
+                },
+                speakerNotesLines: ['Slide generation required recovery due to oversized response.'],
+                selfCritique: { readabilityScore: 0.5, textDensityStatus: "optimal", layoutAction: "keep" }
+            } as T;
+        }
+
+        // --- EARLY ABORT: For severe degeneration, skip expensive repair attempts ---
+        if (classification.type === 'degeneration' && classification.confidence === 'high') {
+            // Check if the degeneration is so severe that repair is pointless
+            const last200 = text.slice(-200);
+            const repetitionDensity = (last200.match(/([a-z_-]{3,})\1/gi) || []).length;
+            
+            if (repetitionDensity > 5) {
+                console.error(`[JSON REPAIR] Severe degeneration detected (repetition density: ${repetitionDensity})`);
+                console.error(`[JSON REPAIR] Skipping repair attempts - returning fallback immediately`);
+                
+                return {
+                    layoutPlan: {
+                        title: "Content",
+                        background: "solid",
+                        components: [{
+                            type: "text-bullets",
+                            title: "Key Points",
+                            content: ["Content generation encountered a processing issue.", "The slide will be regenerated."]
+                        }]
+                    },
+                    speakerNotesLines: ['Slide recovered from degenerated output.'],
+                    selfCritique: { readabilityScore: 0.5, textDensityStatus: "optimal", layoutAction: "keep" }
+                } as T;
+            }
+        }
+
         // --- LAYER 1: String array fallback (MOVED EARLY) ---
         // Check for schema drift BEFORE other repairs to avoid corrupting valid arrays
         if (classification.type === 'string_array') {
@@ -1590,11 +1793,36 @@ export async function createJsonInteraction<T = any>(
         if (classification.type === 'degeneration') {
             console.warn(`[JSON REPAIR] LLM degeneration detected - attempting to extract valid prefix before repetition`);
 
-            // Try to find valid JSON before the degeneration started
-            // Look for patterns like: valid JSON then "type": "text-bullets-metric-cards-text-bullets-..."
+            // STRATEGY 1: Find where repetition starts and truncate
+            // Look for repeating patterns and find the start position
             let repaired = text;
+            
+            // Find repetition start by looking for pattern duplicates
+            const patterns = [
+                /([a-z]{2,}_[a-z]{2,}_[a-z]{2,}_)\1+/gi,  // id_icon_label_id_icon_label...
+                /(.{8,30})\1{2,}/g,  // Generic repetition
+                /((?:text-bullets|metric-cards|process-flow|icon-grid|chart-frame|diagram-svg)[-_]){3,}/gi
+            ];
+            
+            let earliestRepetitionStart = text.length;
+            for (const pattern of patterns) {
+                const match = text.match(pattern);
+                if (match) {
+                    const idx = text.indexOf(match[0]);
+                    if (idx > 0 && idx < earliestRepetitionStart) {
+                        earliestRepetitionStart = idx;
+                        console.warn(`[JSON REPAIR] Found repetition starting at position ${idx}`);
+                    }
+                }
+            }
+            
+            // Truncate at repetition start and try to salvage
+            if (earliestRepetitionStart < text.length) {
+                repaired = text.substring(0, earliestRepetitionStart);
+                console.warn(`[JSON REPAIR] Truncated at repetition start, keeping ${repaired.length} chars`);
+            }
 
-            // Remove the degenerated component type values
+            // Remove any remaining degenerated component type values
             // Pattern: "type": "valid-type-garbage-garbage-garbage..."
             const degeneratedTypePattern = /"type"\s*:\s*"([a-z-]+)(?:[-_][a-z-]+){5,}[^"]*"/gi;
             repaired = repaired.replace(degeneratedTypePattern, (match, validPart) => {
@@ -1606,6 +1834,10 @@ export async function createJsonInteraction<T = any>(
                 console.warn(`[JSON REPAIR] Extracted base type from degeneration: "${extracted}"`);
                 return `"type": "${extracted}"`;
             });
+            
+            // Also clean up any long garbage strings (id_icon_label_id_icon_label...)
+            const longGarbagePattern = /"[a-z_]{50,}"/gi;
+            repaired = repaired.replace(longGarbagePattern, '"text-bullets"');
 
             // Try to parse the cleaned version
             try {
@@ -1613,28 +1845,39 @@ export async function createJsonInteraction<T = any>(
                 const firstBrace = repaired.indexOf('{');
                 if (firstBrace !== -1) {
                     repaired = repaired.substring(firstBrace);
-
-                    // Count and close brackets
+                    
+                    // Find the last complete object by tracking depth
                     let depth = 0;
                     let inString = false;
                     let escape = false;
+                    let lastCompletePos = -1;
+                    
                     for (let i = 0; i < repaired.length; i++) {
                         const char = repaired[i];
                         if (escape) { escape = false; continue; }
                         if (char === '\\') { escape = true; continue; }
                         if (char === '"') { inString = !inString; continue; }
                         if (!inString) {
-                            if (char === '{') depth++;
-                            else if (char === '[') depth++;
-                            else if (char === '}') depth--;
-                            else if (char === ']') depth--;
+                            if (char === '{' || char === '[') depth++;
+                            else if (char === '}' || char === ']') {
+                                depth--;
+                                if (depth === 0) {
+                                    lastCompletePos = i + 1;
+                                }
+                            }
                         }
                     }
-
-                    // Close any open brackets
-                    while (depth > 0) {
-                        repaired += '}';
-                        depth--;
+                    
+                    // If we found a complete object, use that
+                    if (lastCompletePos > 0 && depth !== 0) {
+                        console.warn(`[JSON REPAIR] Using last complete JSON at position ${lastCompletePos}`);
+                        repaired = repaired.substring(0, lastCompletePos);
+                    } else if (depth > 0) {
+                        // Close any open brackets
+                        while (depth > 0) {
+                            repaired += '}';
+                            depth--;
+                        }
                     }
                 }
 
@@ -1642,7 +1885,20 @@ export async function createJsonInteraction<T = any>(
                 console.log(`[JSON REPAIR] Degeneration repair success!`);
                 return normalizeJsonOutput(parsed);
             } catch (degErr) {
-                console.warn(`[JSON REPAIR] Degeneration repair failed, falling through to truncation repair...`);
+                console.warn(`[JSON REPAIR] Degeneration repair failed, trying prefix extraction...`);
+                
+                // STRATEGY 2: Try to extract any valid JSON prefix
+                const prefixResult = extractLongestValidPrefix(repaired);
+                if (prefixResult) {
+                    try {
+                        const parsed = JSON.parse(prefixResult.json) as T;
+                        console.log(`[JSON REPAIR] Degeneration prefix extraction success!`);
+                        return normalizeJsonOutput(parsed);
+                    } catch {
+                        console.warn(`[JSON REPAIR] Prefix extraction also failed`);
+                    }
+                }
+                
                 // Fall through to truncation repair as backup
             }
         }

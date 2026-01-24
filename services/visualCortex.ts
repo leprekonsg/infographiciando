@@ -1575,6 +1575,12 @@ export async function runQwenVisualArchitectLoop(
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalCost = 0;
+    
+    // FIX: Track best slide for rollback when repairs degrade quality
+    // This prevents returning a worse slide when Visual Architect makes things worse
+    let bestSlide = slide;
+    let bestScore = 0;
+    let bestRepairs: RepairAction[] = [];
 
     // Simple hash function for SVG content comparison
     const hashSvg = (svg: string): string => {
@@ -1694,6 +1700,14 @@ export async function runQwenVisualArchitectLoop(
             const repairs = normalizeRepairs(rawRepairs);
 
             console.log(`[VISUAL ARCHITECT] Score: ${currentScore}/100, Verdict: ${verdict}, Repairs: ${repairs.length}`);
+            
+            // FIX: Track best slide for rollback - preserve highest scoring state
+            if (currentScore > bestScore) {
+                bestScore = currentScore;
+                bestSlide = JSON.parse(JSON.stringify(currentSlide)); // Deep clone
+                bestRepairs = [...allRepairs];
+                console.log(`[VISUAL ARCHITECT] 📈 New best score: ${bestScore}`);
+            }
 
             // STAGNATION DETECTION: If same issue categories persist, abort
             if (detectStagnation(repairHistory, repairs)) {
@@ -1732,11 +1746,18 @@ export async function runQwenVisualArchitectLoop(
             // Check for improvement
             if (round > 1 && currentScore <= previousScore + MIN_IMPROVEMENT_DELTA) {
                 console.warn(`[VISUAL ARCHITECT] No improvement detected (${previousScore} → ${currentScore}), exiting early`);
+                // FIX: Return best slide if current is worse (rollback to best state)
+                const returnSlide = bestScore > currentScore ? bestSlide : currentSlide;
+                const returnScore = bestScore > currentScore ? bestScore : currentScore;
+                const returnRepairs = bestScore > currentScore ? bestRepairs : allRepairs;
+                if (bestScore > currentScore) {
+                    console.log(`[VISUAL ARCHITECT] ↩️ Rolling back to best score: ${bestScore} (current: ${currentScore})`);
+                }
                 return {
-                    slide: currentSlide,
+                    slide: returnSlide,
                     rounds: round,
-                    finalScore: currentScore,
-                    repairs: allRepairs,
+                    finalScore: returnScore,
+                    repairs: returnRepairs,
                     converged: false,
                     totalCost,
                     totalInputTokens,
@@ -1751,11 +1772,18 @@ export async function runQwenVisualArchitectLoop(
                 allRepairs = [...allRepairs, ...repairs];
             } else {
                 console.warn('[VISUAL ARCHITECT] No repairs suggested, exiting');
+                // FIX: Return best slide if current is worse
+                const returnSlide = bestScore > currentScore ? bestSlide : currentSlide;
+                const returnScore = bestScore > currentScore ? bestScore : currentScore;
+                const returnRepairs = bestScore > currentScore ? bestRepairs : allRepairs;
+                if (bestScore > currentScore) {
+                    console.log(`[VISUAL ARCHITECT] ↩️ Rolling back to best score: ${bestScore} (current: ${currentScore})`);
+                }
                 return {
-                    slide: currentSlide,
+                    slide: returnSlide,
                     rounds: round,
-                    finalScore: currentScore,
-                    repairs: allRepairs,
+                    finalScore: returnScore,
+                    repairs: returnRepairs,
                     converged: false,
                     totalCost,
                     totalInputTokens,
@@ -1768,12 +1796,18 @@ export async function runQwenVisualArchitectLoop(
         } catch (error: any) {
             console.error(`[VISUAL ARCHITECT] Error in round ${round}:`, error.message);
 
-            // On error, return current state
+            // FIX: On error, return best slide if available
+            const returnSlide = bestScore > 0 ? bestSlide : currentSlide;
+            const returnScore = bestScore > 0 ? bestScore : previousScore;
+            const returnRepairs = bestScore > 0 ? bestRepairs : allRepairs;
+            if (bestScore > 0) {
+                console.log(`[VISUAL ARCHITECT] ↩️ Error recovery: rolling back to best score: ${bestScore}`);
+            }
             return {
-                slide: currentSlide,
+                slide: returnSlide,
                 rounds: round,
-                finalScore: previousScore,
-                repairs: allRepairs,
+                finalScore: returnScore,
+                repairs: returnRepairs,
                 converged: false,
                 totalCost,
                 totalInputTokens,
@@ -1784,11 +1818,18 @@ export async function runQwenVisualArchitectLoop(
 
     // Max rounds reached without convergence
     console.warn(`[VISUAL ARCHITECT] Max rounds (${maxRounds}) reached without full convergence`);
+    // FIX: Return best slide achieved during iteration
+    const returnSlide = bestScore > previousScore ? bestSlide : currentSlide;
+    const returnScore = bestScore > previousScore ? bestScore : previousScore;
+    const returnRepairs = bestScore > previousScore ? bestRepairs : allRepairs;
+    if (bestScore > previousScore) {
+        console.log(`[VISUAL ARCHITECT] ↩️ Max rounds: rolling back to best score: ${bestScore} (final: ${previousScore})`);
+    }
     return {
-        slide: currentSlide,
+        slide: returnSlide,
         rounds: maxRounds,
-        finalScore: previousScore,
-        repairs: allRepairs,
+        finalScore: returnScore,
+        repairs: returnRepairs,
         converged: false,
         totalCost,
         totalInputTokens,
