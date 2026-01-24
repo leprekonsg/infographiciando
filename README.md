@@ -1,30 +1,36 @@
 # InfographIQ
 
-**AI-Powered Slide Deck Generation with Autonomous Agents**
+**AI-Powered Slide Deck Generation with Adaptive Director Orchestration**
 
-InfographIQ transforms a simple topic into a professional, data-driven presentation using a coordinated swarm of specialized AI agents. Built on Google's Gemini Interactions API with strategic model tier optimization.
+InfographIQ transforms a topic into a professional presentation using an adaptive Director agent that orchestrates specialized tools. Built on Google's Gemini Interactions API with strategic model tier optimization.
 
 ---
 
 ## Architecture
 
-The system employs a multi-agent pipeline where each agent has a focused responsibility:
+### Director Pipeline (v3.1)
+
+The system uses a **non-linear state machine** where the Director can loop back to earlier tools when quality gates fail:
 
 ```
-Topic → Researcher → Architect → Router → Content Planner → Composition Architect → Visual Designer → Generator → Renderer → PPTX
+Topic → Director [
+          RESEARCH → ARCHITECT → Per-Slide { ROUTE → PLAN → EVALUATE → (ENRICH?) }
+                                                              ↑___________|
+                                                        (loop back if thin)
+       ] → PPTX
 ```
 
-### Agent Pipeline
+**Key Capability**: If slide content is thin, the Director triggers *targeted re-research* on that specific topic, enriches the fact pool, and retries content planning. This is the "Manus-level" non-linear orchestration.
 
-| Agent | Model | Role |
-|-------|-------|------|
+### Agent Tools
+
+| Tool | Model | Role |
+|------|-------|------|
 | **Researcher** | Gemini 3 Flash | Extracts 8-12 verified facts via Google Search grounding |
 | **Architect** | Gemini 3 Flash | Structures narrative arc, clusters facts, defines style guide |
 | **Router** | Gemini 2.5 Flash | Classifies layout variant and render mode per slide |
 | **Content Planner** | Gemini 3 Flash | Extracts key points and data from assigned fact clusters |
-| **Composition Architect** | Gemini 3 Flash | Determines layered structure, primitives, and "surprise" elements |
 | **Visual Designer** | Gemini 3 Flash | Creates spatial composition spec with color harmony |
-| **Generator** | Gemini 3 Flash | Produces final slide JSON with component layout |
 | **Image Generator** | Gemini 3 Pro Image | Renders background visuals from composed prompts |
 
 ### Model Strategy
@@ -41,11 +47,11 @@ Based on [Phil Schmid's agent best practices](https://www.philschmid.de/building
 
 ## Features
 
-- **Agentic Generation** — Full deck creation with real-time agent activity feed
-- **Serendipity Engine** — Controlled variation system with "surprise slots" and variation budgets
-- **Layered Spatial Engine** — Background → Decorative → Content → Overlay stack for modern design
-- **Visual Architect (Qwen-VL)** — Vision-first critique and repair loop with SVG-to-PNG proxy and structured repair application
-- **Auto-Repair Pipeline** — Deterministic JSON normalization, component type mapping, and context-aware fallback recovery
+- **Adaptive Director** — Non-linear orchestration with quality-driven loop-back and targeted re-research
+- **Silent Fallback** — Director failures silently route to legacy pipeline (zero user-facing errors)
+- **Layered Spatial Engine** — Background → Decorative → Content → Overlay stack
+- **Visual Architect (Qwen-VL)** — Vision-first critique and repair loop with SVG-to-PNG proxy
+- **Auto-Repair Pipeline** — Deterministic JSON normalization with context-aware fallback recovery
 - **PPTX Export** — Native PowerPoint output preserving layouts, images, and speaker notes
 - **Cost Optimized** — ~$0.18/deck (60% savings vs naive Pro usage)
 
@@ -66,56 +72,54 @@ Based on [Phil Schmid's agent best practices](https://www.philschmid.de/building
 ## Quick Start
 
 ```bash
-# Install dependencies
 npm install
-
-# Set API key in .env
 echo "GEMINI_API_KEY=your_key_here" > .env
-
-# Start development server
 npm run dev
 ```
 
-Open `http://localhost:5173`, enter a topic, and watch the agents work.
+Open `http://localhost:5173`, enter a topic, and watch the Director work.
+
+### Enable Director Mode
+
+Set in `slideAgentService.ts`:
+```typescript
+export const ENABLE_DIRECTOR_MODE = true;  // Use adaptive Director
+export const ENABLE_DIRECTOR_MODE = false; // Use legacy sequential pipeline
+```
 
 ---
 
 ## Qwen-VL Visual Architect (Optional)
 
-Qwen-VL powers the visual critique/repair loop. It requires a small Node backend for SVG → PNG rasterization and the DashScope API call.
+Qwen-VL powers the visual critique/repair loop. Requires Node backend for SVG → PNG rasterization.
 
-### Environment Variables
-- `GEMINI_API_KEY` — Required for Gemini Interactions API
-- `DASHSCOPE_API_KEY` or `QWEN_API_KEY` — Required for Qwen-VL
-- `QWEN_VL_PROXY_URL` — Base URL of the local Qwen-VL proxy (e.g., `http://localhost:8787`)
-
-### Local Setup
 ```bash
-# Terminal 1: start Qwen-VL proxy server (Node-only)
+# Set environment variables
+DASHSCOPE_API_KEY=your_key_here
+QWEN_VL_PROXY_URL=http://localhost:8787
+
+# Start proxy server
 npm run qwen:server
-
-# Terminal 2: start the Vite app
-npm run dev
 ```
-
-If `QWEN_VL_PROXY_URL` is not set, the app will fall back to the internal visual critique only.
 
 ---
 
 ## Project Structure
 
 ```
-├── App.tsx                     # Main application
-├── components/
-│   ├── SlideDeckBuilder.tsx    # Agentic builder UI + PPTX export
-│   ├── BuilderCanvas.tsx       # Slide preview with spatial zones
-│   └── ActivityFeed.tsx        # Real-time agent logs
 ├── services/
+│   ├── DirectorAgent.ts        # Adaptive orchestrator (state machine)
+│   ├── slideAgentService.ts    # Entry point + legacy pipeline
 │   ├── interactionsClient.ts   # Gemini Interactions API client
-│   ├── slideAgentService.ts    # Agent orchestration
-│   ├── visualDesignAgent.ts    # Visual composition agent
 │   ├── spatialRenderer.ts      # Zone-based layout engine
-│   └── validators.ts           # Schema + alignment validation
+│   └── agents/                 # Tool implementations
+│       ├── researcher.ts
+│       ├── architect.ts
+│       ├── router.ts
+│       └── contentPlanner.ts
+├── components/
+│   ├── SlideDeckBuilder.tsx    # Builder UI + PPTX export
+│   └── ActivityFeed.tsx        # Real-time agent logs
 ├── types/
 │   └── slideTypes.ts           # Zod schemas
 └── docs/
@@ -125,40 +129,16 @@ If `QWEN_VL_PROXY_URL` is not set, the app will fall back to the internal visual
 
 ---
 
-## Component Types
+## Quality Gates
 
-The generator produces slides using these component primitives:
+The Director evaluates content at each slide:
 
-| Type | Description |
-|------|-------------|
-| `text-bullets` | Bulleted list with optional title |
-| `metric-cards` | 2-6 stat cards with value, label, icon |
-| `process-flow` | 3-5 step horizontal flow |
-| `icon-grid` | 2-4 column grid with icons |
-| `chart-frame` | Bar, pie, line, or doughnut chart |
-| `diagram-svg` | Complex SVG-based diagram (e.g., SWOT) |
-
----
-
-## Validation & Recovery
-
-Each slide passes through a deterministic pipeline:
-
-1. **Schema Validation** — Zod parsing with custom error classification (truncation vs. schema)
-2. **Auto-Repair** — Normalization of types, junk removal, and context-aware content fallback
-3. **Spatial Preflight** — Zone allocation, affinity matching, and density overflow checks
-4. **Vision-First Architect** — Optional Qwen-VL closed-loop refinement for spatial perfection
-
-Failed slides trigger a **Circuit Breaker** which reroutes the slide back to the Architect/Router with more restrictive layout constraints.
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [Architecture Diagram](docs/ARCHITECTURE_DIAGRAM.md) | Full system blueprint with gap analysis |
-| [Model Optimization](docs/MODEL_OPTIMIZATION.md) | Model tier decisions and cost tracking |
+| Gate | Threshold | Action on Fail |
+|------|-----------|----------------|
+| MIN_KEY_POINTS | 2 (1 for hero) | Targeted re-research |
+| MIN_CHARS_PER_POINT | 20 | Targeted re-research |
+| MIN_TOTAL_CHARS | 80 | Targeted re-research |
+| MAX_ENRICHMENT_ATTEMPTS | 2 | Accept and continue |
 
 ---
 

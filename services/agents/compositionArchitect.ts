@@ -32,7 +32,8 @@ import {
 import {
   createJsonInteraction,
   CostTracker,
-  MODEL_SIMPLE
+  MODEL_SIMPLE,
+  TOKEN_BUDGETS
 } from "../interactionsClient";
 
 // ============================================================================
@@ -117,8 +118,8 @@ SLIDE CONTEXT:
 - Purpose: ${slidePurpose}
 - Layout Variant: ${routerConfig.layoutVariant}
 - Render Mode: ${routerConfig.renderMode}
-- Visual Focus: ${routerConfig.visualFocus}
-- Density Budget: max ${routerConfig.densityBudget.maxItems} items, ${routerConfig.densityBudget.maxChars} chars
+- Visual Focus: ${routerConfig.visualFocus || 'General content'}
+- Density Budget: max ${routerConfig.densityBudget?.maxItems ?? 4} items, ${routerConfig.densityBudget?.maxChars ?? 500} chars
 
 CONTENT SUMMARY:
 ${contentSummary}

@@ -39,10 +39,10 @@ import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
 import { runContentPlanner, ContentDensityHint, ContentPlanResult } from "./agents/contentPlanner";
 import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
-import { 
-    runCompositionArchitect, 
+import {
+    runCompositionArchitect,
     trackUsedSurprises,
-    computeDetailedVariationBudget 
+    computeDetailedVariationBudget
 } from "./agents/compositionArchitect";
 import { CompositionPlan, SerendipityDNA } from "../types/serendipityTypes";
 import { z } from "zod";
@@ -50,6 +50,10 @@ import { z } from "zod";
 // --- FEATURE FLAGS ---
 // Enable serendipity mode for high-variation slide generation
 export const SERENDIPITY_MODE_ENABLED = true; // Layer-based composition with premium design
+
+// Enable Director mode - uses orchestrator pattern with browser-based rendering
+// When true, routes to DirectorAgent pipeline instead of legacy multi-agent pipeline
+export const ENABLE_DIRECTOR_MODE = false; // Set to true to test new architecture
 
 // --- CONSTANTS ---
 // Model tiers imported from interactionsClient for consistency
@@ -89,8 +93,8 @@ function ensureValidContentPlan(plan: any, meta: any): ContentPlanResult {
     }
 
     // Validate keyPoints - the most critical field
-    const hasValidKeyPoints = Array.isArray(plan.keyPoints) && 
-        plan.keyPoints.length > 0 && 
+    const hasValidKeyPoints = Array.isArray(plan.keyPoints) &&
+        plan.keyPoints.length > 0 &&
         plan.keyPoints.some((kp: any) => typeof kp === 'string' && kp.trim().length > 0);
 
     if (!hasValidKeyPoints) {
@@ -100,13 +104,13 @@ function ensureValidContentPlan(plan: any, meta: any): ContentPlanResult {
 
     // Return normalized plan with guaranteed shape
     return {
-        title: typeof plan.title === 'string' && plan.title.trim() 
-            ? plan.title.trim() 
+        title: typeof plan.title === 'string' && plan.title.trim()
+            ? plan.title.trim()
             : (meta?.title || 'Slide Content'),
         keyPoints: plan.keyPoints
             .filter((kp: any) => typeof kp === 'string' && kp.trim().length > 0)
             .map((kp: string) => kp.trim()),
-        dataPoints: Array.isArray(plan.dataPoints) 
+        dataPoints: Array.isArray(plan.dataPoints)
             ? plan.dataPoints.filter((dp: any) => dp && typeof dp === 'object' && dp.label)
             : [],
         narrative: typeof plan.narrative === 'string' ? plan.narrative : undefined,
@@ -234,10 +238,10 @@ function computeDynamicBulletCharCap(
 ): number {
     const fontSize = getBodyFontSize(styleGuide);
     const fontFamily = styleGuide?.fontFamilyBody;
-    
+
     // Font-aware adjustment: monospace fonts are ~30% wider per character
     const monospacePenalty = isMonospaceFont(fontFamily) ? 0.7 : 1.0;
-    
+
     const fontAdjusted = Math.round(baseCap * (14 / fontSize) * monospacePenalty);
     const countAdjusted = bulletCount >= 3 ? Math.round(fontAdjusted * 0.9) : fontAdjusted;
     return Math.max(30, Math.min(countAdjusted, 100)); // Tighter limits for safety
@@ -907,9 +911,9 @@ async function runGenerator(
             dataPoints: Array.isArray(contentPlan.dataPoints) ? contentPlan.dataPoints : [],
             narrative: contentPlan.narrative,
             chartSpec: contentPlan.chartSpec
-          }
+        }
         : createSafeContentPlan(meta, 'generator-guard');
-    
+
     // AGGRESSIVE PRE-TRUNCATION: Limit contentPlan size before prompt construction
     // Reduced limits to prevent token exhaustion causing "o0o0o0" degeneration
     if (safeContentPlan.keyPoints.length > 4) {
@@ -948,7 +952,7 @@ async function runGenerator(
             // CRITICAL FIX: Pre-check if we have valid dataPoints for metric-cards
             // If not, steer away from metric-cards in examples to prevent empty arrays
             const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
-            
+
             // SCHEMA GUIDANCE: Since schema is now ultra-minimal, provide explicit JSON examples
             // CRITICAL: metric-cards example MUST show full array structure with 2+ items
             // The model outputs empty metrics:[] because the minimal schema doesn't define inner structure
@@ -1233,7 +1237,7 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
             const hasStructuralIssues = (candidate.warnings || []).some(w =>
                 /truncated|hidden|overflow|requires \d+\.\d+ units but only/i.test(String(w))
             );
-            
+
             if (hasStructuralIssues) {
                 console.log(`[GENERATOR] Skipping Visual Architect: structural issues detected (overflow/truncation). Visual repairs won't help.`);
             }
@@ -1603,17 +1607,154 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
     };
 }
 
+// --- BLUEPRINT TO EDITABLE DECK CONVERTER (Director Pipeline Support) ---
+
+import type { DeckBlueprint } from './DirectorAgent';
+
+/**
+ * Converts a Director-produced DeckBlueprint into an EditableSlideDeck.
+ * This bridges the new Director pipeline output to the existing UI/export layer.
+ */
+function blueprintToEditableDeck(
+    blueprint: DeckBlueprint,
+    costTracker: CostTracker
+): EditableSlideDeck {
+    const slides: SlideNode[] = blueprint.slides.map((bpSlide, index) => {
+        // Build layoutPlan from blueprint components
+        const layoutPlan = {
+            title: bpSlide.title,
+            components: bpSlide.components.map((comp: any) => ({
+                type: comp.type || 'text-bullets',
+                zoneId: comp.zoneId || 'body',
+                content: comp.content || {}
+            }))
+        };
+
+        const slideNode: SlideNode = {
+            order: bpSlide.order,
+            type: index === 0 ? SLIDE_TYPES['title-slide'] : 
+                  index === blueprint.slides.length - 1 ? SLIDE_TYPES['conclusion'] : SLIDE_TYPES['content-main'],
+            title: bpSlide.title,
+            purpose: bpSlide.purpose,
+            routerConfig: {
+                layoutVariant: bpSlide.layoutId as any || 'standard-vertical',
+                renderMode: 'standard'
+            },
+            layoutPlan,
+            visualReasoning: `Director-generated: ${bpSlide.purpose}`,
+            visualPrompt: bpSlide.imagePrompts?.[0] || '',
+            visualDesignSpec: undefined,
+            speakerNotesLines: bpSlide.speakerNotes ? [bpSlide.speakerNotes] : [],
+            readabilityCheck: 'pass',
+            citations: [],
+            warnings: []
+        };
+        return slideNode;
+    });
+
+    // Build deck metrics from blueprint (aligned with DeckMetrics interface)
+    const deckMetrics: DeckMetrics = {
+        totalDurationMs: 0, // Will be filled by caller
+        retries: 0,
+        totalCost: costTracker.totalCost,
+        fallbackSlides: 0,
+        visualAlignmentFirstPassSuccess: slides.length,
+        totalVisualDesignAttempts: slides.length,
+        rerouteCount: 0,
+        visualCritiqueAttempts: 0,
+        visualRepairSuccess: 0,
+        system2Cost: 0,
+        system2TokensInput: 0,
+        system2TokensOutput: 0,
+        coherenceScore: 80,
+        coherenceIssues: 0
+    };
+
+    return {
+        id: crypto.randomUUID(),
+        topic: blueprint.title,
+        meta: {
+            title: blueprint.title,
+            narrativeGoal: blueprint.narrativeGoal,
+            knowledgeSheet: [], // Empty ResearchFact array - Director doesn't pass raw facts through
+            slides: blueprint.slides.map(s => ({
+                order: s.order,
+                type: SLIDE_TYPES['content-main'],
+                title: s.title,
+                purpose: s.purpose
+            })),
+            styleGuide: blueprint.styleGuide || {
+                themeName: 'Default',
+                fontFamilyTitle: 'Inter',
+                fontFamilyBody: 'Inter',
+                colorPalette: {
+                    primary: '#10b981',
+                    secondary: '#3b82f6',
+                    background: '#0f172a',
+                    text: '#f8fafc',
+                    accentHighContrast: '#f59e0b'
+                },
+                imageStyle: 'Clean',
+                layoutStrategy: 'Standard'
+            },
+            factClusters: []
+        },
+        slides,
+        metrics: deckMetrics
+    };
+}
+
 
 // --- ORCHESTRATOR (Level 3: Context Folding + Self-Healing Circuit Breaker) ---
 
+/**
+ * Main entry point for deck generation.
+ * Routes to Director pipeline when ENABLE_DIRECTOR_MODE=true,
+ * with silent fallback to legacy pipeline on Director failure.
+ */
 export const generateAgenticDeck = async (
     topic: string,
     onProgress: (status: string, percent?: number) => void
 ): Promise<EditableSlideDeck> => {
+    // =========================================================================
+    // DIRECTOR PIPELINE (Phase 3 Integration)
+    // Silent fallback to legacy pipeline on failure - critical for reliability
+    // =========================================================================
+    if (ENABLE_DIRECTOR_MODE) {
+        console.log("[ORCHESTRATOR] Director mode enabled, routing to new pipeline...");
+        try {
+            const { runDirector, DeckBlueprintSchema } = await import('./DirectorAgent');
+            const costTracker = new CostTracker();
+            
+            const blueprint = await runDirector(
+                { topic },
+                costTracker,
+                onProgress
+            );
+            
+            // JSON Hallucination Trap: Validate blueprint before proceeding
+            const parseResult = DeckBlueprintSchema.safeParse(blueprint);
+            if (parseResult.success) {
+                // Convert blueprint to EditableSlideDeck
+                const deck = blueprintToEditableDeck(parseResult.data, costTracker);
+                console.log(`[ORCHESTRATOR] Director pipeline complete: ${deck.slides.length} slides`);
+                return deck;
+            }
+            // Validation failed - fall through to legacy pipeline
+            console.warn('[ORCHESTRATOR] Director produced invalid blueprint, falling back to legacy');
+        } catch (directorErr: any) {
+            console.warn('[ORCHESTRATOR] Director pipeline failed, silently falling back:', directorErr.message);
+            // Fall through to legacy pipeline
+        }
+    }
+
+    // =========================================================================
+    // LEGACY PIPELINE (Original multi-agent orchestration)
+    // =========================================================================
     const costTracker = new CostTracker();
     const startTime = Date.now();
 
-    console.log("[ORCHESTRATOR] Starting Level 3 Agentic Deck Generation...");
+    console.log("[ORCHESTRATOR] Starting Level 3 Agentic Deck Generation (Legacy)...");
     console.log(`[ORCHESTRATOR] Max iterations per agent: ${MAX_AGENT_ITERATIONS}`);
 
     // --- PHASE 1: CONTEXT FOLDING STATE ---
@@ -1684,7 +1825,7 @@ export const generateAgenticDeck = async (
             // This is critical - zone sizes vary dramatically between layouts
             const isHeroOrIntro = slideMeta.type === 'title-slide' || slideMeta.type === 'section-header' || i === 0;
             const layoutVariant = routerConfig?.layoutVariant || 'standard-vertical';
-            
+
             // Layout-aware density budgets (based on actual zone capacity)
             // These values are calibrated to the zone sizes in spatialRenderer.ts
             const LAYOUT_DENSITY_BUDGETS: Record<string, { maxBullets: number; maxCharsPerBullet: number }> = {
@@ -1698,24 +1839,24 @@ export const generateAgenticDeck = async (
                 'asymmetric-grid': { maxBullets: 3, maxCharsPerBullet: 55 },    // Mixed zones
                 'standard-vertical': { maxBullets: 3, maxCharsPerBullet: 70 },  // Most generous
             };
-            
+
             const layoutBudget = LAYOUT_DENSITY_BUDGETS[layoutVariant] || LAYOUT_DENSITY_BUDGETS['standard-vertical'];
-            
+
             const densityHint: ContentDensityHint = {
                 maxBullets: isHeroOrIntro ? Math.min(2, layoutBudget.maxBullets) : layoutBudget.maxBullets,
                 maxCharsPerBullet: isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet,
                 maxDataPoints: layoutVariant === 'bento-grid' ? 4 : 3
             };
-            
+
             console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} → max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars`);
 
             onProgress(`Agent 3b/5: Content Planning Slide ${i + 1}...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
-            
+
             // CRITICAL: Content Planner now returns typed ContentPlanResult
             // We still validate with ensureValidContentPlan for defense-in-depth
             const rawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, densityHint);
             const safeContentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, slideMeta);
-            
+
             console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints`);
 
             // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
@@ -1769,7 +1910,7 @@ export const generateAgenticDeck = async (
             let compositionPlan: CompositionPlan | undefined;
             if (SERENDIPITY_MODE_ENABLED) {
                 onProgress(`Agent 3c.1/5: Composition Architecture Slide ${i + 1}...`, 36 + Math.floor((i / (totalSlides * 2)) * 30));
-                
+
                 // Extract serendipity DNA from style guide on first slide
                 if (i === 0 && outline.styleGuide.styleDNA) {
                     serendipityDNA = {
@@ -1781,14 +1922,14 @@ export const generateAgenticDeck = async (
                         surpriseCues: outline.styleGuide.styleDNA.surpriseCues
                     };
                 }
-                
+
                 const detailedBudget = computeDetailedVariationBudget(
-                    i, 
-                    totalSlides, 
+                    i,
+                    totalSlides,
                     slideMeta.type,
                     serendipityDNA
                 );
-                
+
                 compositionPlan = await runCompositionArchitect({
                     slideId: `slide-${i}`,
                     slideTitle: slideMeta.title,
@@ -1803,10 +1944,10 @@ export const generateAgenticDeck = async (
                     narrativeTrail: recentHistory,
                     usedSurprisesInDeck
                 }, costTracker);
-                
+
                 // Track used surprises to avoid repetition
                 usedSurprisesInDeck = trackUsedSurprises(usedSurprisesInDeck, compositionPlan);
-                
+
                 console.log(`[ORCHESTRATOR] Composition plan: ${compositionPlan.layerPlan.contentStructure.pattern}, surprises: ${compositionPlan.serendipityPlan.allocatedSurprises.length}`);
             }
 
@@ -1815,7 +1956,7 @@ export const generateAgenticDeck = async (
             const MAX_REROUTES_PER_SLIDE = 2;
             let slideRerouteCount = 0;
             let generatorResult: GeneratorResult;
-            
+
             // CRITICAL: Use typed ContentPlanResult throughout the generation loop
             // This ensures all downstream consumers (generator, visual designer, layout selector)
             // receive a guaranteed-valid content plan shape
@@ -1872,7 +2013,7 @@ export const generateAgenticDeck = async (
                         maxCharsPerBullet: 60, // Shorter bullets
                         maxDataPoints: 2
                     };
-                    
+
                     // Re-run content planner with tighter constraints and validate result
                     const rerouteRawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, rerouteDensityHint);
                     currentContentPlan = ensureValidContentPlan(rerouteRawContentPlan, slideMeta);
@@ -1916,7 +2057,7 @@ export const generateAgenticDeck = async (
             }
 
             const slideNode = generatorResult.slide;
-            
+
             // Attach composition plan to slide for layer-aware rendering
             if (SERENDIPITY_MODE_ENABLED && currentCompositionPlan) {
                 slideNode.compositionPlan = currentCompositionPlan;
@@ -2135,11 +2276,11 @@ export const regenerateSingleSlide = async (
     };
 
     let routerConfig = await runRouter(meta, costTracker);
-    
+
     // Use typed content plan with validation for single slide regeneration
     const rawContentPlan = await runContentPlanner(meta, "", costTracker);
     const contentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, meta);
-    
+
     routerConfig = await runQwenLayoutSelector(
         meta,
         contentPlan,

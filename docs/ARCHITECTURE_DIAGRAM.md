@@ -1,7 +1,7 @@
 ﻿# InfographIQ Architecture (Current)
 
-> **Updated**: 2026-01-22  
-> **Version**: 3.0 (Current Implementation)
+> **Updated**: 2026-01-24  
+> **Version**: 3.4 (Risk-Based Sampling + Asset Drift Protection + Timing Metrics)
 
 ---
 
@@ -10,7 +10,11 @@
 InfographIQ is a **client-first, agent-orchestrated** slide generation system. It uses a multi-agent pipeline to transform a topic into a structured deck, then renders slides with spatially-aware layouts and optional visual critique.
 
 Key characteristics:
-- **Agentic orchestration** with Interactions API and structured JSON outputs.
+- **Adaptive Director orchestration** with non-linear state machine (loop-back on thin content).
+- **Risk-based visual sampling** (high-risk layouts always validated, low-risk skipped).
+- **Asset drift protection** via content IDs (prevents stale image injection).
+- **Back-pressure controlled** parallel asset generation (max 3 concurrent).
+- **Per-phase timing metrics** for latency optimization.
 - **Deterministic spatial rendering** using predefined layout templates + affinity mapping.
 - **System 2 visual critique** with optional Qwen-VL external validation (Node-only).
 - **Cost-aware model tiering** (Flash-first; Pro reserved only where required).
@@ -26,12 +30,19 @@ Key characteristics:
                          │
                          ▼
 ┌───────────────────────┐              ┌──────────────────────────┐
-│      FRONTEND         │              │       AGENT LAYER        │
-│   React + Vite        │◄────────────►│   Multi-Agent Pipeline   │
-│                       │              │  (Research → Generate)   │
+│      FRONTEND         │              │     DIRECTOR AGENT       │
+│   React + Vite        │◄────────────►│  Adaptive Orchestrator   │
+│                       │              │  (Non-Linear Pipeline)   │
 └───────────────────────┘              └──────────────────────────┘
-                         │                                   │
-                         ▼                                   ▼
+                         │                         │
+                         ▼                         ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                            AGENT TOOLS (demoted from agents)                          │
+│  • Researcher  • Architect  • Router  • ContentPlanner                                │
+│  (Director invokes as needed, including targeted re-research)                         │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                                   SERVICES                                           │
 │  • Spatial Renderer   • Infographic Renderer • Validators                            │
@@ -51,7 +62,7 @@ Key characteristics:
 ## 3) Runtime Separation: Browser vs Node
 
 **Browser (Vite / Client):**
-- Agent orchestration
+- Director orchestration + agent tool invocation
 - Spatial rendering + PPTX layout
 - SVG proxy generation
 - Image generation (Gemini Image models)
@@ -66,46 +77,257 @@ Key characteristics:
 
 ---
 
-## 4) Agentic Pipeline (Current)
+## 4) Director Pipeline (Bidirectional State Machine)
+
+**Key Innovation**: The Director is NOT a sequential pipeline. It's an adaptive
+orchestrator with **bidirectional** quality loops:
+- **THIN content** → ENRICH (targeted re-research)
+- **FAT content** → PRUNE/SUMMARIZE (condensation)
+
+**Layout-Aware Quality Gates**: Hero slides have INVERTED rules (less is more).
 
 ```
 INPUT: topic (string)
      │
      ▼
-AGENT 1: Researcher (MODEL_AGENTIC, Interactions API)
-     └─ outputs ResearchFact[] (8–12 facts)
+┌────────────────────────────────────────────────────────────────────────────┐
+│  DIRECTOR AGENT (DirectorAgent.ts)                                          │
+│  Bidirectional State Machine with Layout-Aware Quality Gates                │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  STATE: RESEARCH ──► runResearcher() ──► facts[]                           │
+│       │                                                                     │
+│       ▼                                                                     │
+│  STATE: ARCHITECT ──► runArchitect() ──► outline + styleGuide               │
+│       │                                                                     │
+│       ▼                                                                     │
+│  STATE: PER-SLIDE LOOP (bidirectional quality control)                      │
+│       │                                                                     │
+│       ├──► ROUTE ──► runRouter() ──► layoutId                              │
+│       │                                                                     │
+│       ├──► PLAN ──► runContentPlanner() ──► contentPlan                    │
+│       │                                                                     │
+│       ├──► EVALUATE ──► evaluateContentQuality(layoutId)                   │
+│       │       │                                                             │
+│       │       ├── PASSES ──────────────────────────────► NEXT SLIDE        │
+│       │       │                                                             │
+│       │       ├── THIN ──► ENRICH (loop back to PLAN)                      │
+│       │       │       │                                                     │
+│       │       │       ▼                                                     │
+│       │       │   targetedResearch(query) ──► merge facts                  │
+│       │       │                                                             │
+│       │       └── FAT ──► PRUNE/SUMMARIZE (loop back to EVALUATE)          │
+│       │               │                                                     │
+│       │               ▼                                                     │
+│       │           pruneContent() or summarizeContent()                     │
+│       │                                                                     │
+│       └──────────────────────────────────────────────────────────────────┘ │
+│                                                                             │
+│  STATE: ASSEMBLE ──► DeckBlueprint                                          │
+│                                                                             │
+└────────────────────────────────────────────────────────────────────────────┘
      │
      ▼
-AGENT 2: Architect (MODEL_AGENTIC, thinking=medium)
-     └─ outputs Outline (narrativeGoal, styleGuide, slides[])
-     │
-     ▼
-FOR EACH SLIDE (sequential, with context folding)
-     ├─ Router (MODEL_SIMPLE) → RouterDecision
-     ├─ Content Planner (MODEL_AGENTIC, thinking=low) → ContentPlan
-     ├─ Composition Architect (MODEL_AGENTIC) → CompositionPlan
-     ├─ Qwen Layout Selector (optional, Node-only) → RouterDecision override
-     ├─ Visual Designer (MODEL_AGENTIC, thinking=low) → VisualDesignSpec
-     └─ Generator (MODEL_AGENTIC, thinking=none)
-           ├─ auto-repair + schema validation
-           ├─ System 2 visual critique (optional)
-           └─ circuit-breaker reroute (max 2)
-     │
-     ▼
-Image Generator (Gemini Image: 2.5 Flash → Pro fallback)
-     └─ outputs backgroundImageUrl (data URL)
-     │
-     ▼
-OUTPUT: EditableSlideDeck
+OUTPUT: DeckBlueprint → blueprintToEditableDeck() → EditableSlideDeck
 ```
 
-**Context Folding:** The last 2 slides are passed into content planning and generation as narrative trail.
+### 4.1) Layout-Specific Quality Profiles
 
-**Serendipity DNA:** On first slide, the Architect's styleGuide is converted to `SerendipityDNA` (motifs, texture, gridRhythm) which governs the variation strategy for the entire deck.
+Each layout has different content expectations:
 
-**Variation Budgeting:** Each slide is assigned a `VariationBudget` (computeDetailedVariationBudget) based on its index and type, controlling how much the Composition Architect can deviate from standard patterns.
+| Layout | Min Bullets | Max Bullets | Min Chars | Max Chars | Allow Empty |
+|--------|-------------|-------------|-----------|-----------|-------------|
+| `hero-centered` | 0 | 2 | 0 | 120 | ✅ (title-only OK) |
+| `bento-grid` | 2 | 3 | 60 | 200 | ❌ |
+| `dashboard-tiles` | 2 | 3 | 60 | 180 | ❌ |
+| `standard-vertical` | 2 | 5 | 100 | 400 | ❌ |
+| `split-left/right-text` | 2 | 4 | 80 | 280 | ❌ |
 
-**Circuit Breaker:** Low fit score or critical validation issues trigger reroute with layout constraints.
+### 4.2) Quality Gate Actions
+
+**THIN Content Detection** (under-generation):
+- `thin_content`: Too few key points
+- `too_generic`: Points too short (avg < 20 chars)
+- `missing_specifics`: Total chars below minimum
+
+→ Action: **ENRICH** via `targetedResearch(suggestedQuery)`
+
+**FAT Content Detection** (over-generation/overflow):
+- `too_many_points`: Exceeds layout's maxBullets
+- `overflow`: Total chars exceed layout's maxTotalChars
+- `too_verbose`: Individual points exceed maxCharsPerPoint
+
+→ Action: **PRUNE** (remove low-value points) or **SUMMARIZE** (condense text)
+
+### 4.3) Loop Limits (Circuit Breakers)
+
+- `MAX_ENRICHMENT_ATTEMPTS`: 2 (prevents infinite research)
+- `MAX_PRUNE_ATTEMPTS`: 2 (prevents over-condensation)
+- `MAX_TOTAL_ATTEMPTS`: 4 (safety valve per slide)
+
+### 4.4) Two-Tier Validation (IFR + VFR) with Risk-Based Sampling
+
+The Director uses **two validation tiers** for comprehensive quality control:
+
+**Tier 1: Logic Gate (Fast - Always On)**
+- Character counts + layout-specific limits
+- `evaluateContentQuality()` with bidirectional checks
+- Instant, deterministic, no external calls
+
+**Tier 2: Visual Gate (Risk-Based Sampling)**
+- `quickFitCheck()` from VisualSensor
+- Catches overflow issues that character counts miss
+- Example: "Configuration" fits 13 chars but wraps in narrow columns
+
+**Risk-Based Sampling** (replaces flat 30%):
+
+| Layout Risk | Layouts | Validation Rate |
+|-------------|---------|-----------------|
+| **HIGH** | `bento-grid`, `dashboard-tiles`, `metrics-rail`, `asymmetric-grid` | 100% (always) |
+| **MEDIUM** | `split-left-text`, `split-right-text`, `standard-vertical`, `timeline-horizontal` | 30% + first/last |
+| **LOW** | `hero-centered` | 0% unless title > 40 chars |
+
+**Structured Failure Codes** (for analytics/auto-remediation):
+- `TITLE_OVERFLOW`: Title text exceeds zone width
+- `BODY_WRAP_EXCEEDED`: Body text wraps beyond acceptable lines
+- `BULLET_TOO_LONG`: Individual bullet exceeds char limit
+- `TOTAL_CHARS_OVERFLOW`: Total content chars exceed layout limit
+- `ELEMENT_DENSITY_HIGH`: Too many visual elements in zone
+
+```
+EVALUATE (Logic Gate)
+       │
+       ▼
+  [passes?] ──No──► ENRICH/PRUNE
+       │
+      Yes
+       │
+       ▼
+  [risk-based sample?]
+       │
+       ├── HIGH RISK ──► Always validate
+       │
+       ├── MEDIUM RISK ──► Sample 30%
+       │
+       └── LOW RISK ──► Skip (unless long title)
+       │
+       ▼
+VISUAL GATE (quickFitCheck)
+       │
+       ▼
+  [fits?] ──No──► PRUNE/SUMMARIZE (+ log failure code)
+```
+       │
+      Yes
+       │
+       ▼
+    NEXT SLIDE
+```
+
+### 4.5) Phase 4: Early Asset Extraction (Parallelism + Drift Protection)
+
+**Key Insight**: Image generation is slow (~5s/image) but independent of slide planning.
+Extract asset needs AFTER architecture, generate in parallel DURING per-slide loop.
+
+**Asset Drift Problem**: Outline says "Slide 4: Q4 Revenue Chart". During drafting, Director
+pivots to "Q4 Qualitative Achievements". Pre-generated chart is now stale.
+
+**Solution: Content ID Binding**
+- Each slide gets a `contentId` based on normalized title + purpose
+- At ASSEMBLE, compare final `contentId` vs asset's original `contentId`
+- If mismatch (< 50% word overlap), discard stale asset
+
+```
+STATE: ARCHITECT ──► outline
+       │
+       ▼
+STATE: ASSET_EXTRACT ──► extractAssetNeeds(outline, facts)
+       │                    + Generate contentId per slide
+       │
+       │──────► [Background Task] generateAssetsParallel()
+       │                               │ (max 3 concurrent, back-pressure)
+       ▼                               ▼
+STATE: PER-SLIDE LOOP            (images generating...)
+       │                               │
+       ▼                               ▼
+STATE: ASSEMBLE ◄─────────────── waitForAssetsWithTimeout()
+       │                               │
+       │                               ▼
+       │                          Drift Detection:
+       │                          contentIdMatches(original, final)?
+       │                               │
+       │                    ┌──────────┴──────────┐
+       │                   Yes                    No
+       │                    │                      │
+       │               Inject image          Discard (stale)
+       │                                     Log warning
+```
+
+**Back-Pressure Control**: `Semaphore` limits concurrent image generations (default: 3).
+Prevents rate limiting while still achieving parallelism.
+
+**Timeout Handling**: `waitForAssetsWithTimeout()` (default: 15s) returns partial results
+rather than blocking forever. If images aren't ready, deck renders without them.
+
+**Configuration** (`DirectorConfig` + Mode Presets):
+```typescript
+// Mode presets (avoid combinatorial config explosion)
+type DirectorMode = 'fast' | 'balanced' | 'premium';
+
+// 'fast' mode: Skip visual validation, 5s timeout, 5 concurrent images
+// 'balanced' mode: 30% sampling, 15s timeout, 3 concurrent images
+// 'premium' mode: 100% validation, 30s timeout, 2 concurrent images
+
+{
+  mode: 'balanced',                  // Use preset (overrides individual flags)
+  enableVisualValidation: true,
+  visualValidationSampling: 0.3,
+  enableParallelPlanning: false,
+  enableEarlyAssetExtraction: true,
+  assetGenerationTimeout: 15000,     // NEW: Max wait time (ms)
+  maxConcurrentImages: 3             // NEW: Back-pressure limit
+}
+```
+
+### 4.6) Per-Phase Timing Metrics
+
+Track latency breakdown for optimization:
+
+```typescript
+interface PhaseTimings {
+    research: number;     // Time in RESEARCH phase (ms)
+    architect: number;    // Time in ARCHITECT phase (ms)
+    assetExtract: number; // Time in ASSET_EXTRACTION phase (ms)
+    perSlideLoop: number; // Total time in PER-SLIDE loop (ms)
+    assemble: number;     // Time in ASSEMBLE phase (ms)
+    assetWait: number;    // Time waiting for parallel assets (ms)
+    total: number;        // Total end-to-end time (ms)
+}
+```
+
+**Example Output**:
+```
+[DIRECTOR] Timing Breakdown:
+  - Research: 8234ms
+  - Architect: 4521ms
+  - Asset Extract: 12ms
+  - Per-Slide Loop: 24103ms
+  - Asset Wait: 3201ms (images ready before loop finished)
+  - Assemble: 89ms
+  - TOTAL: 40160ms
+```
+
+### 4.7) Targeted Re-Research (Loop-back Capability)
+When content is thin, the Director calls `targetedResearch(suggestedQuery)` which:
+1. Runs a focused research query on the specific slide topic
+2. Merges new facts with existing facts (deduplicating)
+3. Retries content planning with enriched context
+
+This is the **Manus-level capability** that makes the Director non-linear.
+
+**Feature Flag**: Set `ENABLE_DIRECTOR_MODE = true` in `slideAgentService.ts` to use Director pipeline (with silent fallback to legacy on failure).
+
+**Legacy Pipeline**: Still available when `ENABLE_DIRECTOR_MODE = false`, using the original multi-agent sequential approach.
 
 ---
 

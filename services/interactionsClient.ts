@@ -199,7 +199,7 @@ function extractLongestValidPrefix(text: string): { json: string; discarded: str
 function hasEntropyDegeneration(text: string): boolean {
     const sample = text.slice(-800).toLowerCase(); // Increased window to catch patterns
     const originalSample = text.slice(-800); // Keep original case for CamelCase detection
-    
+
     // Original character-level patterns
     if (/(\b0-){2,}0\b/.test(sample)) return true;
     if (/(?:\b0\b[\s,\-]*){6,}/.test(sample)) return true;
@@ -237,7 +237,7 @@ function hasEntropyDegeneration(text: string): boolean {
     const words = sample.split(/[\s\-_]+/).filter(w => w.length > 2);
     if (words.length >= 10) {
         const safeWords = new Set(['none', 'null', 'true', 'false', 'default', 'auto', 'inherit', 'normal']);
-        
+
         for (let patternLen = 1; patternLen <= 4; patternLen++) {
             let repeatCount = 1;
             for (let i = patternLen; i < words.length; i += patternLen) {
@@ -472,7 +472,7 @@ async function callQwenFallback(
     options: QwenFallbackOptions = {}
 ): Promise<string | null> {
     const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY;
-    
+
     if (!apiKey) {
         console.warn(`[QWEN FALLBACK] DASHSCOPE_API_KEY not configured. Skipping fallback.`);
         return null;
@@ -481,7 +481,7 @@ async function callQwenFallback(
     console.log(`[QWEN FALLBACK] Gemini failed, trying Qwen (${QWEN_MODEL})...`);
 
     const messages: Array<{ role: string; content: string }> = [];
-    
+
     if (options.systemInstruction) {
         messages.push({ role: 'system', content: options.systemInstruction });
     }
@@ -524,7 +524,7 @@ async function callQwenFallback(
         }
 
         console.log(`[QWEN FALLBACK] Success! Got ${content.length} chars from Qwen`);
-        
+
         // Log token usage if available
         if (data.usage) {
             console.log(`[QWEN FALLBACK] Usage: ${data.usage.prompt_tokens} in / ${data.usage.completion_tokens} out`);
@@ -662,7 +662,7 @@ export class CostTracker {
     addQwenVLCost(inputTokens: number, outputTokens: number): void {
         const QWEN_VL_PRICING = { input: 0.2, output: 1.6 }; // Per 1M tokens
         const cost = (inputTokens / 1_000_000 * QWEN_VL_PRICING.input) +
-                     (outputTokens / 1_000_000 * QWEN_VL_PRICING.output);
+            (outputTokens / 1_000_000 * QWEN_VL_PRICING.output);
 
         this.qwenVLCost += cost;
         this.qwenVLInputTokens += inputTokens;
@@ -716,6 +716,98 @@ export class CostTracker {
 
 const INTERACTIONS_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/interactions';
 
+// --- SINGLETON CLIENT (Phil Schmid Best Practice: Reuse connections) ---
+let _sharedClient: InteractionsClient | null = null;
+
+/**
+ * Get or create a shared InteractionsClient instance.
+ * This reduces TCP/TLS overhead by reusing the same client across calls.
+ */
+export function getSharedClient(): InteractionsClient {
+    if (!_sharedClient) {
+        _sharedClient = new InteractionsClient();
+    }
+    return _sharedClient;
+}
+
+// --- TOKEN ESTIMATION (Phil Schmid Best Practice: Prevent truncation) ---
+
+/**
+ * Estimate the number of output tokens needed for a JSON response.
+ * Uses heuristics based on schema complexity and expected content size.
+ * 
+ * @param schema - The JSON schema for the response
+ * @param options - Additional context for estimation
+ * @returns Recommended max_output_tokens value
+ */
+export function estimateTokenBudget(
+    schema: any,
+    options: {
+        contentComplexity?: 'simple' | 'moderate' | 'complex';
+        expectedArrayLength?: number;
+        hasNestedObjects?: boolean;
+    } = {}
+): number {
+    const BASE_TOKENS = 1024; // Minimum for any JSON response
+
+    // Estimate based on schema structure
+    let multiplier = 1.0;
+
+    // Count top-level properties
+    const propCount = Object.keys(schema?.properties || {}).length;
+    multiplier += propCount * 0.1;
+
+    // Check for arrays (they need more tokens)
+    const schemaString = JSON.stringify(schema);
+    const arrayCount = (schemaString.match(/"type"\s*:\s*"array"/g) || []).length;
+    multiplier += arrayCount * 0.3;
+
+    // Content complexity adjustment
+    if (options.contentComplexity === 'complex') {
+        multiplier *= 1.5;
+    } else if (options.contentComplexity === 'moderate') {
+        multiplier *= 1.2;
+    }
+
+    // Expected array length adjustment
+    if (options.expectedArrayLength) {
+        multiplier += Math.min(options.expectedArrayLength * 0.1, 0.5);
+    }
+
+    // Nested objects need more tokens
+    if (options.hasNestedObjects) {
+        multiplier *= 1.3;
+    }
+
+    // Apply buffer for thinking (if enabled)
+    const thinkingBuffer = 0.2;
+
+    const estimated = Math.ceil(BASE_TOKENS * multiplier * (1 + thinkingBuffer));
+
+    // Clamp to reasonable bounds (min 2048, max 16384)
+    return Math.max(2048, Math.min(16384, estimated));
+}
+
+/**
+ * Quick token estimation for common agent patterns
+ */
+export const TOKEN_BUDGETS = {
+    /** Router: simple classification, small output (increased from 512 for safety) */
+    ROUTER: 1024,
+    /** Content Planner: structured extraction, moderate output */
+    CONTENT_PLANNER: 2048,
+    /** Visual Designer: design spec, moderate output */
+    VISUAL_DESIGNER: 2048,
+    /** Composition Architect: layer planning, small output */
+    COMPOSITION_ARCHITECT: 1536,
+    /** Generator: full slide JSON, largest output */
+    GENERATOR: 8192,
+    /** Generator with complex layout: extra buffer for bento/dashboard */
+    GENERATOR_COMPLEX: 10240,
+    /** JSON Repair: re-formatted output, moderate */
+    JSON_REPAIR: 4096
+} as const;
+
 export class InteractionsClient {
     private apiKey: string;
 
@@ -735,7 +827,10 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
             console.error(errorMsg);
             throw new Error('API_KEY is required for InteractionsClient. Check console for setup instructions.');
         }
-        console.log('[INTERACTIONS CLIENT] Initialized with API key');
+        // Only log on first init (singleton pattern)
+        if (!_sharedClient) {
+            console.log('[INTERACTIONS CLIENT] Initialized with API key');
+        }
     }
 
     /**
@@ -909,7 +1004,8 @@ export async function runAgentLoop(
     costTracker?: CostTracker
 ): Promise<{ text: string; logger: AgentLogger; thoughtSignature?: string }> {
     const logger = new AgentLogger();
-    const client = new InteractionsClient();
+    // Use singleton client for connection reuse (Phil Schmid best practice)
+    const client = getSharedClient();
     const maxIterations = config.maxIterations || 10; // Reduced from 15 per Phil Schmid best practices
 
     // Build tool declarations for the API
@@ -1227,10 +1323,13 @@ export async function createInteraction(
         maxOutputTokens?: number;
         thinkingLevel?: ThinkingLevel;
         tools?: { googleSearch?: {} }[];
+        /** Phil Schmid Best Practice: Chain interactions for context */
+        previousInteractionId?: string;
     } = {},
     costTracker?: CostTracker
 ): Promise<string> {
-    const client = new InteractionsClient();
+    // Use singleton client for connection reuse
+    const client = getSharedClient();
 
     const request: InteractionRequest = {
         model,
@@ -1243,7 +1342,9 @@ export async function createInteraction(
             temperature: options.temperature ?? 0.2,
             max_output_tokens: options.maxOutputTokens ?? 8192,
             thinking_level: options.thinkingLevel
-        }
+        },
+        // Phil Schmid: Server-side state management via previous_interaction_id
+        previous_interaction_id: options.previousInteractionId
     };
 
     const response = await client.create(request);
@@ -1254,14 +1355,14 @@ export async function createInteraction(
         console.log(`[INTERACTIONS CLIENT] Model resolved to ${resolvedModel} (requested ${requestedModel})`);
     }
 
-        if (costTracker) {
-            const usage = normalizeUsage(response);
-            if (usage) {
-                costTracker.addUsage(resolvedModel, usage);
-            } else {
-                console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${resolvedModel}`);
-            }
+    if (costTracker) {
+        const usage = normalizeUsage(response);
+        if (usage) {
+            costTracker.addUsage(resolvedModel, usage);
+        } else {
+            console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${resolvedModel}`);
         }
+    }
 
     // Extract text from outputs
     const outputs = response.outputs || [];
@@ -1387,7 +1488,7 @@ export async function createInteraction(
         // Both Gemini attempts failed. Try Qwen as last resort.
         // This handles content filtering, persistent rate limits, and server outages.
         console.warn(`[INTERACTIONS CLIENT] Both Gemini attempts failed. Trying Qwen fallback...`);
-        
+
         const qwenResult = await callQwenFallback(
             typeof prompt === 'string' ? prompt : JSON.stringify(prompt),
             {
@@ -1488,31 +1589,31 @@ export async function createJsonInteraction<T = any>(
         // When the LLM gets stuck generating repeated enum values, extract what we can
         if (classification.type === 'degeneration') {
             console.warn(`[JSON REPAIR] LLM degeneration detected - attempting to extract valid prefix before repetition`);
-            
+
             // Try to find valid JSON before the degeneration started
             // Look for patterns like: valid JSON then "type": "text-bullets-metric-cards-text-bullets-..."
             let repaired = text;
-            
+
             // Remove the degenerated component type values
             // Pattern: "type": "valid-type-garbage-garbage-garbage..."
             const degeneratedTypePattern = /"type"\s*:\s*"([a-z-]+)(?:[-_][a-z-]+){5,}[^"]*"/gi;
             repaired = repaired.replace(degeneratedTypePattern, (match, validPart) => {
                 // Extract just the first valid component type
                 const validTypes = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
-                const extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t.replace('-', ''))) 
+                const extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t.replace('-', '')))
                     || validTypes.find(t => validPart.toLowerCase().includes(t.split('-')[0]))
                     || 'text-bullets';
                 console.warn(`[JSON REPAIR] Extracted base type from degeneration: "${extracted}"`);
                 return `"type": "${extracted}"`;
             });
-            
+
             // Try to parse the cleaned version
             try {
                 // Also try closing brackets if needed
                 const firstBrace = repaired.indexOf('{');
                 if (firstBrace !== -1) {
                     repaired = repaired.substring(firstBrace);
-                    
+
                     // Count and close brackets
                     let depth = 0;
                     let inString = false;
@@ -1529,14 +1630,14 @@ export async function createJsonInteraction<T = any>(
                             else if (char === ']') depth--;
                         }
                     }
-                    
+
                     // Close any open brackets
                     while (depth > 0) {
                         repaired += '}';
                         depth--;
                     }
                 }
-                
+
                 const parsed = JSON.parse(repaired) as T;
                 console.log(`[JSON REPAIR] Degeneration repair success!`);
                 return normalizeJsonOutput(parsed);

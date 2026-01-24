@@ -112,17 +112,17 @@ export const PREMIUM_QUALITY_CHECKS = {
   MIN_TITLE_FONT_SIZE: 32,
   MIN_BODY_FONT_SIZE: 14,
   MAX_FONT_SIZE_RATIO: 3.5, // Title shouldn't be > 3.5x body size
-  
+
   // Spacing checks (slide units)
   MIN_PADDING: 0.15,
   MIN_NEGATIVE_SPACE_PERCENT: 20,
   MAX_ELEMENT_DENSITY: 12, // Max distinct elements per slide
-  
+
   // Card checks
   MAX_CARDS_PER_SLIDE: 4,
   MIN_CARD_WIDTH: 1.8,
   MIN_CARD_HEIGHT: 2.0,
-  
+
   // Badge checks
   MAX_BADGES_PER_SLIDE: 2,
   MIN_BADGE_CONTRAST_RATIO: 4.5
@@ -329,6 +329,16 @@ export const StyleGuideSchema = z.object({
   imageStyle: z.string(),
   layoutStrategy: z.string(),
   styleDNA: SlideStyleDNASchema.optional(),
+  // NEW: Rendering constraints for Director control
+  rendering: z.object({
+    // Safety multiplier for DOM-to-PPTX text height (1.0-1.5)
+    // Director can increase for dense slides or specific fonts
+    textSafetyBuffer: z.number().min(1.0).max(1.5).default(1.15),
+    // Minimum contrast ratio for accessibility
+    minContrastRatio: z.number().default(4.5),
+    // Max characters per line before forcing wrap estimate
+    maxLineLength: z.number().optional()
+  }).optional(),
   themeTokens: z.object({
     typography: z.object({
       scale: z.object({

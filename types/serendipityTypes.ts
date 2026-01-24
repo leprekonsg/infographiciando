@@ -280,7 +280,10 @@ export const SurpriseSlotSchema = z.object({
   type: SurpriseElementTypeSchema,
   target: z.string().optional(), // Which element to apply to
   intensity: z.enum(['subtle', 'moderate', 'bold']),
-  params: z.record(z.any()).optional()
+  // NOTE: Use passthrough to avoid empty properties object which Gemini rejects
+  // "should be non-empty for OBJECT type" error
+  color: z.string().optional(),  // For glows, borders
+  scale: z.number().optional()   // For asymmetric emphasis (1.0-1.5)
 });
 
 export const SlideSerendipityPlanSchema = z.object({

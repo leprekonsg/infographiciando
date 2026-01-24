@@ -1,5 +1,5 @@
 import { RouterDecision, RouterConstraints, RenderModeSchema, LayoutVariantSchema } from "../../types/slideTypes";
-import { createJsonInteraction, CostTracker, MODEL_SIMPLE } from "../interactionsClient";
+import { createJsonInteraction, CostTracker, MODEL_SIMPLE, TOKEN_BUDGETS } from "../interactionsClient";
 import { PROMPTS } from "../promptRegistry";
 
 // --- AGENT 3: ROUTER (Phase 3: Circuit Breaker Support) ---
@@ -43,7 +43,7 @@ export async function runRouter(
     try {
         // Router: Simple enum classification → MODEL_SIMPLE (2.5 Flash)
         // 79% cheaper than Flash, sufficient for layout variant selection
-        // Thinking: None (classification task, no reasoning needed)
+        // Token budget: Minimal output (just a small JSON object)
         const result = await createJsonInteraction<RouterDecision>(
             MODEL_SIMPLE,
             PROMPTS.ROUTER.TASK(slideMeta, constraints),
@@ -51,6 +51,7 @@ export async function runRouter(
             {
                 systemInstruction: PROMPTS.ROUTER.ROLE,
                 temperature: 0.1, // Reduced for more deterministic routing
+                maxOutputTokens: TOKEN_BUDGETS.ROUTER, // Explicit budget for small output
                 thinkingLevel: undefined // No thinking for simple classification
             },
             costTracker
