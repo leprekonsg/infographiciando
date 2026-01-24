@@ -3,6 +3,10 @@
 import { TemplateComponent, VisualElement, GlobalStyleGuide, SpatialZone, LayoutVariant, SpatialStrategy, SlideNode, VisualDesignSpec, EnvironmentState } from '../types/slideTypes';
 import { InfographicRenderer, normalizeColor } from './infographicRenderer';
 
+// Serendipity layer renderers - static imports for ESM compatibility
+import * as decorativeRenderers from './decorativeRenderer';
+import * as cardRenderers from './cardRenderer';
+
 const getYiq = (hex: string): number => {
   const clean = hex.replace('#', '').trim();
   if (clean.length !== 6) return 0;
@@ -238,7 +242,7 @@ export class SpatialLayoutEngine {
     if (variant === 'bento-grid') {
       // Explode components into grid cells
       let gridIndex = 1;
-      components.forEach(comp => {
+      components.forEach((comp, compIdx) => {
         if (comp.type === 'metric-cards') {
           (comp.metrics || []).forEach(m => {
             const zid = `grid-${gridIndex}`;
@@ -250,7 +254,8 @@ export class SpatialLayoutEngine {
                   type: 'metric-cards',
                   metrics: [m],
                   intro: ''
-                }
+                },
+                componentIdx: compIdx  // Track parent component index
               });
               gridIndex++;
             }
@@ -259,7 +264,7 @@ export class SpatialLayoutEngine {
           const zid = `grid-${gridIndex}`;
           const zone = zones.find(z => z.id === zid);
           if (zone) {
-            allocation.set(zid, { type: 'component-part', component: comp });
+            allocation.set(zid, { type: 'component-part', component: comp, componentIdx: compIdx });
             gridIndex++;
           } else {
             unplaced.push(comp);
@@ -272,7 +277,7 @@ export class SpatialLayoutEngine {
       let cardIndex = 0;
 
       // Place metric cards into the top row
-      components.forEach(comp => {
+      components.forEach((comp, compIdx) => {
         if (comp.type === 'metric-cards') {
           (comp.metrics || []).forEach(m => {
             const zid = cardZones[cardIndex];
@@ -284,7 +289,8 @@ export class SpatialLayoutEngine {
                   type: 'metric-cards',
                   metrics: [m],
                   intro: ''
-                }
+                },
+                componentIdx: compIdx  // Track parent component index
               });
               cardIndex++;
             }
@@ -293,14 +299,16 @@ export class SpatialLayoutEngine {
       });
 
       // Place remaining components into bottom panels
-      const remaining = components.filter(c => c.type !== 'metric-cards');
+      const remaining = components
+        .map((comp, idx) => ({ comp, originalIdx: idx }))
+        .filter(({ comp }) => comp.type !== 'metric-cards');
       const panelZones = ['left-panel', 'right-panel'];
       let panelIndex = 0;
-      remaining.forEach(comp => {
+      remaining.forEach(({ comp, originalIdx }) => {
         const zid = panelZones[panelIndex];
         const zone = zones.find(z => z.id === zid);
         if (zone) {
-          allocation.set(zid, { type: 'component-full', component: comp });
+          allocation.set(zid, { type: 'component-full', component: comp, componentIdx: originalIdx });
           panelIndex++;
         } else {
           unplaced.push(comp);
@@ -314,11 +322,11 @@ export class SpatialLayoutEngine {
         z.purpose !== 'accent' && z.id !== 'divider' && !allocation.has(z.id)
       );
 
-      const componentQueue = [...components];
+      const componentQueue = components.map((comp, idx) => ({ comp, originalIdx: idx }));
       const usedZones = new Set<string>();
 
       // First pass: match components to their best affinity zones
-      componentQueue.forEach((comp, compIdx) => {
+      componentQueue.forEach(({ comp, originalIdx }) => {
         let bestZone: typeof availableZones[0] | null = null;
         let bestScore = -1;
 
@@ -343,7 +351,8 @@ export class SpatialLayoutEngine {
         if (bestZone) {
           allocation.set(bestZone.id, {
             type: 'component-full',
-            component: comp
+            component: comp,
+            componentIdx: originalIdx  // CRITICAL: Track original index for SVG ID mapping
           });
           usedZones.add(bestZone.id);
         } else {
@@ -352,7 +361,8 @@ export class SpatialLayoutEngine {
           if (fallbackZone) {
             allocation.set(fallbackZone.id, {
               type: 'component-full',
-              component: comp
+              component: comp,
+              componentIdx: originalIdx  // CRITICAL: Track original index for SVG ID mapping
             });
             usedZones.add(fallbackZone.id);
             console.warn(`[SpatialRenderer] Component ${comp.type} placed in non-affinity zone ${fallbackZone.id}`);
@@ -434,23 +444,47 @@ export class SpatialLayoutEngine {
 
     const themeTokens = this.resolveThemeTokens(effectiveStyleGuide);
 
+    // --- APPLY LAYOUT-LEVEL REPAIR HINTS ---
+    // Visual Architect sets these on layoutPlan to fix title/divider positioning
+    const layoutPlan = slide.layoutPlan as any; // Cast to access _hint fields
+    // Guard against NaN - typeof NaN === 'number' so we need isFinite check
+    const titleMarginHint = typeof layoutPlan?._titleMarginTop === 'number' && isFinite(layoutPlan._titleMarginTop) 
+        ? layoutPlan._titleMarginTop 
+        : undefined;
+    const dividerYHint = typeof layoutPlan?._dividerY === 'number' && isFinite(layoutPlan._dividerY) 
+        ? layoutPlan._dividerY 
+        : undefined;
+
     zones.forEach(zone => {
       const allocated = allocation.get(zone.id);
 
+      // Apply zone-level hints from Visual Architect
+      let effectiveZone = { ...zone };
+      
+      // Title zone positioning hint
+      if ((zone.id === 'title' || zone.id === 'hero-title') && titleMarginHint !== undefined) {
+        effectiveZone.y = titleMarginHint;
+      }
+      
+      // Divider positioning hint
+      if ((zone.id === 'divider' || zone.id === 'accent-bar') && dividerYHint !== undefined) {
+        effectiveZone.y = dividerYHint;
+      }
+
       if (!allocated) {
         // Render static accents
-        if (zone.purpose === 'accent') {
-          if (zone.id === 'divider' || zone.id === 'accent-bar' || zone.id === 'timeline-track' || zone.id === 'rail-divider') {
+        if (effectiveZone.purpose === 'accent') {
+          if (effectiveZone.id === 'divider' || effectiveZone.id === 'accent-bar' || effectiveZone.id === 'timeline-track' || effectiveZone.id === 'rail-divider') {
             elements.push({
               type: 'shape', shapeType: 'rect',
-              x: zone.x, y: zone.y, w: zone.w, h: zone.h,
+              x: effectiveZone.x, y: effectiveZone.y, w: effectiveZone.w, h: effectiveZone.h,
               fill: { color: normalizeColor(effectiveStyleGuide.colorPalette.accentHighContrast), alpha: 1 },
               zIndex: 5
             });
-          } else if (zone.id === 'accent-bottom') {
+          } else if (effectiveZone.id === 'accent-bottom') {
             elements.push({
               type: 'shape', shapeType: 'rect',
-              x: zone.x, y: zone.y, w: zone.w, h: zone.h,
+              x: effectiveZone.x, y: effectiveZone.y, w: effectiveZone.w, h: effectiveZone.h,
               fill: { color: normalizeColor(effectiveStyleGuide.colorPalette.primary), alpha: 1 },
               zIndex: 5
             });
@@ -460,22 +494,25 @@ export class SpatialLayoutEngine {
       }
 
       if (allocated.type === 'title') {
-        const fontSize = zone.purpose === 'hero'
+        const fontSize = effectiveZone.purpose === 'hero'
           ? (variant === 'hero-centered' ? themeTokens.typography.scale.hero : themeTokens.typography.scale.title)
           : themeTokens.typography.scale.subtitle;
         elements.push({
           type: 'text',
           content: allocated.content,
-          x: zone.x, y: zone.y, w: zone.w, h: zone.h,
+          x: effectiveZone.x, y: effectiveZone.y, w: effectiveZone.w, h: effectiveZone.h,
           fontSize,
           bold: this.isBold(themeTokens.typography.weights.title),
           color: normalizeColor(effectiveStyleGuide.colorPalette.text),
           fontFamily: effectiveStyleGuide.fontFamilyTitle,
           align: variant === 'hero-centered' ? 'center' : 'left',
-          zIndex: 10
-        });
+          zIndex: 10,
+          componentIdx: -1  // Title is special, not a layoutPlan component
+        } as any);
       } else if (allocated.type === 'component-full' || allocated.type === 'component-part') {
-        const els = this.renderComponentInZone(allocated.component, zone, effectiveStyleGuide, themeTokens, getIconUrl, getDiagramUrl);
+        // CRITICAL: Pass componentIdx to renderComponentInZone for SVG ID mapping
+        const componentIdx = allocated.componentIdx ?? -1;
+        const els = this.renderComponentInZone(allocated.component, effectiveZone, effectiveStyleGuide, themeTokens, getIconUrl, getDiagramUrl, componentIdx);
         elements.push(...els);
       }
     });
@@ -536,7 +573,8 @@ export class SpatialLayoutEngine {
     styleGuide: GlobalStyleGuide,
     themeTokens: typeof DEFAULT_THEME_TOKENS,
     getIconUrl: (name: string) => string | undefined,
-    getDiagramUrl?: (comp: any) => string | undefined
+    getDiagramUrl?: (comp: any) => string | undefined,
+    componentIdx: number = -1  // CRITICAL: Component index for SVG ID mapping
   ): VisualElement[] {
     const p = {
       text: normalizeColor(styleGuide.colorPalette.text),
@@ -564,6 +602,12 @@ export class SpatialLayoutEngine {
     }
 
     const els: VisualElement[] = [];
+    
+    // Helper to stamp componentIdx on elements for SVG ID mapping
+    const stampElement = (el: VisualElement): VisualElement => {
+      (el as any).componentIdx = componentIdx;
+      return el;
+    };
 
     // Get spacing values, applying hints if present
     const baseSpacing = themeTokens.spacing;
@@ -960,7 +1004,8 @@ export class SpatialLayoutEngine {
       }
     }
 
-    return els;
+    // CRITICAL: Stamp componentIdx on all elements for SVG ID mapping
+    return els.map(stampElement);
   }
 
   // Helper to render a basic chart using primitives (since VisualElement doesn't support native charts yet)
@@ -1325,19 +1370,13 @@ export function renderWithLayeredComposition(
 ): VisualElement[] {
   const elements: VisualElement[] = [];
 
-  // Import decorative and card renderers dynamically to avoid circular deps
-  // In production, these would be imported at top of file
-  let decorativeRenderers: typeof import('./decorativeRenderer') | null = null;
-  let cardRenderers: typeof import('./cardRenderer') | null = null;
-
-  try {
-    // Dynamic imports for optional serendipity renderers
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    decorativeRenderers = require('./decorativeRenderer');
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    cardRenderers = require('./cardRenderer');
-  } catch (e) {
-    console.warn('[SpatialRenderer] Serendipity renderers not available, using fallback');
+  // Serendipity renderers are now statically imported at top of file for ESM compatibility
+  // Check if the renderers have the required functions available
+  const hasDecorativeRenderer = typeof decorativeRenderers?.renderDecorativeLayer === 'function';
+  const hasCardRenderer = typeof cardRenderers?.renderCard === 'function';
+  
+  if (!hasDecorativeRenderer || !hasCardRenderer) {
+    console.warn('[SpatialRenderer] Serendipity renderers not fully available, some features may be limited');
   }
 
   const palette = {
@@ -1366,7 +1405,7 @@ export function renderWithLayeredComposition(
   }
 
   // --- LAYER 1: DECORATIVE ELEMENTS (z-index 10-19) ---
-  if (decorativeRenderers && compositionPlan.layerPlan.decorativeElements?.length > 0) {
+  if (hasDecorativeRenderer && compositionPlan.layerPlan.decorativeElements?.length > 0) {
     const decorativeContext = {
       palette,
       iconCache,
@@ -1427,7 +1466,7 @@ export function renderWithLayeredComposition(
 
   if (contentStructure.pattern === 'card-row' || contentStructure.pattern === 'narrative-flow') {
     // Use card-based rendering if available
-    if (cardRenderers && slide.layoutPlan?.components) {
+    if (hasCardRenderer && slide.layoutPlan?.components) {
       const cardContext = {
         palette,
         iconCache,

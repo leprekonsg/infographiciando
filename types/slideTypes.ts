@@ -128,6 +128,446 @@ export const PREMIUM_QUALITY_CHECKS = {
   MIN_BADGE_CONTRAST_RATIO: 4.5
 } as const;
 
+// ============================================================================
+// STYLE MODE SYSTEM
+// ============================================================================
+// Defines how visual strategy (not just text limits) changes across presentation modes.
+// The style drives layout selection, negative space, composition variance, and validation rubrics.
+
+/**
+ * StyleMode: The presentation tone that affects spatial + visual strategy
+ * - 'corporate': Maximum stability, data-driven, clean grids, minimal surprises
+ * - 'professional': Balanced, modern, moderate variation, still clean
+ * - 'serendipitous': Visual-first, minimal text, high whitespace, bold composition
+ */
+export const StyleModeSchema = z.enum(['corporate', 'professional', 'serendipitous']);
+export type StyleMode = z.infer<typeof StyleModeSchema>;
+
+/**
+ * SlideArchetype: The structural archetype that determines content constraints
+ * Used alongside StyleMode to enforce archetype-specific rules per style
+ */
+export const SlideArchetypeSchema = z.enum([
+  'hero',        // Title/section headers - minimal text, max impact
+  'narrative',   // Storytelling with key points
+  'concept',     // Explaining ideas with diagrams/visuals
+  'data',        // Charts, metrics, numbers
+  'comparison',  // Side-by-side analysis
+  'grid',        // Multi-item grids (features, team, etc.)
+  'conclusion'   // Summary, CTA, final thoughts
+]);
+export type SlideArchetype = z.infer<typeof SlideArchetypeSchema>;
+
+/**
+ * SLIDE_TYPE → SlideArchetype mapping
+ * This bridges the Architect's output (SLIDE_TYPES) to the style system's archetype constraints.
+ * The mapping is deterministic and can be overridden by layout/purpose heuristics.
+ */
+export const SLIDE_TYPE_TO_ARCHETYPE: Record<string, SlideArchetype> = {
+  [SLIDE_TYPES.TITLE]: 'hero',
+  [SLIDE_TYPES.SECTION]: 'hero',
+  [SLIDE_TYPES.CONTENT]: 'narrative',  // Default, may be refined by content analysis
+  [SLIDE_TYPES.DATA]: 'data',
+  [SLIDE_TYPES.CONCLUSION]: 'conclusion'
+};
+
+/**
+ * Layout → Archetype affinity mapping
+ * Used to refine archetype when layout is known (e.g., bento-grid → 'grid', metrics-rail → 'data')
+ */
+export const LAYOUT_TO_ARCHETYPE_AFFINITY: Partial<Record<z.infer<typeof LayoutVariantSchema>, SlideArchetype>> = {
+  'hero-centered': 'hero',
+  'bento-grid': 'grid',
+  'metrics-rail': 'data',
+  'dashboard-tiles': 'data',
+  'timeline-horizontal': 'narrative',
+  'split-left-text': 'concept',
+  'split-right-text': 'concept',
+  'asymmetric-grid': 'comparison'
+};
+
+/**
+ * Infer SlideArchetype from slide metadata
+ * Priority: explicit archetype > layout affinity > slide type > purpose heuristics > default
+ */
+export function inferArchetype(
+  slideType: string | undefined,
+  layoutVariant: z.infer<typeof LayoutVariantSchema> | undefined,
+  purpose: string | undefined
+): SlideArchetype {
+  // 1. Check layout affinity (layout often implies structure better than type)
+  if (layoutVariant && LAYOUT_TO_ARCHETYPE_AFFINITY[layoutVariant]) {
+    return LAYOUT_TO_ARCHETYPE_AFFINITY[layoutVariant]!;
+  }
+  
+  // 2. Check slide type mapping
+  if (slideType && SLIDE_TYPE_TO_ARCHETYPE[slideType]) {
+    return SLIDE_TYPE_TO_ARCHETYPE[slideType];
+  }
+  
+  // 3. Purpose-based heuristics
+  const purposeLower = (purpose || '').toLowerCase();
+  if (purposeLower.includes('compar') || purposeLower.includes('vs') || purposeLower.includes('versus')) {
+    return 'comparison';
+  }
+  if (purposeLower.includes('data') || purposeLower.includes('metric') || purposeLower.includes('stat') || purposeLower.includes('number')) {
+    return 'data';
+  }
+  if (purposeLower.includes('feature') || purposeLower.includes('team') || purposeLower.includes('option') || purposeLower.includes('benefit')) {
+    return 'grid';
+  }
+  if (purposeLower.includes('diagram') || purposeLower.includes('flow') || purposeLower.includes('process') || purposeLower.includes('how')) {
+    return 'concept';
+  }
+  if (purposeLower.includes('intro') || purposeLower.includes('title') || purposeLower.includes('section')) {
+    return 'hero';
+  }
+  if (purposeLower.includes('summary') || purposeLower.includes('conclusion') || purposeLower.includes('next step') || purposeLower.includes('call to action')) {
+    return 'conclusion';
+  }
+  
+  // 4. Default to narrative (safest general-purpose archetype)
+  return 'narrative';
+}
+
+/**
+ * Risk classification for validation sampling
+ * High-risk = always validate, Low-risk = can skip validation
+ */
+export type ArchetypeRisk = 'high' | 'medium' | 'low';
+
+export const ARCHETYPE_RISK: Record<SlideArchetype, ArchetypeRisk> = {
+  hero: 'medium',      // Simple but high visibility - worth validating
+  narrative: 'low',    // Standard bullets are robust
+  concept: 'high',     // Diagrams/visuals can break easily
+  data: 'high',        // Charts must be legible, numbers must fit
+  comparison: 'high',  // Split layouts can overflow
+  grid: 'high',        // Bento grids can have alignment issues
+  conclusion: 'low'    // Usually simple
+};
+
+export const LAYOUT_RISK: Partial<Record<z.infer<typeof LayoutVariantSchema>, ArchetypeRisk>> = {
+  'standard-vertical': 'low',
+  'hero-centered': 'low',
+  'split-left-text': 'medium',
+  'split-right-text': 'medium',
+  'bento-grid': 'high',
+  'timeline-horizontal': 'high',
+  'dashboard-tiles': 'high',
+  'metrics-rail': 'high',
+  'asymmetric-grid': 'high'
+};
+
+/**
+ * Determine if a slide should be validated based on risk-based sampling
+ * @param archetype The slide's archetype
+ * @param layoutVariant The layout variant
+ * @param slideIndex The slide's index in the deck
+ * @param totalSlides Total number of slides
+ * @param styleMode The style mode (corporate = always validate, serendipitous = can be selective)
+ * @returns Whether this slide should go through visual validation
+ */
+export function shouldValidateSlide(
+  archetype: SlideArchetype,
+  layoutVariant: z.infer<typeof LayoutVariantSchema> | undefined,
+  slideIndex: number,
+  totalSlides: number,
+  styleMode: StyleMode | undefined
+): boolean {
+  // Corporate mode: always validate (safety first)
+  if (styleMode === 'corporate') return true;
+  
+  // First and last slides: always validate (high visibility)
+  if (slideIndex === 0 || slideIndex === totalSlides - 1) return true;
+  
+  // Get risk levels
+  const archetypeRisk = ARCHETYPE_RISK[archetype] ?? 'medium';
+  const layoutRisk = layoutVariant ? (LAYOUT_RISK[layoutVariant] ?? 'medium') : 'medium';
+  
+  // High risk on either dimension: always validate
+  if (archetypeRisk === 'high' || layoutRisk === 'high') return true;
+  
+  // Medium risk: validate 50% (every other slide)
+  if (archetypeRisk === 'medium' || layoutRisk === 'medium') {
+    return slideIndex % 2 === 0;
+  }
+  
+  // Low risk: validate 25% (every 4th slide)
+  return slideIndex % 4 === 0;
+}
+
+/**
+ * QwenRubric: Visual validation rubric for Qwen-VL critique
+ * Different styles have different success criteria
+ */
+export const QwenRubricSchema = z.enum([
+  'corporate_clarity',   // Alignment, legibility, chart accuracy, visual hierarchy
+  'balanced',            // Moderate on all dimensions
+  'serendipity_impact'   // Boldness, negative space, focal point, "not template-y"
+]);
+export type QwenRubric = z.infer<typeof QwenRubricSchema>;
+
+/**
+ * StyleProfile: Complete spatial + validation behavior definition per style mode
+ * This is the core contract that all agents and validators consume
+ */
+export const StyleProfileSchema = z.object({
+  mode: StyleModeSchema,
+
+  // === COPY DISCIPLINE ===
+  // Text caps by archetype (the safety net, not the definition of creativity)
+  bulletsMaxByArchetype: z.record(SlideArchetypeSchema, z.number()).optional(),
+  titleMaxCharsByArchetype: z.record(SlideArchetypeSchema, z.number()).optional(),
+
+  // === SPATIAL + COMPOSITION STRATEGY ===
+  // These define how the slide "feels" - the missing link between text caps and visual quality
+  variationBudgetMultiplier: z.number().min(0.3).max(2.0).describe('Multiplier for computeVariationBudget: corporate=0.6, prof=1.0, serendip=1.6'),
+  negativeSpaceMinRatio: z.number().min(0.1).max(0.5).describe('Minimum negative space: corp=0.15, prof=0.25, serendip=0.40'),
+  
+  // Layout families allowed/preferred for this style
+  layoutFamilyAllowlist: z.array(LayoutVariantSchema).optional().describe('Preferred layouts for this style'),
+  layoutFamilyDenylist: z.array(LayoutVariantSchema).optional().describe('Layouts to avoid for this style'),
+  
+  // Composition behavior
+  allowOverlap: z.boolean().describe('Whether overlapping elements are acceptable (serendip=true)'),
+  allowAsymmetry: z.boolean().describe('Whether asymmetric layouts are encouraged'),
+  maxComponentsPerSlide: z.number().min(1).max(5).describe('Maximum components to prevent crowding'),
+
+  // === VISUAL VALIDATION BEHAVIOR ===
+  fitScoreThreshold: z.number().min(50).max(100).describe('Style-specific pass threshold for spatial fit'),
+  qwenRubric: QwenRubricSchema.describe('Which Qwen-VL rubric to use for visual critique'),
+  
+  // Validation strictness
+  strictAlignmentCheck: z.boolean().describe('Whether alignment issues are critical (corp=true)'),
+  densityTolerance: z.enum(['strict', 'moderate', 'permissive']).describe('How much density/crowding is acceptable'),
+  
+  // === QUALITY GATE THRESHOLDS ===
+  // These replace the hardcoded VISUAL_THRESHOLDS for style-specific behavior
+  visualThresholds: z.object({
+    excellent: z.number(),     // No critique needed
+    target: z.number(),        // Critique activation point
+    repairRequired: z.number(),// Force repair attempt
+    critical: z.number(),      // Aggressive repair
+    fallback: z.number()       // Give up
+  }).optional()
+});
+export type StyleProfile = z.infer<typeof StyleProfileSchema>;
+
+/**
+ * Default StyleProfile configurations for each mode
+ * These are the canonical definitions - all agents inherit from these
+ */
+export const STYLE_PROFILES: Record<StyleMode, StyleProfile> = {
+  corporate: {
+    mode: 'corporate',
+    
+    // Conservative text limits
+    bulletsMaxByArchetype: {
+      hero: 0,
+      narrative: 3,
+      concept: 3,
+      data: 2,
+      comparison: 3,
+      grid: 2,
+      conclusion: 2
+    },
+    titleMaxCharsByArchetype: {
+      hero: 50,
+      narrative: 60,
+      concept: 55,
+      data: 50,
+      comparison: 55,
+      grid: 50,
+      conclusion: 45
+    },
+
+    // Spatial strategy: conservative, structured
+    variationBudgetMultiplier: 0.6,
+    negativeSpaceMinRatio: 0.15,
+    layoutFamilyAllowlist: ['hero-centered', 'split-left-text', 'split-right-text', 'dashboard-tiles', 'standard-vertical'],
+    layoutFamilyDenylist: ['asymmetric-grid', 'bento-grid'],
+    allowOverlap: false,
+    allowAsymmetry: false,
+    maxComponentsPerSlide: 3,
+
+    // Strict validation
+    fitScoreThreshold: 85,
+    qwenRubric: 'corporate_clarity',
+    strictAlignmentCheck: true,
+    densityTolerance: 'strict',
+    
+    visualThresholds: {
+      excellent: 95,
+      target: 85,
+      repairRequired: 70,
+      critical: 60,
+      fallback: 50
+    }
+  },
+
+  professional: {
+    mode: 'professional',
+    
+    // Balanced text limits
+    bulletsMaxByArchetype: {
+      hero: 1,
+      narrative: 4,
+      concept: 4,
+      data: 3,
+      comparison: 4,
+      grid: 3,
+      conclusion: 3
+    },
+    titleMaxCharsByArchetype: {
+      hero: 60,
+      narrative: 70,
+      concept: 65,
+      data: 60,
+      comparison: 65,
+      grid: 60,
+      conclusion: 55
+    },
+
+    // Spatial strategy: balanced, modern
+    variationBudgetMultiplier: 1.0,
+    negativeSpaceMinRatio: 0.25,
+    layoutFamilyAllowlist: undefined, // All layouts allowed
+    layoutFamilyDenylist: undefined,
+    allowOverlap: false,
+    allowAsymmetry: true,
+    maxComponentsPerSlide: 3,
+
+    // Moderate validation
+    fitScoreThreshold: 80,
+    qwenRubric: 'balanced',
+    strictAlignmentCheck: true,
+    densityTolerance: 'moderate',
+    
+    visualThresholds: {
+      excellent: 92,
+      target: 82,
+      repairRequired: 68,
+      critical: 58,
+      fallback: 48
+    }
+  },
+
+  serendipitous: {
+    mode: 'serendipitous',
+    
+    // Minimal text - visual-first
+    bulletsMaxByArchetype: {
+      hero: 0,
+      narrative: 2,
+      concept: 2,
+      data: 1,
+      comparison: 2,
+      grid: 1,
+      conclusion: 1
+    },
+    titleMaxCharsByArchetype: {
+      hero: 80,      // Punchy narrative headers allowed
+      narrative: 75,
+      concept: 70,
+      data: 60,
+      comparison: 70,
+      grid: 65,
+      conclusion: 60
+    },
+
+    // Spatial strategy: visual-first, high whitespace
+    variationBudgetMultiplier: 1.6,
+    negativeSpaceMinRatio: 0.40,
+    layoutFamilyAllowlist: ['hero-centered', 'asymmetric-grid', 'bento-grid', 'split-left-text', 'split-right-text'],
+    layoutFamilyDenylist: ['standard-vertical', 'dashboard-tiles'],
+    allowOverlap: true, // Overlay-capable compositions
+    allowAsymmetry: true,
+    maxComponentsPerSlide: 2, // Less is more
+
+    // Permissive validation but different criteria
+    fitScoreThreshold: 75,
+    qwenRubric: 'serendipity_impact',
+    strictAlignmentCheck: false, // Slight misalignment can be intentional
+    densityTolerance: 'permissive', // But will penalize over-density via rubric
+    
+    visualThresholds: {
+      excellent: 90,
+      target: 78,
+      repairRequired: 65,
+      critical: 55,
+      fallback: 45
+    }
+  }
+};
+
+/**
+ * Get StyleProfile for a given mode with safe fallback
+ */
+export function getStyleProfile(mode: StyleMode | undefined): StyleProfile {
+  return STYLE_PROFILES[mode || 'professional'];
+}
+
+/**
+ * Get bullets max for a specific archetype and style
+ */
+export function getBulletsMax(style: StyleProfile, archetype: SlideArchetype): number {
+  return style.bulletsMaxByArchetype?.[archetype] ?? 3;
+}
+
+/**
+ * Get title max chars for a specific archetype and style
+ */
+export function getTitleMaxChars(style: StyleProfile, archetype: SlideArchetype): number {
+  return style.titleMaxCharsByArchetype?.[archetype] ?? 60;
+}
+
+/**
+ * Check if a layout is allowed for a given style
+ */
+export function isLayoutAllowedForStyle(layout: string, style: StyleProfile): boolean {
+  const variant = layout as z.infer<typeof LayoutVariantSchema>;
+  
+  // Check denylist first
+  if (style.layoutFamilyDenylist?.includes(variant)) {
+    return false;
+  }
+  
+  // If allowlist exists, check it
+  if (style.layoutFamilyAllowlist && style.layoutFamilyAllowlist.length > 0) {
+    return style.layoutFamilyAllowlist.includes(variant);
+  }
+  
+  // Default: allowed
+  return true;
+}
+
+/**
+ * Visual thresholds return type (number-based for style flexibility)
+ */
+export interface VisualThresholdsConfig {
+  EXCELLENT: number;
+  TARGET: number;
+  REPAIR_REQUIRED: number;
+  CRITICAL: number;
+  FALLBACK: number;
+}
+
+/**
+ * Get visual thresholds for a style (with fallback to defaults)
+ */
+export function getVisualThresholdsForStyle(style: StyleProfile): VisualThresholdsConfig {
+  if (style.visualThresholds) {
+    return {
+      EXCELLENT: style.visualThresholds.excellent,
+      TARGET: style.visualThresholds.target,
+      REPAIR_REQUIRED: style.visualThresholds.repairRequired,
+      CRITICAL: style.visualThresholds.critical,
+      FALLBACK: style.visualThresholds.fallback
+    };
+  }
+  return VISUAL_THRESHOLDS;
+}
+
 export type VisualThreshold = typeof VISUAL_THRESHOLDS[keyof typeof VISUAL_THRESHOLDS];
 
 // --- VISUAL & SPATIAL SCHEMAS (NEW) ---
@@ -305,11 +745,24 @@ export const TemplateComponentSchema = z.discriminatedUnion('type', [
 
 export type TemplateComponent = z.infer<typeof TemplateComponentSchema>;
 
+// Visual repair hints schema - applied by Visual Architect and consumed by SpatialRenderer
+// These are internal fields prefixed with _ to distinguish from content fields
+export const RepairHintsSchema = z.object({
+  // Title and divider positioning hints (set by Visual Architect)
+  _titleMarginTop: z.number().optional(),
+  _titleSpacing: z.union([z.string(), z.number()]).optional(),
+  _dividerY: z.number().optional(),
+}).passthrough(); // Allow any additional _ prefixed hints
+
 export const SlideLayoutPlanSchema = z.object({
   title: z.string().max(100),
   components: z.array(TemplateComponentSchema).min(1).max(3),
   background: z.enum(['solid', 'gradient', 'image']).default('solid'),
-});
+  // Repair hints (set by Visual Architect, consumed by SpatialRenderer)
+  _titleMarginTop: z.number().optional(),
+  _titleSpacing: z.union([z.string(), z.number()]).optional(),
+  _dividerY: z.number().optional(),
+}).passthrough(); // Allow additional repair hints
 
 // --- AGENT LAYOUT SCHEMAS ---
 
@@ -675,6 +1128,7 @@ export interface VisualArchitectResult {
   totalCost?: number; // Total cost of Visual Architect loop
   totalInputTokens?: number;
   totalOutputTokens?: number;
+  warning?: string; // Warning message if repairs were ineffective
 }
 
 /**

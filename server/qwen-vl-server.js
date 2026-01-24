@@ -85,12 +85,15 @@ ANALYZE FOR:
 4. Spacing - Crowding, negative space balance (optimal: 10-15% margins)
 5. Hierarchy - Visual weight matches importance
 
-COMPONENT ID FORMAT: Look for data-component-id attributes in the SVG or use:
-- "text-title-0" for main title
-- "text-bullets-0", "text-bullets-1" for bullet lists
-- "metric-cards-0" for metric displays
-- "divider-0", "line-0" for separators
-- "shape-card-0" for shapes/cards
+COMPONENT ID FORMAT: 
+The SVG contains data-component-idx attributes that map to layoutPlan.components[index].
+Use ONLY the component IDs listed in the ComponentManifest comment at the top of the SVG.
+Format: "{component-type}-{index}" mapping directly to layoutPlan.components[index]
+- "text-bullets-0" maps to layoutPlan.components[0] (if type is text-bullets)
+- "metric-cards-1" maps to layoutPlan.components[1] (if type is metric-cards)
+- "chart-frame-0" maps to layoutPlan.components[0] (if type is chart-frame)
+- For slide title/divider elements: use "title" or "divider" (not numbered)
+DO NOT use legacy IDs like "text-title-0" or "shape-card-0" - these are internal only.
 
 OUTPUT JSON:
 {

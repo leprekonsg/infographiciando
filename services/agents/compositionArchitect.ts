@@ -13,6 +13,7 @@
  * 2. Primitive Selection: Choose card styles, badge placements, accent usage
  * 3. Variation Budget Execution: Use variationBudget to inject controlled surprises
  * 4. Theme Enforcement: Ensure choices align with SerendipityDNA
+ * 5. Style-Aware Composition: Respect StyleMode constraints for layout and density
  */
 
 import { z } from "zod";
@@ -27,7 +28,10 @@ import {
 import {
   RouterDecision,
   ResearchFact,
-  NarrativeTrail
+  NarrativeTrail,
+  StyleMode,
+  StyleProfile,
+  getStyleProfile
 } from "../../types/slideTypes";
 import {
   createJsonInteraction,
@@ -43,6 +47,73 @@ import {
 // Use MODEL_SIMPLE (gemini-2.5-flash) for Composition Architect
 // This is a classification/planning task, not reasoning-heavy
 const COMPOSITION_ARCHITECT_MODEL = MODEL_SIMPLE;
+
+// ============================================================================
+// STYLE-AWARE VARIATION BUDGET
+// ============================================================================
+
+/**
+ * Apply style-specific multiplier to variation budget
+ * This is the key integration point that makes Serendipitous mode actually different
+ */
+export function applyStyleMultiplierToVariationBudget(
+  baseVariationBudget: number,
+  styleMode: StyleMode | undefined
+): number {
+  const style = getStyleProfile(styleMode);
+  const multiplied = baseVariationBudget * style.variationBudgetMultiplier;
+  
+  // Clamp to 0-1 range
+  return Math.max(0, Math.min(1, multiplied));
+}
+
+/**
+ * Get style-constrained surprise allowlist
+ * Corporate mode limits bold surprises; Serendipitous mode enables more creativity
+ */
+export function getStyleConstrainedSurprises(
+  baseAllowedTypes: string[],
+  styleMode: StyleMode | undefined
+): string[] {
+  const style = getStyleProfile(styleMode);
+  
+  // Corporate mode: only subtle surprises
+  if (style.mode === 'corporate') {
+    const corporateAllowed = ['subtle-badge', 'accent-underline', 'icon-glow', 'gradient-divider'];
+    return baseAllowedTypes.filter(t => corporateAllowed.includes(t));
+  }
+  
+  // Serendipitous mode: full palette + extras
+  if (style.mode === 'serendipitous') {
+    const serendipitousExtras = ['asymmetric-emphasis', 'floating-stat', 'connector-flow', 'quote-callout'];
+    return [...new Set([...baseAllowedTypes, ...serendipitousExtras])];
+  }
+  
+  // Professional: balanced
+  return baseAllowedTypes;
+}
+
+/**
+ * Get style-appropriate intensity bias
+ */
+export function getStyleIntensityBias(
+  baseIntensity: 'subtle' | 'moderate' | 'bold',
+  styleMode: StyleMode | undefined
+): 'subtle' | 'moderate' | 'bold' {
+  const style = getStyleProfile(styleMode);
+  
+  // Corporate: always subtle or moderate, never bold
+  if (style.mode === 'corporate' && baseIntensity === 'bold') {
+    return 'moderate';
+  }
+  
+  // Serendipitous: can bump up intensity
+  if (style.mode === 'serendipitous' && baseIntensity === 'subtle') {
+    return 'moderate';
+  }
+  
+  return baseIntensity;
+}
 
 // ============================================================================
 // PROMPTS
@@ -109,8 +180,12 @@ const buildCompositionTask = (
   serendipityDNA?: SerendipityDNA,
   variationBudget?: number,
   narrativeTrail?: NarrativeTrail[],
-  usedSurprises?: string[]
-): string => `
+  usedSurprises?: string[],
+  styleMode?: StyleMode
+): string => {
+  const style = getStyleProfile(styleMode);
+  
+  return `
 TASK: Plan the layer structure and compositional primitives for a premium slide.
 
 SLIDE CONTEXT:
@@ -124,13 +199,39 @@ SLIDE CONTEXT:
 CONTENT SUMMARY:
 ${contentSummary}
 
+${styleMode ? `
+STYLE MODE: ${styleMode.toUpperCase()}
+${styleMode === 'corporate' ? `
+CORPORATE CONSTRAINTS (Manus-grade stability):
+- Maximum visual stability and consistency
+- Clean grids, no asymmetric layouts
+- Decorative elements: subtle only (badges, underlines)
+- Negative space minimum: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%
+- Max components per slide: ${style.maxComponentsPerSlide}
+- FORBIDDEN: overlapping elements, bold surprises, asymmetric emphasis
+` : styleMode === 'serendipitous' ? `
+SERENDIPITOUS CONSTRAINTS (Visual-first impact):
+- Visual dominance over text (fewer bullets, bolder visuals)
+- High negative space: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%+ 
+- Max components: ${style.maxComponentsPerSlide} (less is more)
+- ENCOURAGED: asymmetric layouts, floating stats, dramatic whitespace
+- ENCOURAGED: bold surprises, icon glows, quote callouts
+- FORBIDDEN: dense bullet lists, "template-y" standard layouts
+` : `
+PROFESSIONAL CONSTRAINTS (Balanced modern):
+- Modern, clean aesthetic with moderate variation
+- Negative space: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%
+- Asymmetry allowed where appropriate
+`}
+` : ''}
+
 ${serendipityDNA ? `THEME DNA:
 - Motifs: ${serendipityDNA.motifs?.join(', ')}
 - Card Style Preference: ${serendipityDNA.cardStyle || 'glass'}
 - Accent Density: ${serendipityDNA.accentDensity || 'balanced'}
 - Composition Bias: ${serendipityDNA.compositionBias || 'balanced'}` : ''}
 
-VARIATION BUDGET: ${variationBudget?.toFixed(2) || '0.5'} (0=conservative, 1=bold)
+VARIATION BUDGET: ${variationBudget?.toFixed(2) || '0.5'} (0=conservative, 1=bold)${styleMode ? ` [${styleMode}-adjusted]` : ''}
 
 ${narrativeTrail?.length ? `PREVIOUS SLIDES (avoid repetition):
 ${narrativeTrail.map(t => `- ${t.title}: ${t.mainPoint}`).join('\n')}` : ''}
@@ -214,6 +315,7 @@ YOUR DECISIONS:
 OUTPUT: Return a JSON object matching the CompositionPlan schema.
 Include brief reasoning for your decisions, referencing the Design Commandments.
 `;
+}
 
 
 // ============================================================================
@@ -313,6 +415,7 @@ export interface CompositionArchitectInput {
   variationBudget: number;
   narrativeTrail?: NarrativeTrail[];
   usedSurprisesInDeck?: string[]; // Track surprises already used to avoid repetition
+  styleMode?: StyleMode; // NEW: Style mode for composition constraints
 }
 
 export async function runCompositionArchitect(
@@ -343,21 +446,28 @@ export async function runCompositionArchitect(
     return createFallbackPlan(input);
   }
 
-  console.log(`[COMPOSITION ARCHITECT] Planning composition for "${input.slideTitle || 'untitled'}"...`);
+  // Apply style multiplier to variation budget
+  const styleAdjustedBudget = applyStyleMultiplierToVariationBudget(
+    input.variationBudget,
+    input.styleMode
+  );
+
+  console.log(`[COMPOSITION ARCHITECT] Planning composition for "${input.slideTitle || 'untitled'}"${input.styleMode ? ` (style: ${input.styleMode}, budget: ${input.variationBudget.toFixed(2)} → ${styleAdjustedBudget.toFixed(2)})` : ''}...`);
 
   // Build content summary for the prompt
   const contentSummary = buildContentSummary(input.contentPlan);
 
-  // Build the task prompt
+  // Build the task prompt with style-adjusted budget
   const taskPrompt = buildCompositionTask(
     input.slideTitle,
     input.slidePurpose,
     input.routerConfig,
     contentSummary,
     input.serendipityDNA,
-    input.variationBudget,
+    styleAdjustedBudget, // Use style-adjusted budget
     input.narrativeTrail,
-    input.usedSurprisesInDeck
+    input.usedSurprisesInDeck,
+    input.styleMode // Pass style mode to prompt builder
   );
 
   try {
@@ -373,7 +483,7 @@ export async function runCompositionArchitect(
       tracker
     );
 
-    // Validate and normalize
+    // Validate and normalize (with style constraints)
     const normalized = normalizeCompositionPlan(result, input);
 
     console.log(`[COMPOSITION ARCHITECT] Plan complete:

@@ -1,13 +1,46 @@
 
 import React, { useState } from 'react';
-import { EditableSlideDeck } from '../types/slideTypes';
+import { EditableSlideDeck, StyleMode } from '../types/slideTypes';
 import { generateAgenticDeck, regenerateSingleSlide } from '../services/slideAgentService';
 import { generateImageFromPrompt } from '../services/geminiService';
 import { InfographicRenderer, normalizeColor } from '../services/infographicRenderer';
-import { Bot, Download, Play, Clock, ShieldCheck, Sparkles, BrainCircuit, AlertTriangle, ArrowRight, DollarSign, RefreshCw, AlertOctagon } from 'lucide-react';
+import { Bot, Download, Play, Clock, ShieldCheck, Sparkles, BrainCircuit, AlertTriangle, ArrowRight, DollarSign, RefreshCw, AlertOctagon, Briefcase, Users, Zap } from 'lucide-react';
 import pptxgen from 'pptxgenjs';
 import ActivityFeed, { ActivityLogItem } from './ActivityFeed';
 import BuilderCanvas from './BuilderCanvas';
+
+/**
+ * Style mode configuration for UI display
+ */
+const STYLE_MODE_CONFIG: Record<StyleMode, {
+    label: string;
+    description: string;
+    icon: React.ReactNode;
+    gradient: string;
+    borderColor: string;
+}> = {
+    corporate: {
+        label: 'Corporate',
+        description: 'Board decks, investor presentations. Maximum clarity, strict alignment, zero chaos.',
+        icon: <Briefcase className="w-5 h-5" />,
+        gradient: 'from-slate-600 to-slate-700',
+        borderColor: 'border-slate-500/50'
+    },
+    professional: {
+        label: 'Professional',
+        description: 'Team meetings, workshops. Balanced readability with moderate visual interest.',
+        icon: <Users className="w-5 h-5" />,
+        gradient: 'from-blue-600 to-indigo-600',
+        borderColor: 'border-blue-500/50'
+    },
+    serendipitous: {
+        label: 'Creative',
+        description: 'Thought leadership, pitches. Bold visuals, dramatic layouts, memorable impact.',
+        icon: <Zap className="w-5 h-5" />,
+        gradient: 'from-purple-600 to-pink-600',
+        borderColor: 'border-purple-500/50'
+    }
+};
 
 interface SlideDeckBuilderProps {
     onBack: () => void;
@@ -15,6 +48,7 @@ interface SlideDeckBuilderProps {
 
 const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
     const [topic, setTopic] = useState("");
+    const [styleMode, setStyleMode] = useState<StyleMode>('professional');
     const [isBuilding, setIsBuilding] = useState(false);
     const [progressVal, setProgressVal] = useState(0);
     const [deck, setDeck] = useState<EditableSlideDeck | null>(null);
@@ -30,20 +64,29 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
         setIsBuilding(true);
         setDeck(null);
         setProgressVal(0);
-        setActivityLog([{ id: 'init', message: 'Initializing RLM Agent Loop...', timestamp: new Date(), type: 'info' }]);
+        setActivityLog([{ 
+            id: 'init', 
+            message: `Initializing RLM Agent Loop (Style: ${STYLE_MODE_CONFIG[styleMode].label})...`, 
+            timestamp: new Date(), 
+            type: 'info' 
+        }]);
 
         try {
-            const newDeck = await generateAgenticDeck(topic, (status, percent) => {
-                if (percent !== undefined) setProgressVal(percent);
+            const newDeck = await generateAgenticDeck(
+                topic, 
+                (status, percent) => {
+                    if (percent !== undefined) setProgressVal(percent);
 
-                let type: ActivityLogItem['type'] = 'agent';
-                if (status.includes('RLM Loop')) type = 'validation';
+                    let type: ActivityLogItem['type'] = 'agent';
+                    if (status.includes('RLM Loop')) type = 'validation';
 
-                setActivityLog(prev => [
-                    ...prev,
-                    { id: crypto.randomUUID(), message: status, timestamp: new Date(), type, agentName: status.split(':')[0] }
-                ]);
-            });
+                    setActivityLog(prev => [
+                        ...prev,
+                        { id: crypto.randomUUID(), message: status, timestamp: new Date(), type, agentName: status.split(':')[0] }
+                    ]);
+                },
+                { styleMode } // Pass style mode to generation
+            );
             setDeck(newDeck);
             setActiveSlideIndex(0);
             setActivityLog(prev => [...prev, { id: 'done', message: 'Generation Complete.', timestamp: new Date(), type: 'success' }]);
@@ -181,6 +224,56 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
                                         </span>
                                     </div>
                                 )}
+                            </div>
+
+                            {/* STYLE MODE SELECTOR */}
+                            <div className="space-y-3">
+                                <label className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                                    Presentation Style
+                                </label>
+                                <div className="grid grid-cols-3 gap-3">
+                                    {(Object.keys(STYLE_MODE_CONFIG) as StyleMode[]).map((mode) => {
+                                        const config = STYLE_MODE_CONFIG[mode];
+                                        const isSelected = styleMode === mode;
+                                        return (
+                                            <button
+                                                key={mode}
+                                                type="button"
+                                                onClick={() => setStyleMode(mode)}
+                                                disabled={isBuilding}
+                                                className={`
+                                                    p-4 rounded-2xl border-2 transition-all text-left
+                                                    ${isSelected 
+                                                        ? `bg-gradient-to-br ${config.gradient} ${config.borderColor} shadow-lg` 
+                                                        : 'bg-black/30 border-white/10 hover:border-white/20 hover:bg-black/40'
+                                                    }
+                                                    ${isBuilding ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}
+                                                `}
+                                            >
+                                                <div className="flex items-center gap-2 mb-2">
+                                                    <div className={`
+                                                        p-1.5 rounded-lg
+                                                        ${isSelected ? 'bg-white/20' : 'bg-white/10'}
+                                                    `}>
+                                                        {config.icon}
+                                                    </div>
+                                                    <span className={`
+                                                        font-bold text-sm
+                                                        ${isSelected ? 'text-white' : 'text-slate-300'}
+                                                    `}>
+                                                        {config.label}
+                                                    </span>
+                                                </div>
+                                                <p className={`
+                                                    text-[10px] leading-relaxed
+                                                    ${isSelected ? 'text-white/80' : 'text-slate-500'}
+                                                `}>
+                                                    {config.description}
+                                                </p>
+                                            </button>
+                                        );
+                                    })}
+                                </div>
                             </div>
 
                             <button onClick={handleBuild} disabled={isBuilding || !topic} className="w-full py-5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-lg font-bold rounded-2xl flex items-center justify-center gap-3 shadow-xl transition-all hover:scale-[1.01] active:scale-[0.99]">

@@ -490,10 +490,17 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         if (value === null || value === undefined) return true;
         const raw = String(value).trim().toLowerCase();
         if (!raw) return true;
-        return [
+        // Common placeholder patterns including "No Data Available" variations
+        const placeholderExact = [
             'n/a', 'na', 'tbd', 'unknown', 'none', 'null', 'nil', 'not available',
-            '-', '—', '...', 'n.a.'
-        ].includes(raw);
+            '-', '—', '...', 'n.a.', 'no data available', 'no data', 'data visualization',
+            'key points', 'placeholder', 'coming soon', 'to be determined'
+        ];
+        if (placeholderExact.includes(raw)) return true;
+        // Pattern-based detection
+        if (/^(data\s*viz|key\s*points?)$/i.test(raw)) return true;
+        if (/^\[.*\]$/.test(raw)) return true; // [Insert text] style
+        return false;
     };
 
     const extractFallbackBullets = () => {

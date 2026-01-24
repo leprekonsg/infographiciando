@@ -376,7 +376,21 @@ export async function callAI(
     const response: any = await Promise.race([generatePromise, timeoutPromise]);
 
     if (tracker && response.usageMetadata) {
-      tracker.addTokenUsage(effectiveModel, response.usageMetadata.promptTokenCount || 0, response.usageMetadata.candidatesTokenCount || 0);
+      // Support both old TokenTracker and new CostTracker interfaces
+      const inputTokens = response.usageMetadata.promptTokenCount || 0;
+      const outputTokens = response.usageMetadata.candidatesTokenCount || 0;
+      
+      if ('addTokenUsage' in tracker && typeof tracker.addTokenUsage === 'function') {
+        // Old TokenTracker interface
+        tracker.addTokenUsage(effectiveModel, inputTokens, outputTokens);
+      } else if ('addUsage' in tracker && typeof tracker.addUsage === 'function') {
+        // New CostTracker interface - convert to expected format
+        tracker.addUsage(effectiveModel, {
+          total_input_tokens: inputTokens,
+          total_output_tokens: outputTokens,
+          total_tokens: inputTokens + outputTokens
+        });
+      }
     }
 
     const rawText = response.text || "";

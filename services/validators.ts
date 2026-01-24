@@ -542,6 +542,550 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
   };
 };
 
+// ============================================================================
+// CONTENT COMPLETENESS VALIDATION
+// ============================================================================
+// Validates that slides have substantive content, not just placeholders.
+// QA score = 100 should mean "this slide is actually useful", not just "valid JSON".
+
+/** Placeholder phrases that indicate empty/unfinished content */
+const PLACEHOLDER_PATTERNS = [
+  /no data available/i,
+  /key points?$/i,            // Just "Key Points" with no actual points
+  /data visualization$/i,     // Placeholder chart label
+  /to be (added|determined)/i,
+  /coming soon/i,
+  /placeholder/i,
+  /\[.*\]/,                   // [Insert text here] style
+  /n\/a/i,
+  /tbd/i
+];
+
+/** 
+ * Check if a string matches placeholder patterns
+ */
+function isPlaceholderContent(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.length < 3) return true;
+  return PLACEHOLDER_PATTERNS.some(pattern => pattern.test(trimmed));
+}
+
+/**
+ * Calculate string similarity using word overlap (Jaccard-like for word tokens)
+ * Returns value between 0 (no similarity) and 1 (identical)
+ */
+function calculateStringSimilarity(str1: string, str2: string): number {
+  // Tokenize into words, filter short words and common stop words
+  const STOP_WORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 
+    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
+    'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by', 'from', 'and', 'or', 'but', 'so', 'yet',
+    'this', 'that', 'these', 'those', 'it', 'its']);
+  
+  const tokenize = (s: string): Set<string> => {
+    const words = s.toLowerCase()
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2 && !STOP_WORDS.has(w));
+    return new Set(words);
+  };
+  
+  const tokens1 = tokenize(str1);
+  const tokens2 = tokenize(str2);
+  
+  if (tokens1.size === 0 || tokens2.size === 0) return 0;
+  
+  // Calculate Jaccard similarity
+  const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
+  const union = new Set([...tokens1, ...tokens2]);
+  
+  return intersection.size / union.size;
+}
+
+/**
+ * Content Completeness Validation
+ * Checks that slides have real, substantive content rather than:
+ * - Empty bullets with "Key Points" labels
+ * - Title duplicated as body content
+ * - "No Data Available" placeholders
+ * - Generic placeholder text
+ * - Semantic redundancy (same info repeated)
+ * 
+ * This validation runs AFTER visual/structural validation and caps QA score.
+ */
+export interface ContentCompletenessResult {
+  passed: boolean;
+  score: number;  // 0-100, will cap overall QA score
+  issues: { code: string; message: string; severity: 'critical' | 'major' | 'minor'; }[];
+}
+
+export function validateContentCompleteness(slide: SlideNode): ContentCompletenessResult {
+  const issues: ContentCompletenessResult['issues'] = [];
+  let score = 100;
+  
+  const slideTitle = slide.layoutPlan?.title || slide.title || '';
+  const components = slide.layoutPlan?.components || [];
+  
+  // 1. CHECK: Title duplication in body
+  // If the title appears verbatim as a bullet, that's lazy content
+  const titleLower = slideTitle.toLowerCase().trim();
+  
+  components.forEach((comp, idx) => {
+    if (comp.type === 'text-bullets') {
+      // Filter out null/undefined bullets and ensure all are strings
+      const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b !== null);
+      
+      // Check for title duplication (only if we have a non-empty title)
+      if (titleLower && bullets.some(b => b.toLowerCase().trim() === titleLower)) {
+        score -= 15;
+        issues.push({
+          code: 'CONTENT_TITLE_DUPLICATION',
+          message: `Slide title "${slideTitle.slice(0, 30)}..." duplicated as bullet content`,
+          severity: 'major'
+        });
+      }
+      
+      // Check for empty bullets array when title suggests content
+      if (bullets.length === 0 && comp.title) {
+        score -= 25;
+        issues.push({
+          code: 'CONTENT_EMPTY_BULLETS',
+          message: `Text-bullets component has title "${comp.title}" but no actual bullet points`,
+          severity: 'critical'
+        });
+      }
+      
+      // Check for placeholder bullets
+      bullets.forEach((bullet, bulletIdx) => {
+        if (isPlaceholderContent(bullet)) {
+          score -= 10;
+          issues.push({
+            code: 'CONTENT_PLACEHOLDER_BULLET',
+            message: `Bullet ${bulletIdx + 1} contains placeholder text: "${bullet.slice(0, 40)}..."`,
+            severity: 'major'
+          });
+        }
+      });
+      
+      // Check for insufficient content (1 bullet that's very short)
+      if (bullets.length === 1 && bullets[0] && bullets[0].length < 20) {
+        score -= 10;
+        issues.push({
+          code: 'CONTENT_INSUFFICIENT',
+          message: `Only one very short bullet point - slide lacks substance`,
+          severity: 'minor'
+        });
+      }
+    }
+    
+    if (comp.type === 'metric-cards') {
+      const metrics = comp.metrics || [];
+      
+      // Check for "No Data Available" placeholder values
+      metrics.forEach((metric, metricIdx) => {
+        if (isPlaceholderContent(metric.value) || isPlaceholderContent(metric.label)) {
+          score -= 15;
+          issues.push({
+            code: 'CONTENT_PLACEHOLDER_METRIC',
+            message: `Metric ${metricIdx + 1} contains placeholder: "${metric.value}" / "${metric.label}"`,
+            severity: 'critical'
+          });
+        }
+      });
+      
+      // Check for empty metrics array
+      if (metrics.length === 0) {
+        score -= 25;
+        issues.push({
+          code: 'CONTENT_EMPTY_METRICS',
+          message: 'Metric cards component has no metrics',
+          severity: 'critical'
+        });
+      }
+    }
+    
+    if (comp.type === 'chart-frame') {
+      const data = comp.data || [];
+      
+      // Check for empty chart data
+      if (data.length === 0) {
+        score -= 25;
+        issues.push({
+          code: 'CONTENT_EMPTY_CHART',
+          message: `Chart "${comp.title || 'Untitled'}" has no data points`,
+          severity: 'critical'
+        });
+      }
+      
+      // Check for placeholder chart titles
+      if (comp.title && isPlaceholderContent(comp.title)) {
+        score -= 10;
+        issues.push({
+          code: 'CONTENT_PLACEHOLDER_CHART_TITLE',
+          message: `Chart has placeholder title: "${comp.title}"`,
+          severity: 'major'
+        });
+      }
+    }
+  });
+  
+  // 2. CHECK: "Key Points" pattern with no points
+  // This catches slides with a "Key Points" section label but empty content
+  const allText = extractSlideTextForCompleteness(slide);
+  if (/key\s*points?/i.test(allText) && countSubstantiveBullets(components) === 0) {
+    score -= 30;
+    issues.push({
+      code: 'CONTENT_KEY_POINTS_EMPTY',
+      message: 'Slide has "Key Points" label but no actual key points',
+      severity: 'critical'
+    });
+  }
+  
+  // 3. CHECK: Overall content density
+  // A slide with components but almost no actual text is incomplete
+  const totalChars = allText.replace(/\s+/g, '').length;
+  if (totalChars < 50 && components.length > 0) {
+    score -= 20;
+    issues.push({
+      code: 'CONTENT_TOO_SPARSE',
+      message: `Slide has ${components.length} components but only ${totalChars} characters of content`,
+      severity: 'major'
+    });
+  }
+  
+  // ============================================================================
+  // 4. CHECK: SEMANTIC REDUNDANCY (within-slide)
+  // ============================================================================
+  // Detects content that says the same thing twice:
+  // - Title duplicated as bullet (already checked above, but also check near-duplicates)
+  // - Same information repeated across bullets
+  // - Section header that just restates the title
+  // 
+  // When redundancy is detected, prefer content rewrite over geometry repair,
+  // because moving a duplicated bullet doesn't fix the underlying problem.
+  
+  // 4a. Check for near-duplicate title in component titles
+  if (titleLower && titleLower.length > 5) {
+    components.forEach((comp, idx) => {
+      if ('title' in comp && comp.title) {
+        const compTitleLower = comp.title.toLowerCase().trim();
+        // Check for high similarity (90%+ overlap)
+        if (compTitleLower.length > 5 && calculateStringSimilarity(titleLower, compTitleLower) > 0.85) {
+          score -= 10;
+          issues.push({
+            code: 'CONTENT_REDUNDANT_TITLE',
+            message: `Component ${idx} title "${comp.title.slice(0, 30)}..." restates slide title`,
+            severity: 'minor'
+          });
+        }
+      }
+    });
+  }
+  
+  // 4b. Check for repeated bullets within text-bullets components
+  components.forEach((comp, compIdx) => {
+    if (comp.type === 'text-bullets') {
+      const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b.length > 10);
+      
+      // Compare each pair of bullets for similarity
+      for (let i = 0; i < bullets.length; i++) {
+        for (let j = i + 1; j < bullets.length; j++) {
+          const similarity = calculateStringSimilarity(
+            bullets[i].toLowerCase(),
+            bullets[j].toLowerCase()
+          );
+          
+          if (similarity > 0.75) { // 75%+ similarity = likely duplicate
+            score -= 15;
+            issues.push({
+              code: 'CONTENT_REDUNDANT_BULLETS',
+              message: `Bullets ${i + 1} and ${j + 1} in component ${compIdx} say nearly the same thing (${Math.round(similarity * 100)}% similar)`,
+              severity: 'major'
+            });
+            break; // Only report first redundancy per component to avoid spam
+          }
+        }
+      }
+    }
+  });
+  
+  // 4c. Check for bullet that just restates title with minor changes
+  components.forEach((comp, compIdx) => {
+    if (comp.type === 'text-bullets' && titleLower.length > 10) {
+      const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b.length > 10);
+      
+      bullets.forEach((bullet, bulletIdx) => {
+        const similarity = calculateStringSimilarity(titleLower, bullet.toLowerCase());
+        if (similarity > 0.7 && similarity < 0.95) { // Near-duplicate but not exact
+          score -= 10;
+          issues.push({
+            code: 'CONTENT_BULLET_RESTATES_TITLE',
+            message: `Bullet ${bulletIdx + 1} appears to restate the slide title with minor changes`,
+            severity: 'minor'
+          });
+        }
+      });
+    }
+  });
+  
+  return {
+    passed: !issues.some(i => i.severity === 'critical'),
+    score: Math.max(0, score),
+    issues
+  };
+}
+
+// ============================================================================
+// NO-PLACEHOLDER SHIPPING HARD GATE
+// ============================================================================
+
+/** 
+ * SHIPPING-CRITICAL placeholder strings that should NEVER appear in exported PPTX.
+ * These indicate incomplete content that slipped through generation/repair.
+ */
+const SHIPPING_BLOCK_PLACEHOLDERS = [
+  'No Data Available',
+  'Data Visualization',
+  'Key Points',         // Only when standalone (no actual points follow)
+  '[Insert',            // [Insert text here] style
+  'Coming Soon',
+  'TBD',
+  'To Be Determined',
+  'N/A',
+  'Placeholder',
+  'Lorem ipsum',
+  '...',               // Ellipsis-only content
+];
+
+/**
+ * NO-PLACEHOLDER SHIPPING GATE
+ * 
+ * Final validation gate that blocks export if placeholder content remains.
+ * This is a HARD FAIL - no slide with placeholder content should ship.
+ * 
+ * Unlike validateContentCompleteness (which caps QA score), this is a boolean gate:
+ * - Returns false = BLOCK EXPORT (slide cannot ship)
+ * - Returns true = OK to ship
+ * 
+ * When blocking, returns the offending content so it can be:
+ * 1. Removed (if component is non-essential)
+ * 2. Converted to simpler text-only fallback
+ * 3. Flagged for regeneration
+ */
+export interface ShippingGateResult {
+  canShip: boolean;
+  blockedContent: {
+    componentIndex: number;
+    componentType: string;
+    placeholderFound: string;
+    location: 'title' | 'value' | 'label' | 'content' | 'data';
+  }[];
+  recommendation: 'remove_component' | 'convert_to_text' | 'regenerate' | 'ok';
+}
+
+export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateResult {
+  const blockedContent: ShippingGateResult['blockedContent'] = [];
+  const components = slide.layoutPlan?.components || [];
+  
+  // Check helper: case-insensitive match against block list
+  const isBlockedPlaceholder = (text: string): string | null => {
+    if (!text || typeof text !== 'string') return null;
+    const trimmed = text.trim();
+    if (trimmed.length === 0) return null;
+    
+    for (const placeholder of SHIPPING_BLOCK_PLACEHOLDERS) {
+      if (trimmed.toLowerCase() === placeholder.toLowerCase()) {
+        return placeholder;
+      }
+      // Check if starts with placeholder pattern
+      if (placeholder.startsWith('[') && trimmed.toLowerCase().startsWith(placeholder.toLowerCase())) {
+        return placeholder;
+      }
+    }
+    
+    // Check for ellipsis-only content
+    if (/^\.{2,}$/.test(trimmed)) {
+      return '...';
+    }
+    
+    return null;
+  };
+  
+  components.forEach((comp, idx) => {
+    // Check component title (all types)
+    if ('title' in comp && comp.title) {
+      const blocked = isBlockedPlaceholder(comp.title);
+      if (blocked) {
+        blockedContent.push({
+          componentIndex: idx,
+          componentType: comp.type,
+          placeholderFound: blocked,
+          location: 'title'
+        });
+      }
+    }
+    
+    // Type-specific checks
+    if (comp.type === 'text-bullets') {
+      (comp.content || []).forEach((bullet, bIdx) => {
+        const blocked = isBlockedPlaceholder(bullet);
+        if (blocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${blocked} (bullet ${bIdx + 1})`,
+            location: 'content'
+          });
+        }
+      });
+    }
+    
+    if (comp.type === 'metric-cards') {
+      (comp.metrics || []).forEach((metric, mIdx) => {
+        const valueBlocked = isBlockedPlaceholder(metric.value);
+        const labelBlocked = isBlockedPlaceholder(metric.label);
+        
+        if (valueBlocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${valueBlocked} (metric ${mIdx + 1} value)`,
+            location: 'value'
+          });
+        }
+        if (labelBlocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${labelBlocked} (metric ${mIdx + 1} label)`,
+            location: 'label'
+          });
+        }
+      });
+    }
+    
+    if (comp.type === 'chart-frame') {
+      // Check chart title
+      if (comp.title) {
+        const blocked = isBlockedPlaceholder(comp.title);
+        if (blocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${blocked} (chart title)`,
+            location: 'title'
+          });
+        }
+      }
+      
+      // Check if chart has no data (empty chart = placeholder equivalent)
+      if (!comp.data || comp.data.length === 0) {
+        blockedContent.push({
+          componentIndex: idx,
+          componentType: comp.type,
+          placeholderFound: '(empty chart data)',
+          location: 'data'
+        });
+      }
+    }
+    
+    if (comp.type === 'process-flow') {
+      (comp.steps || []).forEach((step, sIdx) => {
+        const titleBlocked = isBlockedPlaceholder(step.title);
+        const descBlocked = isBlockedPlaceholder(step.description);
+        
+        if (titleBlocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${titleBlocked} (step ${sIdx + 1} title)`,
+            location: 'title'
+          });
+        }
+        if (descBlocked) {
+          blockedContent.push({
+            componentIndex: idx,
+            componentType: comp.type,
+            placeholderFound: `${descBlocked} (step ${sIdx + 1} description)`,
+            location: 'content'
+          });
+        }
+      });
+    }
+  });
+  
+  // Determine recommendation based on what was found
+  let recommendation: ShippingGateResult['recommendation'] = 'ok';
+  
+  if (blockedContent.length > 0) {
+    const uniqueComponents = new Set(blockedContent.map(b => b.componentIndex));
+    
+    if (uniqueComponents.size === 1 && blockedContent.length <= 2) {
+      // Single component with 1-2 issues: can likely convert to text or remove
+      const comp = components[blockedContent[0].componentIndex];
+      if (comp.type === 'chart-frame' || comp.type === 'metric-cards') {
+        recommendation = 'convert_to_text';
+      } else {
+        recommendation = 'remove_component';
+      }
+    } else if (blockedContent.length > 3) {
+      // Multiple issues across components: slide needs regeneration
+      recommendation = 'regenerate';
+    } else {
+      recommendation = 'remove_component';
+    }
+  }
+  
+  return {
+    canShip: blockedContent.length === 0,
+    blockedContent,
+    recommendation
+  };
+}
+
+/** Extract all text from slide for content analysis */
+function extractSlideTextForCompleteness(slide: SlideNode): string {
+  const parts: string[] = [slide.layoutPlan?.title || '', slide.title || ''];
+  
+  (slide.layoutPlan?.components || []).forEach(comp => {
+    if (comp.type === 'text-bullets') {
+      if (comp.title) parts.push(comp.title);
+      parts.push(...(comp.content || []));
+    } else if (comp.type === 'metric-cards') {
+      (comp.metrics || []).forEach(m => {
+        parts.push(m.label, m.value);
+      });
+    } else if (comp.type === 'chart-frame') {
+      if (comp.title) parts.push(comp.title);
+      (comp.data || []).forEach(d => parts.push(d.label));
+    } else if (comp.type === 'process-flow') {
+      (comp.steps || []).forEach(s => {
+        parts.push(s.title, s.description);
+      });
+    } else if (comp.type === 'icon-grid') {
+      (comp.items || []).forEach(i => {
+        parts.push(i.label, i.description || '');
+      });
+    }
+  });
+  
+  return parts.filter(Boolean).join(' ');
+}
+
+/** Count meaningful bullet points (excludes empty/placeholder) */
+function countSubstantiveBullets(components: any[]): number {
+  let count = 0;
+  components.forEach(comp => {
+    if (comp.type === 'text-bullets') {
+      (comp.content || []).forEach((bullet: string) => {
+        if (bullet && bullet.trim().length > 10 && !isPlaceholderContent(bullet)) {
+          count++;
+        }
+      });
+    }
+  });
+  return count;
+}
+
 /**
  * Validates API response for visual critique against Zod schema.
  * Returns validated VisualCritiqueReport or null on failure.

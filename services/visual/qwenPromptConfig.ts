@@ -225,12 +225,21 @@ COORDINATE SYSTEM: 0-1000 normalized range.
 - Body content optimal Y: 250-400 (25-40% from top)
 - Minimum edge margin: 50 (5%)
 
-COMPONENT ID REFERENCE (use these exact formats):
-- "text-title-0" for main title
-- "text-bullets-0", "text-bullets-1" for bullet lists (indexed by order)
-- "metric-cards-0" for metric displays
-- "shape-card-0", "shape-card-1" for card shapes
-- "divider-0", "line-0" for separators
+COMPONENT ID REFERENCE (use ONLY IDs from ComponentManifest comment):
+- Format: "{component-type}-{index}" where index maps to layoutPlan.components[index]
+- Example: "text-bullets-0" → layoutPlan.components[0], "metric-cards-1" → layoutPlan.components[1]
+- The ComponentManifest comment in the SVG lists ALL valid component IDs
+- For slide title positioning, use "title" (not a numbered component)
+- For divider/accent bar positioning, use "divider" (not a numbered component)
+- DO NOT use render-order IDs like "text-0", "shape-1" - use component IDs only
+
+VALID COMPONENT TYPES:
+- "text-bullets-N" for bullet point lists
+- "metric-cards-N" for numeric metric displays
+- "chart-frame-N" for data visualizations
+- "process-flow-N" for step/process diagrams
+- "icon-grid-N" for icon-based layouts
+- "diagram-svg-N" for complex diagrams
 
 ANALYZE FOR:
 1. Spatial Issues - Overlap, out-of-bounds (x < 50 or x > 950), zone violations
@@ -571,4 +580,347 @@ export function getQwenRequestConfig(taskType: 'critique' | 'repair' | 'layout_s
         default:
             return { ...baseConfig, max_tokens: 1024 };
     }
+}
+
+// ============================================================================
+// STYLE-AWARE VISUAL CRITIQUE RUBRICS
+// ============================================================================
+
+/**
+ * StyleMode type for rubric selection.
+ * Matches the StyleMode from slideTypes.ts
+ */
+export type QwenStyleMode = 'corporate' | 'professional' | 'serendipitous';
+
+/**
+ * Style-aware visual critique rubrics.
+ * Each rubric emphasizes different visual qualities based on the target audience.
+ * 
+ * These rubrics transform System 2 validation from "is it broken?" to
+ * "does it match the intended style?" - a critical shift for quality differentiation.
+ */
+export const STYLE_RUBRICS = {
+    /**
+     * Corporate Clarity Rubric
+     * Target: Board decks, investor presentations, formal reports
+     * Priority: Zero tolerance for chaos, maximum legibility, professional polish
+     */
+    corporate_clarity: `STYLE RUBRIC: CORPORATE CLARITY
+Target audience: Executives, board members, investors, formal stakeholders
+
+MANDATORY REQUIREMENTS (fail = requires_repair):
+1. Grid Alignment: ALL elements must snap to a 50-unit grid (in 0-1000 space)
+   - Text boxes aligned to left edge OR center
+   - No "floating" elements that break visual rhythm
+   - Consistent vertical spacing between sections
+
+2. Text Legibility (STRICT):
+   - Title: Minimum 24pt equivalent, high contrast (>7:1 ratio)
+   - Body: Minimum 16pt equivalent, WCAG AAA compliance (>7:1 ratio)
+   - NO text truncation visible - all content fully readable
+   - Line height minimum 1.4 for body text
+
+3. Visual Hierarchy (EXPLICIT):
+   - Clear single focal point (title or hero metric)
+   - Supporting content visually subordinate
+   - No competing visual weights
+
+4. Chart Legibility (if present):
+   - Axis labels fully readable
+   - Data labels present and legible
+   - Legend clearly positioned and readable
+   - No overlapping data elements
+
+5. Professional Polish:
+   - Consistent color palette (max 3 colors + neutrals)
+   - No visual "noise" or decorative distractions
+   - Adequate negative space (minimum 15% of slide area)
+   - Edge margins respected (minimum 50 units from all edges)
+
+SEVERITY WEIGHTING:
+- Text truncation: CRITICAL (instant requires_repair)
+- Chart legibility failure: CRITICAL
+- Grid misalignment: WARNING (flag_for_review at 3+ instances)
+- Contrast below 7:1: WARNING
+- Insufficient negative space: INFO
+
+SCORING ADJUSTMENTS FOR CORPORATE:
+- Deduct 20 points for ANY "creative" asymmetry
+- Deduct 15 points for serif fonts in data visualizations
+- Deduct 10 points for more than 3 accent colors
+- Add 10 points for perfect grid alignment throughout`,
+
+    /**
+     * Balanced Rubric (Professional)
+     * Target: General business, team presentations, workshops
+     * Priority: Readability + moderate visual interest, flexible standards
+     */
+    balanced: `STYLE RUBRIC: PROFESSIONAL BALANCE
+Target audience: Business professionals, team meetings, workshops
+
+EVALUATION PRIORITIES (balanced weighting):
+
+1. Core Readability (40% of score):
+   - All text legible at presentation distance
+   - WCAG AA compliance (4.5:1 contrast minimum)
+   - No critical truncation (minor overflow acceptable if context clear)
+   - Line height 1.3-1.5 acceptable
+
+2. Visual Organization (30% of score):
+   - Clear content grouping
+   - Logical flow (top-to-bottom, left-to-right)
+   - Consistent spacing within sections
+   - Minor alignment variations acceptable if intentional
+
+3. Professional Appearance (20% of score):
+   - Coherent color palette
+   - Appropriate use of imagery/icons
+   - No jarring visual elements
+   - Margins respected (40 units minimum)
+
+4. Visual Interest (10% of score):
+   - Some visual variety welcome
+   - Color accents add engagement
+   - Moderate asymmetry acceptable
+   - Personality allowed if not distracting
+
+FLEXIBILITY ZONES:
+- Grid alignment: 50-unit tolerance (vs. perfect snap)
+- Color count: Up to 4 accent colors acceptable
+- Asymmetry: Intentional asymmetry is a feature, not a bug
+- Negative space: 10-15% range acceptable
+
+SEVERITY WEIGHTING:
+- Text truncation (critical content): CRITICAL
+- Contrast below AA (4.5:1): WARNING
+- Alignment inconsistency: INFO
+- Color palette expansion: INFO
+
+SCORING NOTES:
+- Do NOT penalize for creative layouts if content remains clear
+- Award points for visual hierarchy that aids comprehension
+- Minor imperfections acceptable if overall professionalism maintained`,
+
+    /**
+     * Serendipity Impact Rubric
+     * Target: Creative pitches, thought leadership, inspiration
+     * Priority: Boldness, visual drama, memorable impact over conformity
+     */
+    serendipity_impact: `STYLE RUBRIC: SERENDIPITY IMPACT
+Target audience: Creative professionals, innovation pitches, thought leadership
+
+EVALUATION PHILOSOPHY:
+This is NOT a safety check - this is an IMPACT assessment.
+We're asking: "Would this make someone stop and pay attention?"
+
+PRIMARY CRITERIA (impact-weighted):
+
+1. Visual Drama (35% of score):
+   - Does the slide have a clear FOCAL POINT that commands attention?
+   - Is there intentional TENSION in the composition?
+   - Does the layout avoid "template-y" corporate sameness?
+   - Is negative space used BOLDLY (not just "adequately")?
+
+2. Memorable Design (30% of score):
+   - Would you remember this slide tomorrow?
+   - Does it break expected patterns in a meaningful way?
+   - Is there a visual "hook" or surprise element?
+   - Does the design feel AUTHORED, not assembled?
+
+3. Content Legibility (25% of score):
+   - Core message readable (hero text, key metric)
+   - Supporting content accessible (but can be secondary)
+   - WCAG AA acceptable (4.5:1) - but HIGH contrast preferred (10:1+)
+   - Truncation acceptable for decorative/atmospheric text
+
+4. Cohesive Vision (10% of score):
+   - Does the visual style serve the message?
+   - Is boldness intentional, not accidental?
+   - Do "breaking" elements feel designed, not broken?
+
+ENCOURAGED ELEMENTS:
++ Dramatic asymmetry with purpose
++ Bold color contrasts and accent pops
++ Generous negative space (>20% encouraged)
++ Oversized typography for impact
++ Atmospheric/background elements that add depth
++ Rule-of-thirds positioning over center-alignment
+
+THINGS NOT TO PENALIZE:
+- Text that "breathes" (minimal bullet points)
+- Unconventional layouts that still communicate
+- Color boldness that maintains readability
+- Asymmetric compositions with clear focal point
+- Large empty areas (negative space is a feature)
+
+RED FLAGS (require repair):
+- Core message unreadable or obscured
+- Chaotic layout with NO focal point
+- Contrast so low that key text disappears
+- Boldness that undermines rather than enhances message
+- "Random" chaos vs. intentional drama
+
+SCORING PHILOSOPHY:
+- A "safe" but forgettable slide should score 50-60
+- A bold slide with minor legibility issues: 70-80
+- A dramatic slide that communicates clearly: 85-95
+- A timid, template-like slide: 30-50 (fails the style intent)
+
+CRITICAL: If the slide looks like it could have come from a generic template,
+that is a FAILURE of serendipitous style, regardless of technical correctness.`
+} as const;
+
+/**
+ * Get the appropriate style rubric for visual critique.
+ * @param styleMode The style mode to use for critique
+ * @returns The rubric text to append to the visual critique prompt
+ */
+export function getStyleRubric(styleMode: QwenStyleMode): string {
+    switch (styleMode) {
+        case 'corporate':
+            return STYLE_RUBRICS.corporate_clarity;
+        case 'professional':
+            return STYLE_RUBRICS.balanced;
+        case 'serendipitous':
+            return STYLE_RUBRICS.serendipity_impact;
+        default:
+            return STYLE_RUBRICS.balanced; // Safe fallback
+    }
+}
+
+/**
+ * Build a style-aware visual critique prompt.
+ * Combines the base critique prompt with the appropriate style rubric.
+ * 
+ * @param styleMode The style mode driving the critique rubric
+ * @returns Complete prompt with style-specific evaluation criteria
+ */
+export function buildStyleAwareCritiquePrompt(styleMode: QwenStyleMode): string {
+    const rubric = getStyleRubric(styleMode);
+    
+    return `${VISUAL_CRITIQUE_PROMPT}
+
+---
+
+${rubric}
+
+IMPORTANT: Apply the style rubric above when determining severity ratings and the overall_verdict.
+A slide that is technically correct but fails to match the style intent should be flagged for review.`;
+}
+
+/**
+ * Build a style-aware repair prompt.
+ * Adjusts repair priorities based on style mode.
+ * 
+ * @param styleMode The style mode driving repair priorities
+ * @returns Complete repair prompt with style-specific priorities
+ */
+export function buildStyleAwareRepairPrompt(styleMode: QwenStyleMode): string {
+    const styleContext = getStyleRepairContext(styleMode);
+    
+    return `${VISUAL_ARCHITECT_REPAIR_PROMPT}
+
+---
+
+STYLE-SPECIFIC REPAIR PRIORITIES:
+${styleContext}
+
+Apply these priorities when determining which repairs are most important.`;
+}
+
+/**
+ * Get style-specific repair context.
+ */
+function getStyleRepairContext(styleMode: QwenStyleMode): string {
+    switch (styleMode) {
+        case 'corporate':
+            return `MODE: CORPORATE
+Repair Priority Order:
+1. TEXT TRUNCATION - Fix immediately, no tolerance
+2. GRID ALIGNMENT - Snap all elements to 50-unit grid
+3. CONTRAST - Elevate to AAA (7:1) if possible
+4. NEGATIVE SPACE - Increase to minimum 15%
+5. COLOR SIMPLIFICATION - Reduce to max 3 accent colors
+
+Avoid: ANY asymmetric "creative" repositioning`;
+
+        case 'professional':
+            return `MODE: PROFESSIONAL
+Repair Priority Order:
+1. CRITICAL TRUNCATION - Fix text that loses meaning
+2. CONTRAST - Ensure AA compliance (4.5:1)
+3. OVERLAP - Resolve any element collisions
+4. SPACING - Normalize to consistent rhythm
+5. MARGINS - Ensure 40-unit minimum from edges
+
+Allow: Moderate asymmetry if it aids visual interest`;
+
+        case 'serendipitous':
+            return `MODE: SERENDIPITOUS
+Repair Priority Order:
+1. FOCAL POINT - Ensure ONE clear visual anchor
+2. CORE MESSAGE - Key text must be readable (10:1+ preferred)
+3. INTENTIONAL DRAMA - Preserve bold positioning, don't "normalize"
+4. NEGATIVE SPACE - INCREASE if cramped, dramatic space is good
+
+Avoid: Repairs that make the slide look "safer" or more template-like
+Preserve: Bold asymmetry, generous whitespace, dramatic scale contrasts`;
+
+        default:
+            return '';
+    }
+}
+
+/**
+ * Determine if a slide passes style-specific quality gates.
+ * Different modes have different acceptance thresholds.
+ * 
+ * @param score The overall score from Qwen critique (0-100)
+ * @param styleMode The style mode to evaluate against
+ * @param hasCriticalIssues Whether any critical issues were found
+ * @returns Whether the slide passes the style-specific quality gate
+ */
+export function passesStyleQualityGate(
+    score: number,
+    styleMode: QwenStyleMode,
+    hasCriticalIssues: boolean
+): boolean {
+    // Critical issues always fail, regardless of mode
+    if (hasCriticalIssues) return false;
+    
+    // Style-specific thresholds
+    const thresholds = {
+        corporate: 85,      // High bar - safety first
+        professional: 75,   // Standard bar
+        serendipitous: 65   // Lower bar - impact over safety
+    };
+    
+    const threshold = thresholds[styleMode] ?? 75;
+    return score >= threshold;
+}
+
+/**
+ * Get style-specific thinking mode.
+ * Corporate mode uses more deliberate analysis; serendipitous uses faster perception.
+ * 
+ * @param styleMode The style mode
+ * @param taskType The task being performed
+ * @returns Thinking mode directive
+ */
+export function getStyleAwareThinkingMode(
+    styleMode: QwenStyleMode,
+    taskType: 'critique' | 'repair' | 'layout_select' | 'quick_score'
+): string {
+    // Corporate always uses thinking for thoroughness
+    if (styleMode === 'corporate') {
+        return THINKING_MODES.THINK;
+    }
+    
+    // Serendipitous uses faster perception for most tasks
+    if (styleMode === 'serendipitous') {
+        return taskType === 'repair' ? THINKING_MODES.THINK : THINKING_MODES.NO_THINK;
+    }
+    
+    // Professional uses default task-based thinking
+    return getThinkingMode(taskType);
 }

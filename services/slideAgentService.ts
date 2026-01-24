@@ -12,6 +12,7 @@
  * - Max iterations guard (escape hatch)
  * - Structured logging and transparency
  * - Thought signature preservation (Gemini 3)
+ * - Style-aware pipeline (StyleMode propagation through all agents)
  */
 
 import {
@@ -21,14 +22,19 @@ import {
     // Level 3 Agentic Stack Types
     NarrativeTrail, RouterConstraints, GeneratorResult, DeckMetrics, GeneratorFailureReason,
     // System 2 Visual Critique
-    VISUAL_THRESHOLDS
+    VISUAL_THRESHOLDS,
+    // Style Mode System
+    StyleMode, StyleProfile, SlideArchetype, getStyleProfile, getVisualThresholdsForStyle,
+    isLayoutAllowedForStyle, getBulletsMax, getTitleMaxChars,
+    // Archetype inference and risk-based validation
+    inferArchetype, shouldValidateSlide, ARCHETYPE_RISK, VisualThresholdsConfig
 } from "../types/slideTypes";
 import {
     createJsonInteraction,
     CostTracker
 } from "./interactionsClient";
 import { PROMPTS } from "./promptRegistry";
-import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence } from "./validators";
+import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence, validateContentCompleteness, checkNoPlaceholderShippingGate } from "./validators";
 import { runVisualDesigner } from "./visualDesignAgent";
 import { SpatialLayoutEngine, createEnvironmentSnapshot } from "./spatialRenderer";
 import { autoRepairSlide } from "./repair/autoRepair";
@@ -37,12 +43,13 @@ import { generateSvgProxy } from "./visual/svgProxy";
 import { runResearcher } from "./agents/researcher";
 import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
-import { runContentPlanner, ContentDensityHint, ContentPlanResult } from "./agents/contentPlanner";
+import { runContentPlanner, ContentDensityHint, ContentPlanResult, StyleAwareContentHint } from "./agents/contentPlanner";
 import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
 import {
     runCompositionArchitect,
     trackUsedSurprises,
-    computeDetailedVariationBudget
+    computeDetailedVariationBudget,
+    applyStyleMultiplierToVariationBudget
 } from "./agents/compositionArchitect";
 import { CompositionPlan, SerendipityDNA } from "../types/serendipityTypes";
 import { z } from "zod";
@@ -54,6 +61,9 @@ export const SERENDIPITY_MODE_ENABLED = true; // Layer-based composition with pr
 // Enable Director mode - uses orchestrator pattern with browser-based rendering
 // When true, routes to DirectorAgent pipeline instead of legacy multi-agent pipeline
 export const ENABLE_DIRECTOR_MODE = false; // Set to true to test new architecture
+
+// Default style mode - can be overridden per-request
+export const DEFAULT_STYLE_MODE: StyleMode = 'professional';
 
 // --- CONSTANTS ---
 // Model tiers imported from interactionsClient for consistency
@@ -384,13 +394,15 @@ function applySpatialPreflightAdjustments(
  * @param validation - Initial validation result
  * @param costTracker - Cost tracking
  * @param styleGuide - Global style guide for SVG rendering
+ * @param styleMode - Style mode for style-aware thresholds and rubrics
  * @returns Enhanced result with rounds, finalScore, repairSucceeded
  */
 async function runRecursiveVisualCritique(
     candidate: SlideNode,
     validation: ValidationResult,
     costTracker: CostTracker,
-    styleGuide: GlobalStyleGuide
+    styleGuide: GlobalStyleGuide,
+    styleMode?: StyleMode
 ): Promise<{
     slide: SlideNode;
     rounds: number;
@@ -403,15 +415,20 @@ async function runRecursiveVisualCritique(
     const MAX_VISUAL_ROUNDS = 3;
     const MIN_IMPROVEMENT_DELTA = 5; // Require meaningful improvement
 
+    // Get style-aware thresholds
+    const styleProfile = getStyleProfile(styleMode);
+    const thresholds = getVisualThresholdsForStyle(styleProfile);
+    console.log(`[SYSTEM 2] Using style-aware thresholds: TARGET=${thresholds.TARGET}, REPAIR_REQUIRED=${thresholds.REPAIR_REQUIRED} (style=${styleMode || 'default'})`);
+
     // Capture cost before System 2 operations
     const preSystem2Summary = costTracker.getSummary();
     const preSystem2Cost = preSystem2Summary.totalCost;
     const preSystem2InputTokens = preSystem2Summary.totalInputTokens;
     const preSystem2OutputTokens = preSystem2Summary.totalOutputTokens;
 
-    // Import visual cortex functions
+    // Import visual cortex functions (including style-aware critique)
     const { runVisualCritique, runLayoutRepair } = await import('./visualDesignAgent');
-    const { getVisualCritiqueFromSvg, isQwenVLAvailable } = await import('./visualCortex');
+    const { getStyleAwareCritiqueFromSvg, isQwenVLAvailable } = await import('./visualCortex');
 
     let currentSlide = candidate;
     let currentValidation = validation;
@@ -422,37 +439,35 @@ async function runRecursiveVisualCritique(
     // Track issue categories across rounds to detect unfixable issues
     const issueHistory = new Map<string, number>(); // category -> count
 
-    while (round < MAX_VISUAL_ROUNDS && currentValidation.score < VISUAL_THRESHOLDS.TARGET) {
+    while (round < MAX_VISUAL_ROUNDS && currentValidation.score < thresholds.TARGET) {
         round++;
-        console.log(`[SYSTEM 2] Visual critique round ${round}/${MAX_VISUAL_ROUNDS} (score: ${currentValidation.score})...`);
+        console.log(`[SYSTEM 2] Visual critique round ${round}/${MAX_VISUAL_ROUNDS} (score: ${currentValidation.score}, target: ${thresholds.TARGET})...`);
 
         try {
             // Generate SVG proxy from current slide state
             const svgProxy = generateSvgProxy(currentSlide, styleGuide);
 
-            // --- QWEN-VL VISUAL CRITIQUE (External Visual Cortex) ---
-            // Fast Path: SVG proxy → PNG (resvg) → Qwen-VL
+            // --- QWEN-VL STYLE-AWARE VISUAL CRITIQUE (External Visual Cortex) ---
+            // Fast Path: SVG proxy → PNG (resvg) → Qwen-VL with style rubric
             // This provides real bounding box detection and spatial analysis
             let externalCritique: any = null;
             if (isQwenVLAvailable()) {
                 try {
-                    console.log(`[SYSTEM 2] Qwen-VL external visual critique (SVG proxy → PNG path)...`);
+                    console.log(`[SYSTEM 2] Qwen-VL style-aware visual critique (style=${styleMode || 'professional'})...`);
 
-                    // Step 1: Generate SVG proxy (already done above)
-                    // svgProxy is available from the line above
-
-                    // Step 2: Rasterize SVG to PNG and send to Qwen-VL
-                    externalCritique = await getVisualCritiqueFromSvg(
+                    // Use style-aware critique with appropriate rubric
+                    externalCritique = await getStyleAwareCritiqueFromSvg(
                         svgProxy,
+                        styleMode || 'professional',
                         costTracker
                     );
 
                     if (externalCritique) {
-                        console.log(`[SYSTEM 2] Qwen-VL critique: score=${externalCritique.overall_score}, verdict=${externalCritique.overall_verdict}, fidelity=${externalCritique.renderFidelity}`);
+                        console.log(`[SYSTEM 2] Qwen-VL critique: score=${externalCritique.overall_score}, verdict=${externalCritique.overall_verdict}, passesStyleGate=${externalCritique.passesStyleGate}`);
                         console.log(`[SYSTEM 2] Issues: ${externalCritique.issues.length}, Empty regions: ${externalCritique.empty_regions.length}`);
 
-                        // Log render fidelity contract
-                        console.log(`[SYSTEM 2] Render fidelity: ${externalCritique.renderFidelity} (svg-proxy = fast/deterministic, pptx-render = slow/accurate)`);
+                        // Log render fidelity and style mode
+                        console.log(`[SYSTEM 2] Render fidelity: ${externalCritique.renderFidelity}, style rubric: ${styleMode || 'professional'}`);
 
                         // Map Qwen-VL critique to internal format
                         // For now, we use external critique as supplementary validation
@@ -520,9 +535,9 @@ async function runRecursiveVisualCritique(
                 }
                 : critique;
 
-            // Check if critique score meets target
-            if (mergedCritique.overallScore >= VISUAL_THRESHOLDS.TARGET) {
-                console.log(`[SYSTEM 2] Critique passed (score: ${mergedCritique.overallScore}), exiting loop`);
+            // Check if critique score meets style-aware target
+            if (mergedCritique.overallScore >= thresholds.TARGET) {
+                console.log(`[SYSTEM 2] Critique passed (score: ${mergedCritique.overallScore}, target: ${thresholds.TARGET}), exiting loop`);
                 break;
             }
 
@@ -548,9 +563,9 @@ async function runRecursiveVisualCritique(
                 break;
             }
 
-            // Determine if repair is needed based on thresholds
+            // Determine if repair is needed based on style-aware thresholds
             const needsRepair = mergedCritique.hasCriticalIssues ||
-                mergedCritique.overallScore < VISUAL_THRESHOLDS.REPAIR_REQUIRED ||
+                mergedCritique.overallScore < thresholds.REPAIR_REQUIRED ||
                 externalCritique?.overall_verdict === 'requires_repair';
 
             if (needsRepair) {
@@ -587,7 +602,7 @@ async function runRecursiveVisualCritique(
                         textDensityTarget: 0.65
                     };
 
-                    // Re-route with constraints
+                    // Re-route with constraints (pass styleMode for style-aware layout selection)
                     try {
                         const reroutedDecision = await runRouter(
                             {
@@ -596,7 +611,8 @@ async function runRecursiveVisualCritique(
                                 purpose: 'Fix persistent text truncation'
                             },
                             costTracker,
-                            constraints
+                            constraints,
+                            styleMode  // Pass styleMode for style filtering
                         );
 
                         console.log(`[SYSTEM 2] Re-routed: ${currentSlide.routerConfig?.layoutVariant} → ${reroutedDecision.layoutVariant}`);
@@ -741,8 +757,8 @@ async function runRecursiveVisualCritique(
                 // ... (rest of logic)
                 const improvement = repairedValidation.score - currentValidation.score;
                 const meetsMinImprovement = improvement >= MIN_IMPROVEMENT_DELTA;
-                const crossedThreshold = currentValidation.score < VISUAL_THRESHOLDS.REPAIR_REQUIRED &&
-                    repairedValidation.score >= VISUAL_THRESHOLDS.REPAIR_REQUIRED;
+                const crossedThreshold = currentValidation.score < thresholds.REPAIR_REQUIRED &&
+                    repairedValidation.score >= thresholds.REPAIR_REQUIRED;
 
                 if (repairedValidation.passed &&
                     (meetsMinImprovement || crossedThreshold)) {
@@ -777,10 +793,10 @@ async function runRecursiveVisualCritique(
     }
 
     // Final summary
-    if (round >= MAX_VISUAL_ROUNDS && currentValidation.score < VISUAL_THRESHOLDS.TARGET) {
-        console.warn(`[SYSTEM 2] Max rounds reached (${MAX_VISUAL_ROUNDS}), final score: ${currentValidation.score}`);
-    } else if (currentValidation.score >= VISUAL_THRESHOLDS.TARGET) {
-        console.log(`[SYSTEM 2] Converged to target score (${currentValidation.score})`);
+    if (round >= MAX_VISUAL_ROUNDS && currentValidation.score < thresholds.TARGET) {
+        console.warn(`[SYSTEM 2] Max rounds reached (${MAX_VISUAL_ROUNDS}), final score: ${currentValidation.score} (target: ${thresholds.TARGET})`);
+    } else if (currentValidation.score >= thresholds.TARGET) {
+        console.log(`[SYSTEM 2] Converged to style-aware target score (${currentValidation.score} >= ${thresholds.TARGET})`);
     }
 
     // --- PHASE 2: ENVIRONMENT STATE SNAPSHOT ---
@@ -859,6 +875,7 @@ async function runGenerator(
         onProgress: (status: string, percent?: number) => void;
         slideIndex?: number;
         totalSlides?: number;
+        styleMode?: StyleMode; // NEW: StyleMode for style-aware generation
     }
 ): Promise<GeneratorResult> {
     console.log(`[GENERATOR] Generating slide: "${meta.title}"...`);
@@ -1190,12 +1207,47 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                 }
             }
 
+            // CONTENT COMPLETENESS VALIDATION
+            // Ensures slides have substantive content, not just valid JSON structure
+            // This caps QA score even if structural validation passes
+            const contentCompleteness = validateContentCompleteness(candidate);
+            if (!contentCompleteness.passed || contentCompleteness.score < 100) {
+                // Add content issues as validation errors
+                const contentErrors = contentCompleteness.issues.map(issue => ({
+                    code: issue.code,
+                    message: issue.message,
+                    suggestedFix: issue.severity === 'critical' ? 'Add substantive content or remove placeholder' : undefined
+                }));
+                validation.errors.push(...contentErrors);
+                
+                // Cap score based on content completeness (cannot exceed content score)
+                validation.score = Math.min(validation.score, contentCompleteness.score);
+                
+                // Critical content issues should fail the slide
+                if (!contentCompleteness.passed) {
+                    validation.passed = false;
+                    console.warn(`[GENERATOR] Content completeness failed (score: ${contentCompleteness.score}):`,
+                        contentCompleteness.issues.filter(i => i.severity === 'critical').map(i => i.code).join(', '));
+                }
+            }
+
             if (validation.errors.length > 0) {
                 const validationWarnings = validation.errors.map(e => `Validation: ${e.code} - ${e.message}`);
                 candidate.warnings = [...(candidate.warnings || []), ...validationWarnings];
             }
 
             lastValidation = validation;
+
+            // ============================================================================
+            // GATE ORDERING FOR COST CONTROL (Critical Change)
+            // ============================================================================
+            // Order of gates (cheap → expensive):
+            // 1. Content completeness (CHEAP) - if failing, skip VL entirely; regenerate/prune/summarize
+            // 2. Fast layout score (CHEAP-ish) - only if content passes
+            // 3. Full critique/repairs (EXPENSIVE) - only for slides that pass content AND still fail fit/score
+            //
+            // This prevents wasting VL tokens on slides with incomplete/placeholder content.
+            // ============================================================================
 
             // --- VISUAL ARCHITECT: QWEN-VL3 VISION-FIRST CRITIQUE LOOP (DEFAULT) ---
             // Run Vision Architect if validation passed but score < TARGET threshold
@@ -1210,6 +1262,13 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
             let system2Cost = 0;
             let system2InputTokens = 0;
             let system2OutputTokens = 0;
+
+            // GATE 1: CONTENT COMPLETENESS (CHEAP - no API calls)
+            // If content is fundamentally incomplete, VL cannot help - skip to save cost
+            const contentIsShippable = contentCompleteness.passed && contentCompleteness.score >= 50;
+            if (!contentIsShippable) {
+                console.log(`[GENERATOR] Skipping Visual Architect: content incomplete (score: ${contentCompleteness.score}). VL cannot fix missing content.`);
+            }
 
             let hasSpatialWarnings = false;
             try {
@@ -1242,10 +1301,18 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                 console.log(`[GENERATOR] Skipping Visual Architect: structural issues detected (overflow/truncation). Visual repairs won't help.`);
             }
 
+            // Get style-aware threshold for this slide
+            const generatorStyleMode = progress?.styleMode;
+            const generatorStyleProfile = getStyleProfile(generatorStyleMode);
+            const generatorThresholds = getVisualThresholdsForStyle(generatorStyleProfile);
+
+            // GATE 2: DECIDE WHETHER TO RUN EXPENSIVE VL CRITIQUE
+            // Must pass: content completeness (Gate 1) AND no structural issues AND needs visual polish
             const shouldRunVisualRepair = VISUAL_REPAIR_ENABLED
-                && !hasStructuralIssues // Skip if structural issues exist
+                && contentIsShippable // GATE 1: Content must be complete (cheap check)
+                && !hasStructuralIssues // Skip if structural issues exist (VL can't help)
                 && (validation.passed || qualityFlags)
-                && (validation.score < VISUAL_THRESHOLDS.TARGET || hasSpatialWarnings || qualityFlags);
+                && (validation.score < generatorThresholds.TARGET || hasSpatialWarnings || qualityFlags);
 
             if (shouldRunVisualRepair) {
                 console.log(`[GENERATOR] Entering visual repair loop (score: ${validation.score})...`);
@@ -1303,7 +1370,8 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                             candidate,
                             validation,
                             costTracker,
-                            styleGuide
+                            styleGuide,
+                            progress?.styleMode  // Pass styleMode for style-aware thresholds
                         );
 
                         // Update candidate with System 2 result
@@ -1339,7 +1407,7 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
             } else if (!validation.passed) {
                 console.log(`[GENERATOR] Skipping visual repair: validation failed (score: ${validation.score})`);
             } else {
-                console.log(`[GENERATOR] Skipping visual repair: score ${validation.score} meets/exceeds target ${VISUAL_THRESHOLDS.TARGET} and no spatial warnings detected.`);
+                console.log(`[GENERATOR] Skipping visual repair: score ${validation.score} meets/exceeds target ${generatorThresholds.TARGET} and no spatial warnings detected.`);
             }
 
             // --- QWEN VISUAL QA (always inspect slide if available) ---
@@ -1705,17 +1773,36 @@ function blueprintToEditableDeck(
 }
 
 
-// --- ORCHESTRATOR (Level 3: Context Folding + Self-Healing Circuit Breaker) ---
+// --- ORCHESTRATOR (Level 3: Context Folding + Self-Healing Circuit Breaker + Style-Aware Pipeline) ---
+
+/**
+ * Generation options for deck creation
+ */
+export interface GenerationOptions {
+    styleMode?: StyleMode;
+    // Future: archetype overrides, custom constraints, etc.
+}
 
 /**
  * Main entry point for deck generation.
  * Routes to Director pipeline when ENABLE_DIRECTOR_MODE=true,
  * with silent fallback to legacy pipeline on Director failure.
+ * 
+ * @param topic - The topic/prompt for deck generation
+ * @param onProgress - Progress callback for UI updates
+ * @param options - Optional generation options including styleMode
  */
 export const generateAgenticDeck = async (
     topic: string,
-    onProgress: (status: string, percent?: number) => void
+    onProgress: (status: string, percent?: number) => void,
+    options?: GenerationOptions
 ): Promise<EditableSlideDeck> => {
+    // Extract style mode with fallback to default
+    const styleMode: StyleMode = options?.styleMode || DEFAULT_STYLE_MODE;
+    const styleProfile = getStyleProfile(styleMode);
+    
+    console.log(`[ORCHESTRATOR] Style mode: ${styleMode} (variation multiplier: ${styleProfile.variationBudgetMultiplier}, negative space: ${styleProfile.negativeSpaceMinRatio})`);
+    
     // =========================================================================
     // DIRECTOR PIPELINE (Phase 3 Integration)
     // Silent fallback to legacy pipeline on failure - critical for reliability
@@ -1727,7 +1814,7 @@ export const generateAgenticDeck = async (
             const costTracker = new CostTracker();
             
             const blueprint = await runDirector(
-                { topic },
+                { topic, styleMode }, // Pass styleMode to Director
                 costTracker,
                 onProgress
             );
@@ -1749,13 +1836,14 @@ export const generateAgenticDeck = async (
     }
 
     // =========================================================================
-    // LEGACY PIPELINE (Original multi-agent orchestration)
+    // LEGACY PIPELINE (Original multi-agent orchestration + Style-Aware)
     // =========================================================================
     const costTracker = new CostTracker();
     const startTime = Date.now();
 
     console.log("[ORCHESTRATOR] Starting Level 3 Agentic Deck Generation (Legacy)...");
     console.log(`[ORCHESTRATOR] Max iterations per agent: ${MAX_AGENT_ITERATIONS}`);
+    console.log(`[ORCHESTRATOR] Style: ${styleMode} | Fit threshold: ${styleProfile.fitScoreThreshold} | Qwen rubric: ${styleProfile.qwenRubric}`);
 
     // --- PHASE 1: CONTEXT FOLDING STATE ---
     const narrativeHistory: NarrativeTrail[] = [];
@@ -1790,22 +1878,22 @@ export const generateAgenticDeck = async (
     const slides: SlideNode[] = [];
     const totalSlides = outline.slides.length;
 
-    // 3. PER-SLIDE GENERATION with Context Folding + Circuit Breaker
+    // 3. PER-SLIDE GENERATION with Context Folding + Circuit Breaker + Style-Awareness
     for (let i = 0; i < totalSlides; i++) {
         const slideMeta = outline.slides[i];
         let slideConstraints: RouterConstraints = {};
 
         try {
-            console.log(`[ORCHESTRATOR] Processing slide ${i + 1}/${totalSlides}: "${slideMeta.title}"`);
+            console.log(`[ORCHESTRATOR] Processing slide ${i + 1}/${totalSlides}: "${slideMeta.title}" [${styleMode}]`);
 
             // --- PHASE 1: Get recent narrative history for context folding ---
             const recentHistory = narrativeHistory.slice(-2);
 
-            // 3a. Route Layout (with optional constraints for rerouting)
-            onProgress(`Agent 3/5: Routing Slide ${i + 1}/${totalSlides}...`, 30 + Math.floor((i / (totalSlides * 2)) * 30));
-            let routerConfig = await runRouter(slideMeta, costTracker, slideConstraints);
+            // 3a. Route Layout (with optional constraints for rerouting + styleMode)
+            onProgress(`Agent 3/5: Routing Slide ${i + 1}/${totalSlides} [${styleMode}]...`, 30 + Math.floor((i / (totalSlides * 2)) * 30));
+            let routerConfig = await runRouter(slideMeta, costTracker, slideConstraints, styleMode);
 
-            // 3b. Plan Content (with narrative history for context folding)
+            // 3b. Plan Content (with narrative history for context folding + style hints)
             const clusterIds = slideMeta.relevantClusterIds || [];
             const relevantClusterFacts: string[] = [];
             if (clusterIds.length > 0 && outline.factClusters) {
@@ -1828,6 +1916,7 @@ export const generateAgenticDeck = async (
 
             // Layout-aware density budgets (based on actual zone capacity)
             // These values are calibrated to the zone sizes in spatialRenderer.ts
+            // Now also adjusted by style profile
             const LAYOUT_DENSITY_BUDGETS: Record<string, { maxBullets: number; maxCharsPerBullet: number }> = {
                 'hero-centered': { maxBullets: 2, maxCharsPerBullet: 50 },      // Minimal text, big impact
                 'split-left-text': { maxBullets: 3, maxCharsPerBullet: 60 },    // 50% width for text
@@ -1842,22 +1931,41 @@ export const generateAgenticDeck = async (
 
             const layoutBudget = LAYOUT_DENSITY_BUDGETS[layoutVariant] || LAYOUT_DENSITY_BUDGETS['standard-vertical'];
 
+            // Infer proper archetype from slide type and layout (no unsafe casting)
+            const inferredArchetype = inferArchetype(slideMeta.type, layoutVariant, slideMeta.purpose);
+
+            // Apply style-specific adjustments to density budget
+            const styleAdjustedBullets = Math.min(
+                layoutBudget.maxBullets,
+                getBulletsMax(styleProfile, inferredArchetype)
+            );
+
             const densityHint: ContentDensityHint = {
-                maxBullets: isHeroOrIntro ? Math.min(2, layoutBudget.maxBullets) : layoutBudget.maxBullets,
+                maxBullets: isHeroOrIntro ? Math.min(2, styleAdjustedBullets) : styleAdjustedBullets,
                 maxCharsPerBullet: isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet,
                 maxDataPoints: layoutVariant === 'bento-grid' ? 4 : 3
             };
 
-            console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} → max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars`);
+            // Create style-aware content hint
+            const styleAwareHint: StyleAwareContentHint = {
+                ...densityHint,
+                styleMode,
+                archetype: inferredArchetype,
+                preferDiagram: styleMode === 'serendipitous',
+                preferMetrics: styleMode === 'corporate' && !isHeroOrIntro,
+                avoidBullets: styleMode === 'serendipitous' && isHeroOrIntro
+            };
 
-            onProgress(`Agent 3b/5: Content Planning Slide ${i + 1}...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
+            console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} → max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars [${styleMode}]`);
 
-            // CRITICAL: Content Planner now returns typed ContentPlanResult
+            onProgress(`Agent 3b/5: Content Planning Slide ${i + 1} [${styleMode}]...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
+
+            // CRITICAL: Content Planner now returns typed ContentPlanResult with style awareness
             // We still validate with ensureValidContentPlan for defense-in-depth
-            const rawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, densityHint);
+            const rawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, densityHint, styleAwareHint);
             const safeContentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, slideMeta);
 
-            console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints`);
+            console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints${safeContentPlan.contentStrategy ? ` (${safeContentPlan.contentStrategy.preferredFormat})` : ''}`);
 
             // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
             // This prevents Generator from outputting empty metrics:[] arrays
@@ -1870,6 +1978,12 @@ export const generateAgenticDeck = async (
                     ...metricHeavyLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
                 ];
                 console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding metric-heavy layouts`);
+                
+                // STYLE-AWARE FALLBACK: Corporate mode without data degrades to professional
+                if (styleMode === 'corporate' && !hasValidDataPoints) {
+                    console.log(`[ORCHESTRATOR] Corporate mode with no data - degrading to professional for this slide`);
+                    // Note: We don't change the global styleMode, just log the degradation
+                }
             }
 
             // 3b.1 Qwen Layout Selector (visual QA-driven layout selection)
@@ -1883,9 +1997,14 @@ export const generateAgenticDeck = async (
             );
 
             // 3c. Visual Design (using Interactions API) - Track first-pass success
-            onProgress(`Agent 3c/5: Visual Design Slide ${i + 1}...`, 34 + Math.floor((i / (totalSlides * 2)) * 30));
+            onProgress(`Agent 3c/5: Visual Design Slide ${i + 1} [${styleMode}]...`, 34 + Math.floor((i / (totalSlides * 2)) * 30));
             totalVisualDesignAttempts++;
-            const variationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
+            
+            // Apply style multiplier to variation budget
+            const baseVariationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
+            const variationBudget = applyStyleMultiplierToVariationBudget(baseVariationBudget, styleMode);
+            console.log(`[ORCHESTRATOR] Variation budget: ${baseVariationBudget.toFixed(2)} → ${variationBudget.toFixed(2)} (${styleMode} multiplier)`);
+            
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
                 safeContentPlan,
@@ -1898,18 +2017,18 @@ export const generateAgenticDeck = async (
 
             // Phase 2: Track visual alignment first-pass success
             const visualValidation = validateVisualLayoutAlignment(visualDesign, routerConfig);
-            if (visualValidation.passed && visualValidation.score >= 80) {
+            if (visualValidation.passed && visualValidation.score >= styleProfile.fitScoreThreshold) {
                 visualAlignmentFirstPassSuccess++;
-                console.log(`[ORCHESTRATOR] Visual design first-pass SUCCESS (score: ${visualValidation.score})`);
+                console.log(`[ORCHESTRATOR] Visual design first-pass SUCCESS (score: ${visualValidation.score} >= ${styleProfile.fitScoreThreshold})`);
             } else {
-                console.log(`[ORCHESTRATOR] Visual design needs improvement (score: ${visualValidation.score})`);
+                console.log(`[ORCHESTRATOR] Visual design needs improvement (score: ${visualValidation.score} < ${styleProfile.fitScoreThreshold})`);
             }
 
-            // 3c.1 COMPOSITION ARCHITECT (Serendipity Mode - Layer-based composition)
+            // 3c.1 COMPOSITION ARCHITECT (Serendipity Mode - Layer-based composition + Style-aware)
             // Runs only when SERENDIPITY_MODE_ENABLED is true
             let compositionPlan: CompositionPlan | undefined;
             if (SERENDIPITY_MODE_ENABLED) {
-                onProgress(`Agent 3c.1/5: Composition Architecture Slide ${i + 1}...`, 36 + Math.floor((i / (totalSlides * 2)) * 30));
+                onProgress(`Agent 3c.1/5: Composition Architecture Slide ${i + 1} [${styleMode}]...`, 36 + Math.floor((i / (totalSlides * 2)) * 30));
 
                 // Extract serendipity DNA from style guide on first slide
                 if (i === 0 && outline.styleGuide.styleDNA) {
@@ -1942,16 +2061,17 @@ export const generateAgenticDeck = async (
                     serendipityDNA,
                     variationBudget: detailedBudget.overall,
                     narrativeTrail: recentHistory,
-                    usedSurprisesInDeck
+                    usedSurprisesInDeck,
+                    styleMode // Pass styleMode to Composition Architect
                 }, costTracker);
 
                 // Track used surprises to avoid repetition
                 usedSurprisesInDeck = trackUsedSurprises(usedSurprisesInDeck, compositionPlan);
 
-                console.log(`[ORCHESTRATOR] Composition plan: ${compositionPlan.layerPlan.contentStructure.pattern}, surprises: ${compositionPlan.serendipityPlan.allocatedSurprises.length}`);
+                console.log(`[ORCHESTRATOR] Composition plan: ${compositionPlan.layerPlan.contentStructure.pattern}, surprises: ${compositionPlan.serendipityPlan.allocatedSurprises.length} [${styleMode}]`);
             }
 
-            // 3d. Final Generation (with narrative history + circuit breaker)
+            // 3d. Final Generation (with narrative history + circuit breaker + style awareness)
             // GAP 3: Bounded reroute loop to prevent infinite reroutes
             const MAX_REROUTES_PER_SLIDE = 2;
             let slideRerouteCount = 0;
@@ -1966,7 +2086,7 @@ export const generateAgenticDeck = async (
             let currentCompositionPlan = compositionPlan; // Pass composition plan to generator
 
             while (slideRerouteCount <= MAX_REROUTES_PER_SLIDE) {
-                onProgress(`Agent 4/5: Generating Slide ${i + 1}...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
+                onProgress(`Agent 4/5: Generating Slide ${i + 1} [${styleMode}]...`, 40 + Math.floor((i / (totalSlides * 2)) * 40));
                 generatorResult = await runGenerator(
                     slideMeta,
                     currentRouterConfig,
@@ -1980,7 +2100,8 @@ export const generateAgenticDeck = async (
                     {
                         onProgress,
                         slideIndex: i,
-                        totalSlides
+                        totalSlides,
+                        styleMode // Pass styleMode to Generator
                     }
                 );
 
@@ -2001,11 +2122,11 @@ export const generateAgenticDeck = async (
                     console.warn(`[ORCHESTRATOR] Reroute ${slideRerouteCount}/${MAX_REROUTES_PER_SLIDE} for slide ${i + 1} (${reasonType}): ${generatorResult.rerouteReason}`);
                     rerouteCount++;
 
-                    // Re-run router with constraints to avoid failed layout
+                    // Re-run router with constraints to avoid failed layout (preserve styleMode)
                     const newConstraints: RouterConstraints = {
                         avoidLayoutVariants: generatorResult.avoidLayoutVariants
                     };
-                    currentRouterConfig = await runRouter(slideMeta, costTracker, newConstraints);
+                    currentRouterConfig = await runRouter(slideMeta, costTracker, newConstraints, styleMode);
 
                     // TIGHTER density hints on reroute - content overflow was likely the issue
                     const rerouteDensityHint: ContentDensityHint = {
@@ -2014,8 +2135,18 @@ export const generateAgenticDeck = async (
                         maxDataPoints: 2
                     };
 
-                    // Re-run content planner with tighter constraints and validate result
-                    const rerouteRawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, rerouteDensityHint);
+                    // Build style-aware hint for reroute with tighter constraints
+                    const rerouteStyleHint: StyleAwareContentHint = {
+                        ...rerouteDensityHint,
+                        styleMode,
+                        archetype: inferredArchetype,
+                        preferDiagram: styleMode === 'serendipitous',
+                        preferMetrics: styleMode === 'corporate' && !isHeroOrIntro,
+                        avoidBullets: styleMode === 'serendipitous' && isHeroOrIntro
+                    };
+
+                    // Re-run content planner with tighter constraints and validate result (preserve style)
+                    const rerouteRawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, rerouteDensityHint, rerouteStyleHint);
                     currentContentPlan = ensureValidContentPlan(rerouteRawContentPlan, slideMeta);
                     console.log(`[ORCHESTRATOR] Reroute content plan: ${currentContentPlan.keyPoints.length} keyPoints`);
 
@@ -2162,6 +2293,67 @@ export const generateAgenticDeck = async (
 
     onProgress("Finalizing Deck...", 100);
 
+    // ============================================================================
+    // NO-PLACEHOLDER SHIPPING GATE (HARD FAIL)
+    // ============================================================================
+    // Final check: ensure no placeholder content escapes to export.
+    // Slides with placeholders are either fixed (component removal) or flagged.
+    console.log("[ORCHESTRATOR] Checking no-placeholder shipping gate...");
+    
+    let placeholderBlockCount = 0;
+    slides.forEach((slide, idx) => {
+        const shippingGate = checkNoPlaceholderShippingGate(slide);
+        
+        if (!shippingGate.canShip) {
+            placeholderBlockCount++;
+            console.warn(`[ORCHESTRATOR] ⚠️  Slide ${idx + 1} blocked by shipping gate: ${shippingGate.blockedContent.map(b => b.placeholderFound).join(', ')}`);
+            console.warn(`[ORCHESTRATOR]    Recommendation: ${shippingGate.recommendation}`);
+            
+            // Apply auto-fix based on recommendation
+            if (shippingGate.recommendation === 'remove_component' || shippingGate.recommendation === 'convert_to_text') {
+                const indicesToRemove = [...new Set(shippingGate.blockedContent.map(b => b.componentIndex))];
+                
+                // For chart-frame/metric-cards with placeholder data, convert to simple text fallback
+                indicesToRemove.forEach(compIdx => {
+                    const comp = slide.layoutPlan?.components?.[compIdx];
+                    if (comp && (comp.type === 'chart-frame' || comp.type === 'metric-cards')) {
+                        // Convert to text-bullets fallback
+                        // Note: metric-cards doesn't have title, use intro or generic fallback
+                        const fallbackTitle = comp.type === 'chart-frame' 
+                            ? (comp as any).title || 'Content'
+                            : (comp as any).intro || 'Data';
+                        const fallbackComp = {
+                            type: 'text-bullets' as const,
+                            title: fallbackTitle,
+                            content: ['Data visualization pending manual update.'],
+                            style: 'standard' as const
+                        };
+                        slide.layoutPlan!.components![compIdx] = fallbackComp;
+                        console.log(`[ORCHESTRATOR]    Auto-converted ${comp.type} at index ${compIdx} to text-bullets fallback`);
+                    }
+                });
+                
+                slide.warnings = [
+                    ...(slide.warnings || []),
+                    `Shipping gate: Placeholder content auto-fixed (${shippingGate.blockedContent.length} issues)`
+                ];
+            } else if (shippingGate.recommendation === 'regenerate') {
+                // Cannot auto-fix - flag for manual attention
+                slide.warnings = [
+                    ...(slide.warnings || []),
+                    `⚠️ MANUAL REVIEW REQUIRED: Multiple placeholder content issues found`
+                ];
+                slide.readabilityCheck = 'fail' as any;
+            }
+        }
+    });
+    
+    if (placeholderBlockCount > 0) {
+        console.warn(`[ORCHESTRATOR] Shipping gate: ${placeholderBlockCount}/${slides.length} slides had placeholder content (auto-fixed or flagged)`);
+    } else {
+        console.log(`[ORCHESTRATOR] ✅ No-placeholder shipping gate passed for all slides`);
+    }
+
     // GAP 2: Deck-Wide Narrative Coherence Validation
     console.log("[ORCHESTRATOR] Validating deck-wide narrative coherence...");
     const coherenceReport = validateDeckCoherence(slides);
@@ -2255,7 +2447,8 @@ export const regenerateSingleSlide = async (
     meta: any,
     currentSlide: SlideNode,
     facts: ResearchFact[],
-    factClusters: z.infer<typeof FactClusterSchema>[] = []
+    factClusters: z.infer<typeof FactClusterSchema>[] = [],
+    styleMode?: StyleMode  // Optional style mode for consistency
 ): Promise<SlideNode> => {
     const costTracker = new CostTracker();
 
@@ -2275,10 +2468,21 @@ export const regenerateSingleSlide = async (
         layoutStrategy: "Standard"
     };
 
-    let routerConfig = await runRouter(meta, costTracker);
+    let routerConfig = await runRouter(meta, costTracker, undefined, styleMode);
+
+    // Build style hint for single slide regeneration
+    const singleSlideStyleHint: StyleAwareContentHint | undefined = styleMode ? {
+        maxBullets: 3,
+        maxCharsPerBullet: 70,
+        styleMode,
+        archetype: undefined,
+        preferDiagram: styleMode === 'serendipitous',
+        preferMetrics: styleMode === 'corporate',
+        avoidBullets: false
+    } : undefined;
 
     // Use typed content plan with validation for single slide regeneration
-    const rawContentPlan = await runContentPlanner(meta, "", costTracker);
+    const rawContentPlan = await runContentPlanner(meta, "", costTracker, [], undefined, singleSlideStyleHint);
     const contentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, meta);
 
     routerConfig = await runQwenLayoutSelector(

@@ -65,12 +65,36 @@ export const PROMPTS = {
   ROUTER: {
     ROLE: "Lead Visual Designer",
     // Phase 3: Router now accepts constraints for circuit breaker rerouting
-    TASK: (slideMeta: any, constraints?: { avoidLayoutVariants?: string[] }) => `
+    // Phase 4: StyleMode integration for layout filtering
+    TASK: (slideMeta: any, constraints?: { avoidLayoutVariants?: string[]; styleMode?: 'corporate' | 'professional' | 'serendipitous' }) => {
+      // Style-specific layout guidance
+      const STYLE_LAYOUT_HINTS: Record<string, string> = {
+        corporate: `
+          STYLE: CORPORATE (Maximum stability, zero creative risk)
+          PREFERRED LAYOUTS: 'standard-vertical', 'hero-centered', 'split-left-text', 'split-right-text'
+          AVOID LAYOUTS: 'asymmetric-grid', 'timeline-horizontal' (too dynamic)
+          PRINCIPLES: Grid alignment over creative flourish. Predictability is a feature.`,
+        professional: `
+          STYLE: PROFESSIONAL (Balanced readability + visual interest)
+          ALL LAYOUTS AVAILABLE - choose based on content fit
+          PRINCIPLES: Prioritize clarity but moderate asymmetry is welcome.`,
+        serendipitous: `
+          STYLE: CREATIVE/SERENDIPITOUS (Bold, memorable, avoid template-y)
+          PREFERRED LAYOUTS: 'hero-centered', 'asymmetric-grid', 'bento-grid', 'split-left-text'
+          AVOID LAYOUTS: 'standard-vertical' (too safe), 'metrics-rail' (too corporate)
+          PRINCIPLES: Visual drama over safety. Be bold, not generic.`
+      };
+      
+      const styleHint = constraints?.styleMode ? STYLE_LAYOUT_HINTS[constraints.styleMode] : '';
+      
+      return `
       Assign a specific layout structure to: "${slideMeta.title}" - ${slideMeta.purpose}
       LAYOUT VARIANTS: 'standard-vertical', 'split-left-text', 'split-right-text', 'hero-centered', 'bento-grid', 'timeline-horizontal', 'dashboard-tiles', 'metrics-rail', 'asymmetric-grid'.
       ${constraints?.avoidLayoutVariants?.length ? `AVOID THESE LAYOUTS (they failed validation): ${constraints.avoidLayoutVariants.join(', ')}` : ''}
+      ${styleHint}
       DECISION: 1. Intro/Conclusion -> 'hero-centered'. 2. Comparison -> 'split-*' or 'metrics-rail'. 3. Multi-item -> 'bento-grid' or 'dashboard-tiles'. 4. Asymmetric storytelling -> 'asymmetric-grid'.
-    `,
+    `;
+    },
     OUTPUT_SCHEMA: "JSON RouterDecision"
   },
 
@@ -79,11 +103,37 @@ export const PROMPTS = {
     ROLE: "Senior Editor",
     // Phase 1: Content Planner now receives recentHistory for narrative arc awareness
     // Phase 2: Added density constraints to prevent overflow
-    TASK: (title: string, purpose: string, facts: string, recentHistory?: Array<{ title: string, mainPoint: string }>, densityHint?: { maxBullets?: number; maxCharsPerBullet?: number }) => `
+    // Phase 4: StyleMode integration for content density guidance
+    TASK: (title: string, purpose: string, facts: string, recentHistory?: Array<{ title: string, mainPoint: string }>, densityHint?: { maxBullets?: number; maxCharsPerBullet?: number; styleMode?: 'corporate' | 'professional' | 'serendipitous' }) => {
+      // Style-specific content guidance
+      const STYLE_CONTENT_HINTS: Record<string, string> = {
+        corporate: `
+          STYLE: CORPORATE
+          - Be CONCISE and PRECISE - executives don't read paragraphs
+          - Prefer data-backed claims over descriptive text
+          - Each bullet point should be a single, standalone statement
+          - If you have metrics, lead with them`,
+        professional: `
+          STYLE: PROFESSIONAL
+          - Balance data with context
+          - Clear, readable bullets with moderate detail
+          - Include necessary explanation but stay focused`,
+        serendipitous: `
+          STYLE: CREATIVE
+          - Less is more - negative space is your friend
+          - One powerful statement > five medium ones
+          - Think "headline + supporting insight" not "comprehensive coverage"
+          - Bold claims welcome if backed by facts`
+      };
+      
+      const styleHint = densityHint?.styleMode ? STYLE_CONTENT_HINTS[densityHint.styleMode] : '';
+      
+      return `
         TASK: Draft the core semantic content for slide "${title}".
         PURPOSE: ${purpose}
         ${recentHistory?.length ? `NARRATIVE SO FAR: ${recentHistory.map(h => h.title + ': ' + h.mainPoint).join('; ')}` : ''}
         FACTS: ${facts}
+        ${styleHint}
         
         CONSTRAINTS:
         - Extract ONLY the key facts needed.
@@ -93,7 +143,8 @@ export const PROMPTS = {
         - NO VISUALS. NO LAYOUT. TEXT ONLY.
         - Build on the narrative so far - avoid repeating what was already covered.
         - BREVITY IS KEY: Slides have limited space. Prioritize impact over completeness.
-      `
+      `;
+    }
   },
 
   // --- VISUAL COMPOSER AGENT (Background Aesthetics Only) ---

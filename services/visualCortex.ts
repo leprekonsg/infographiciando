@@ -92,7 +92,14 @@ import {
     getQwenRequestConfig,
     parseQwenResponse,
     getThinkingMode,
-    COORDINATE_SYSTEM
+    COORDINATE_SYSTEM,
+    // Style-aware rubric functions
+    QwenStyleMode,
+    getStyleRubric,
+    buildStyleAwareCritiquePrompt,
+    buildStyleAwareRepairPrompt,
+    passesStyleQualityGate,
+    getStyleAwareThinkingMode
 } from './visual/qwenPromptConfig';
 
 // Qwen-VL Model Configuration
@@ -610,6 +617,279 @@ export async function getVisualCritiqueFromQwen(
     return getVisualCritiqueFromImage(slideImageBase64, slideWidth, slideHeight, costTracker);
 }
 
+// ============================================================================
+// STYLE-AWARE VISUAL CRITIQUE (StyleMode Integration)
+// ============================================================================
+
+/**
+ * Extended critique result with style-specific evaluation
+ */
+export interface StyleAwareCritiqueResult extends VisualCritiqueResult {
+    /** The style mode used for evaluation */
+    styleMode: QwenStyleMode;
+    /** Whether the slide passes the style-specific quality gate */
+    passesStyleGate: boolean;
+    /** Style-specific score adjustments */
+    styleAdjustments?: {
+        reason: string;
+        adjustment: number;
+    }[];
+}
+
+/**
+ * Get style-aware visual critique from SVG proxy
+ * 
+ * This extends the standard critique with style-specific rubrics:
+ * - Corporate: Strict grid alignment, WCAG AAA contrast, zero tolerance for chaos
+ * - Professional: Balanced readability + visual interest, WCAG AA
+ * - Serendipitous: Impact-focused, boldness rewarded, template-y penalized
+ * 
+ * @param svgString - SVG markup from generateSvgProxy()
+ * @param styleMode - The style mode to evaluate against
+ * @param costTracker - Optional cost tracker
+ * @returns Style-aware critique result with quality gate status
+ */
+export async function getStyleAwareCritiqueFromSvg(
+    svgString: string,
+    styleMode: QwenStyleMode = 'professional',
+    costTracker?: CostTracker
+): Promise<(StyleAwareCritiqueResult & { renderFidelity: RenderFidelity }) | null> {
+    const sanitizeSvg = (input: string) =>
+        input.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[a-fA-F0-9]+;)/g, '&amp;');
+
+    const safeSvg = sanitizeSvg(svgString);
+
+    if (!qwenVLClient.isAvailable()) {
+        if (!QWEN_VL_PROXY_URL) {
+            console.warn('[QWEN-VL] Skipping style-aware critique - API not configured');
+            return null;
+        }
+    }
+
+    // Browser path: use proxy with style mode
+    if (typeof window !== 'undefined') {
+        if (!QWEN_VL_PROXY_URL) {
+            console.warn('[QWEN-VL] Skipping style critique in browser (requires proxy).');
+            return null;
+        }
+
+        try {
+            console.log(`[QWEN-VL] Style-aware proxy path: SVG → Qwen-VL (mode: ${styleMode})`);
+            const critique = await callQwenProxy<VisualCritiqueResult>(
+                '/api/qwen/critique',
+                { svgString: safeSvg, slideWidth: 1920, slideHeight: 1080, styleMode },
+                costTracker
+            );
+
+            const hasCritical = critique.issues?.some(i => i.severity === 'critical') ?? false;
+            const passesGate = passesStyleQualityGate(critique.overall_score, styleMode, hasCritical);
+
+            return {
+                ...critique,
+                styleMode,
+                passesStyleGate: passesGate,
+                renderFidelity: 'svg-proxy' as RenderFidelity
+            };
+        } catch (error: any) {
+            console.error('[QWEN-VL] Style-aware proxy critique failed:', error.message);
+            markQwenProxyFailure(error.message);
+            return null;
+        }
+    }
+
+    // Node path: use style-aware prompt
+    try {
+        console.log(`[QWEN-VL] Style-aware fast path: SVG → PNG → Qwen-VL (mode: ${styleMode})`);
+        const svgRasterizeStart = Date.now();
+
+        // Step 1: Rasterize SVG to PNG
+        const pngBase64 = await svgToPngBase64(safeSvg, 1920, 1080);
+        const svgRasterizeDuration = Date.now() - svgRasterizeStart;
+        console.log(`[QWEN-VL] SVG rasterization complete in ${svgRasterizeDuration}ms`);
+
+        // Step 2: Build style-aware prompt
+        const styleAwarePrompt = buildStyleAwareCritiquePrompt(styleMode);
+        const thinkingMode = getStyleAwareThinkingMode(styleMode, 'critique');
+
+        // Use appropriate persona based on style
+        const persona = styleMode === 'serendipitous' 
+            ? QWEN_PERSONAS.ART_DIRECTOR  // Aesthetic focus for serendipitous
+            : QWEN_PERSONAS.VISUAL_ARCHITECT;  // Spatial focus for corporate/professional
+
+        const messages = buildQwenMessage(
+            persona,
+            `${thinkingMode}\n\n${styleAwarePrompt}`,
+            pngBase64
+        );
+
+        const requestConfig = getQwenRequestConfig('critique');
+
+        // Step 3: Call Qwen-VL with style-aware prompt
+        const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${qwenVLClient['apiKey']}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ...requestConfig,
+                messages
+            })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Qwen-VL API error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+
+        // Track costs
+        if (costTracker && data.usage) {
+            const inputTokens = data.usage.prompt_tokens || 0;
+            const outputTokens = data.usage.completion_tokens || 0;
+            costTracker.addQwenVLCost(inputTokens, outputTokens);
+
+            const duration = Date.now() - svgRasterizeStart;
+            console.log(`[QWEN-VL] Style-aware critique complete in ${duration}ms (mode: ${styleMode}, tokens: ${inputTokens}/${outputTokens})`);
+        }
+
+        const responseText = data.choices?.[0]?.message?.content || '';
+
+        // Parse and normalize response
+        const parsed = qwenVLClient['parseJsonResponse'](responseText);
+        const normalized = parseQwenResponse(parsed) as VisualCritiqueResult;
+
+        // Evaluate against style-specific quality gate
+        const hasCritical = normalized.issues?.some(i => i.severity === 'critical') ?? false;
+        const passesGate = passesStyleQualityGate(normalized.overall_score, styleMode, hasCritical);
+
+        console.log(`[QWEN-VL] Style critique result: score=${normalized.overall_score}, mode=${styleMode}, passes_gate=${passesGate}, verdict=${normalized.overall_verdict}`);
+
+        return {
+            ...normalized,
+            styleMode,
+            passesStyleGate: passesGate,
+            renderFidelity: 'svg-proxy' as RenderFidelity
+        };
+    } catch (error: any) {
+        console.error('[QWEN-VL] Style-aware SVG critique failed:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Get style-aware repair instructions
+ * 
+ * Uses style-specific repair priorities:
+ * - Corporate: Grid alignment first, truncation never allowed
+ * - Professional: Balance readability fixes with visual interest
+ * - Serendipitous: Preserve drama, avoid "normalizing" bold choices
+ * 
+ * @param svgString - SVG markup
+ * @param styleMode - Style mode for repair prioritization
+ * @param currentComponents - Current component list for ID mapping
+ * @param costTracker - Optional cost tracker
+ */
+export async function getStyleAwareRepairsFromSvg(
+    svgString: string,
+    styleMode: QwenStyleMode = 'professional',
+    currentComponents: any[] = [],
+    costTracker?: CostTracker
+): Promise<any | null> {
+    const sanitizeSvg = (input: string) =>
+        input.replace(/&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#x[a-fA-F0-9]+;)/g, '&amp;');
+
+    const safeSvg = sanitizeSvg(svgString);
+
+    if (!qwenVLClient.isAvailable() && !QWEN_VL_PROXY_URL) {
+        console.warn('[QWEN-VL] Skipping style-aware repairs - API not configured');
+        return null;
+    }
+
+    const isBrowser = typeof window !== 'undefined';
+
+    if (isBrowser && QWEN_VL_PROXY_URL) {
+        try {
+            console.log(`[QWEN-VL] Style-aware repair via proxy (mode: ${styleMode})`);
+            return await callQwenProxy(
+                '/api/qwen/repair',
+                { svgString: safeSvg, styleMode, components: currentComponents },
+                costTracker
+            );
+        } catch (error: any) {
+            console.error('[QWEN-VL] Style-aware proxy repair failed:', error.message);
+            markQwenProxyFailure(error.message);
+            return null;
+        }
+    }
+
+    if (isBrowser) {
+        console.warn('[QWEN-VL] Style-aware repairs unavailable in browser without proxy');
+        return null;
+    }
+
+    // Node path
+    try {
+        console.log(`[QWEN-VL] Style-aware repair: SVG → PNG → Qwen-VL (mode: ${styleMode})`);
+
+        const pngBase64 = await svgToPngBase64(safeSvg, 1920, 1080);
+        const styleAwareRepairPrompt = buildStyleAwareRepairPrompt(styleMode);
+        const thinkingMode = getStyleAwareThinkingMode(styleMode, 'repair');
+
+        const componentManifest = currentComponents
+            .map((c, i) => `${c.type}-${i}`)
+            .join(', ');
+
+        const messages = buildQwenMessage(
+            QWEN_PERSONAS.REPAIR_SURGEON,
+            `${thinkingMode}\n\nAVAILABLE COMPONENTS: ${componentManifest || 'none'}\n\n${styleAwareRepairPrompt}`,
+            pngBase64
+        );
+
+        const requestConfig = getQwenRequestConfig('repair');
+
+        const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${qwenVLClient['apiKey']}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ...requestConfig,
+                messages
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`Qwen-VL API error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (costTracker && data.usage) {
+            costTracker.addQwenVLCost(
+                data.usage.prompt_tokens || 0,
+                data.usage.completion_tokens || 0
+            );
+        }
+
+        const responseText = data.choices?.[0]?.message?.content || '';
+        const parsed = qwenVLClient['parseJsonResponse'](responseText);
+        const normalized = parseQwenResponse(parsed);
+
+        console.log(`[QWEN-VL] Style-aware repair result: score=${normalized.overall_score}, repairs=${normalized.repairs?.length || 0}, mode=${styleMode}`);
+
+        return {
+            ...normalized,
+            styleMode
+        };
+    } catch (error: any) {
+        console.error('[QWEN-VL] Style-aware repair failed:', error.message);
+        return null;
+    }
+}
+
 /**
  * Check if Qwen-VL visual cortex is available
  */
@@ -877,7 +1157,7 @@ function normalizeRepair(repair: RepairAction): RepairAction {
     // Apply sensible defaults for common repair types if still missing
     if (action === 'adjust_spacing') {
         if (mergedParams.lineHeight === undefined) {
-            mergedParams.lineHeight = 1.6; // Safe default
+            mergedParams.lineHeight = 1.45; // Safe default within max bound (1.5)
         }
     }
     
@@ -917,13 +1197,14 @@ import type {
 } from '../types/slideTypes';
 
 /**
- * Parse component ID from various formats Qwen-VL might generate.
- * Handles:
- * - "text-bullets-0" → { type: "text-bullets", index: 0 }
- * - "text-title-0" → { type: "text-title", index: 0, isTitle: true }
- * - "shape-card-0" → { type: "shape-card", index: 0 }
- * - "heading-0", "title-0" → { type: "title", index: 0, isTitle: true }
- * - "divider-0", "line-decorative-0" → { type: "divider", index: 0, isDivider: true }
+ * Parse component ID from Qwen-VL output.
+ * 
+ * STANDARDIZED FORMAT: "{component-type}-{index}" e.g., "text-bullets-0", "metric-cards-1"
+ * The index directly maps to layoutPlan.components[index].
+ * 
+ * Special IDs:
+ * - "title" → isTitle: true (slide title, not a numbered component)
+ * - "divider" → isDivider: true (accent bar, not a numbered component)
  */
 function parseComponentId(componentId: string): {
     type: string;
@@ -932,29 +1213,37 @@ function parseComponentId(componentId: string): {
     isDivider: boolean;
     isLine: boolean;
 } {
-    const parts = componentId.split('-');
+    const normalized = componentId.toLowerCase().trim();
+    
+    // Handle special non-indexed IDs first
+    if (normalized === 'title' || normalized === 'heading') {
+        return { type: 'title', index: -1, isTitle: true, isDivider: false, isLine: false };
+    }
+    if (normalized === 'divider' || normalized === 'accent-bar' || normalized === 'line') {
+        return { type: 'divider', index: -1, isTitle: false, isDivider: true, isLine: true };
+    }
+    
+    // Standard format: "{type}-{index}" e.g., "text-bullets-0"
+    const parts = normalized.split('-');
     const indexStr = parts[parts.length - 1];
-    const index = /^\d+$/.test(indexStr) ? parseInt(indexStr) : 0;
-    const typeWithoutIndex = /^\d+$/.test(indexStr) 
-        ? parts.slice(0, -1).join('-') 
-        : componentId;
+    const hasNumericIndex = /^\d+$/.test(indexStr);
     
-    // Normalize common variations
-    const normalized = typeWithoutIndex.toLowerCase();
+    const index = hasNumericIndex ? parseInt(indexStr) : 0;
+    const type = hasNumericIndex ? parts.slice(0, -1).join('-') : normalized;
     
-    const isTitle = ['title', 'heading', 'text-title', 'section-header'].includes(normalized);
-    const isDivider = ['divider', 'line-decorative', 'underline', 'accent-bar'].includes(normalized);
-    const isLine = isDivider || normalized.includes('line');
+    // Legacy ID patterns that map to title/divider
+    const isTitle = ['text-title', 'section-header'].includes(type);
+    const isDivider = ['line-decorative', 'underline'].includes(type);
+    const isLine = isDivider || type.includes('line');
     
-    return { type: normalized, index, isTitle, isDivider, isLine };
+    return { type, index, isTitle, isDivider, isLine };
 }
 
 /**
- * Find component by flexible matching.
- * Tries:
- * 1. Exact index match for matching type
- * 2. Type-only match (first component of that type)
- * 3. Fuzzy match (partial type name)
+ * Find component by direct index lookup.
+ * 
+ * With standardized IDs, the index in "text-bullets-0" directly maps to components[0].
+ * Only falls back to type matching if direct lookup fails (legacy compatibility).
  */
 function findComponentByFlexibleMatch(
     components: any[],
@@ -964,10 +1253,27 @@ function findComponentByFlexibleMatch(
     
     const { type, index } = parsedId;
     
-    // Map SVG element types to component types
+    // STRATEGY 1: Direct index lookup (preferred - new standardized IDs)
+    // The index in "text-bullets-0" directly maps to components[0]
+    if (index >= 0 && index < components.length) {
+        const component = components[index];
+        const componentType = component.type?.toLowerCase() || '';
+        
+        // Verify type matches (sanity check)
+        if (componentType === type) {
+            return { component, actualIndex: index };
+        }
+        
+        // Type mismatch warning but still use direct index (it's authoritative)
+        console.warn(`[REPAIR] Component type mismatch: expected ${type} at index ${index}, found ${componentType}. Using direct index.`);
+        return { component, actualIndex: index };
+    }
+    
+    // STRATEGY 2: Fallback to type-based search (legacy compatibility)
+    // For old-style IDs like "text-title-0" that don't map to component indices
     const typeMapping: Record<string, string[]> = {
         'text-bullets': ['text-bullets'],
-        'text-title': ['text-bullets'], // Title text often rendered from text-bullets
+        'text-title': ['text-bullets'], // Title text rendered from text-bullets
         'shape-card': ['metric-cards', 'icon-grid', 'chart-frame'],
         'metric-cards': ['metric-cards'],
         'process-flow': ['process-flow'],
@@ -976,39 +1282,18 @@ function findComponentByFlexibleMatch(
         'diagram-svg': ['diagram-svg'],
     };
     
-    // Get potential component types this ID could refer to
     const potentialTypes = typeMapping[type] || [type];
     
-    // Strategy 1: Find component of matching type at the specified index
-    let typeMatchCount = 0;
+    // Find first component of matching type
     for (let i = 0; i < components.length; i++) {
         const cType = components[i].type?.toLowerCase() || '';
-        if (potentialTypes.some(pt => cType === pt || cType.includes(pt.split('-')[0]))) {
-            if (typeMatchCount === index) {
-                return { component: components[i], actualIndex: i };
-            }
-            typeMatchCount++;
+        if (potentialTypes.some(pt => cType === pt)) {
+            console.warn(`[REPAIR] Using fallback type match for ${type}-${index} → component ${i} (${cType})`);
+            return { component: components[i], actualIndex: i };
         }
     }
     
-    // Strategy 2: If index was 0 and we found no match, try first of any matching type
-    if (index === 0 && typeMatchCount === 0) {
-        for (let i = 0; i < components.length; i++) {
-            const cType = components[i].type?.toLowerCase() || '';
-            // Fuzzy match: check if component type contains any part of our target type
-            const typeWords = type.split('-').filter(w => w.length > 2);
-            if (typeWords.some(w => cType.includes(w))) {
-                return { component: components[i], actualIndex: i };
-            }
-        }
-    }
-    
-    // Strategy 3: Fall back to direct index if within bounds
-    if (index >= 0 && index < components.length) {
-        console.log(`[REPAIR] Using fallback index match for ${type}-${index}`);
-        return { component: components[index], actualIndex: index };
-    }
-    
+    console.warn(`[REPAIR] No component found for ${type}-${index}`);
     return null;
 }
 
@@ -1016,8 +1301,7 @@ function findComponentByFlexibleMatch(
  * Apply structured repairs to a slide
  * Modifies component positions, sizes, colors based on Qwen-VL repair instructions
  * 
- * IMPROVED: Better component ID parsing and flexible matching to handle
- * the mismatch between SVG element IDs and actual component indices.
+ * IMPROVED: Direct index lookup now that SVG IDs match component indices.
  * 
  * NOTE: Some repairs (reposition, adjust_spacing) add hints to the component that
  * the spatial renderer can use during layout. These don't directly change positions
@@ -1120,15 +1404,36 @@ function applyRepairsToSlide(
                 const requestedLineHeight = params?.lineHeight;
                 
                 // SAFETY: Never increase line height above 1.5 (causes overflow)
-                // Qwen-VL often suggests 1.6-1.8 which breaks tight layouts
+                // If Qwen-VL requests > 1.5, that's a signal that content reduction is needed
+                // Prefer simplify_content or resize over silent clamping
                 if (requestedLineHeight && requestedLineHeight > 1.5) {
-                    console.warn(`[REPAIR] Blocking line-height increase to ${requestedLineHeight} (max: 1.5) for ${component_id}`);
-                    // Cap at 1.5 instead of requested value
-                    if (requestedLineHeight > currentLineHeight) {
-                        (component as any)._hintLineHeight = Math.min(1.5, requestedLineHeight);
+                    console.warn(`[REPAIR] lineHeight ${requestedLineHeight} > max 1.5 for ${component_id}. Triggering content simplification.`);
+                    
+                    // Instead of clamping, reduce content if possible
+                    const hasReducibleContent = 
+                        (component.type === 'text-bullets' && Array.isArray((component as any).content) && (component as any).content.length > 2) ||
+                        (component.type === 'metric-cards' && Array.isArray((component as any).metrics) && (component as any).metrics.length > 2) ||
+                        (component.type === 'process-flow' && Array.isArray((component as any).steps) && (component as any).steps.length > 3);
+                    
+                    if (hasReducibleContent) {
+                        // Remove 1 item to make room instead of forcing tight spacing
+                        if (component.type === 'text-bullets') {
+                            (component as any).content = (component as any).content.slice(0, -1);
+                        } else if (component.type === 'metric-cards') {
+                            (component as any).metrics = (component as any).metrics.slice(0, -1);
+                        } else if (component.type === 'process-flow') {
+                            (component as any).steps = (component as any).steps.slice(0, -1);
+                        }
+                        console.log(`[REPAIR] Simplified content for ${component_id} (removed 1 item) instead of excessive line-height`);
+                        // Now we can use a comfortable 1.45 line-height
+                        (component as any)._hintLineHeight = 1.45;
+                    } else {
+                        // Component can't be reduced further, clamp to max but log warning
+                        (component as any)._hintLineHeight = 1.5;
+                        console.warn(`[REPAIR] Clamped lineHeight to 1.5 (content cannot be reduced further)`);
                     }
                 } else if (params?.lineHeight !== undefined) {
-                    (component as any)._hintLineHeight = params.lineHeight;
+                    (component as any)._hintLineHeight = Math.min(params.lineHeight, 1.5); // Always enforce max
                 }
                 
                 console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params?.padding}, lineHeight=${(component as any)._hintLineHeight || params?.lineHeight} (${reason})`);
@@ -1182,9 +1487,57 @@ function applyRepairsToSlide(
     return updatedSlide;
 }
 
+// ============================================================================
+// PER-SLIDE BUDGET ABORT CONFIGURATION
+// ============================================================================
+// Prevents runaway VL costs on problematic slides
+const SLIDE_BUDGET_LIMITS = {
+    maxTimeMs: 15_000,         // 15 seconds max per slide
+    maxCostDollars: 0.05,      // $0.05 max per slide (roughly 25K tokens at VL rates)
+    maxStagnantRounds: 2       // If same issue persists 2 rounds, abort
+};
+
+interface BudgetCheckResult {
+    exceeded: boolean;
+    reason?: 'time' | 'cost' | 'stagnation' | 'none';
+    recommendation?: 'reroute_layout' | 'simplify_content' | 'accept_as_is';
+}
+
+/**
+ * Track issue categories across rounds to detect stagnation
+ */
+function detectStagnation(repairs: RepairAction[][], currentRepairs: RepairAction[]): boolean {
+    if (repairs.length < 2) return false;
+    
+    // Get issue categories from last 2 rounds plus current
+    const getCategories = (r: RepairAction[]) => new Set(r.map(rep => rep.action));
+    
+    const prev = repairs[repairs.length - 1] || [];
+    const prevPrev = repairs[repairs.length - 2] || [];
+    
+    const currCategories = getCategories(currentRepairs);
+    const prevCategories = getCategories(prev);
+    const prevPrevCategories = getCategories(prevPrev);
+    
+    // Check if same issue categories persist across 3 consecutive rounds
+    for (const category of currCategories) {
+        if (prevCategories.has(category) && prevPrevCategories.has(category)) {
+            console.warn(`[BUDGET ABORT] Stagnation detected: "${category}" persists for 3+ rounds`);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
 /**
  * Run Qwen-VL3 Visual Architect iterative loop
  * Generates SVG proxy, critiques with Qwen-VL, applies repairs, repeats until convergence
+ * 
+ * NEW: Per-slide budget aborts to prevent runaway costs:
+ * - Time limit: 15s per slide
+ * - Cost limit: $0.05 per slide
+ * - Stagnation detection: same issue 2+ rounds → abort and reroute/simplify
  */
 export async function runQwenVisualArchitectLoop(
     slide: SlideNode,
@@ -1195,6 +1548,7 @@ export async function runQwenVisualArchitectLoop(
 ): Promise<VisualArchitectResult> {
     console.log('✨ [VISUAL ARCHITECT] Starting vision-first critique loop');
 
+    const startTime = Date.now();
     const isBrowser = typeof window !== 'undefined';
     if (isBrowser && !QWEN_VL_PROXY_URL) {
         console.warn('[VISUAL ARCHITECT] Skipping Qwen-VL loop in browser (requires QWEN_VL_PROXY_URL).');
@@ -1215,10 +1569,20 @@ export async function runQwenVisualArchitectLoop(
 
     let currentSlide = slide;
     let allRepairs: RepairAction[] = [];
+    let repairHistory: RepairAction[][] = []; // Track repairs per round for stagnation detection
     let previousScore = 0;
+    let previousSvgHash = ''; // Track SVG hash to detect ineffective repairs
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalCost = 0;
+
+    // Simple hash function for SVG content comparison
+    const hashSvg = (svg: string): string => {
+        // Extract key positioning data from SVG for comparison
+        // This focuses on element positions rather than styling
+        const positions = svg.match(/(x|y|width|height)="[\d.]+"/g) || [];
+        return positions.join('|');
+    };
 
     const preSummary = costTracker.getSummary();
     const preQwen = preSummary.qwenVL || { cost: 0, inputTokens: 0, outputTokens: 0, calls: 0 };
@@ -1226,11 +1590,66 @@ export async function runQwenVisualArchitectLoop(
     for (let round = 1; round <= maxRounds; round++) {
         console.log(`\n[VISUAL ARCHITECT] Round ${round}/${maxRounds}`);
 
+        // ============================================================================
+        // PER-SLIDE BUDGET ABORT CHECKS
+        // ============================================================================
+        const elapsedMs = Date.now() - startTime;
+        
+        // Check time budget
+        if (elapsedMs > SLIDE_BUDGET_LIMITS.maxTimeMs) {
+            console.warn(`[VISUAL ARCHITECT] ⏱️  TIME BUDGET EXCEEDED (${Math.round(elapsedMs / 1000)}s > ${SLIDE_BUDGET_LIMITS.maxTimeMs / 1000}s). Aborting.`);
+            return {
+                slide: currentSlide,
+                rounds: round - 1,
+                finalScore: previousScore,
+                repairs: allRepairs,
+                converged: false,
+                totalCost,
+                totalInputTokens,
+                totalOutputTokens,
+                warning: `Budget abort: time exceeded (${Math.round(elapsedMs / 1000)}s)`
+            };
+        }
+        
+        // Check cost budget
+        if (totalCost > SLIDE_BUDGET_LIMITS.maxCostDollars) {
+            console.warn(`[VISUAL ARCHITECT] 💰 COST BUDGET EXCEEDED ($${totalCost.toFixed(4)} > $${SLIDE_BUDGET_LIMITS.maxCostDollars}). Aborting.`);
+            return {
+                slide: currentSlide,
+                rounds: round - 1,
+                finalScore: previousScore,
+                repairs: allRepairs,
+                converged: false,
+                totalCost,
+                totalInputTokens,
+                totalOutputTokens,
+                warning: `Budget abort: cost exceeded ($${totalCost.toFixed(4)})`
+            };
+        }
+
         try {
             // Step 1: Generate SVG proxy from current slide state
             console.log('[VISUAL ARCHITECT] Generating SVG proxy...');
             const { generateSvgProxy } = await import('./visual/svgProxy');
             const svgString = await generateSvgProxy(currentSlide, styleGuide);
+
+            // RENDER-DIFF GATE: Check if SVG changed from previous round
+            const currentSvgHash = hashSvg(svgString);
+            if (round > 1 && currentSvgHash === previousSvgHash) {
+                console.warn(`[VISUAL ARCHITECT] Repairs had no visual effect - renderer likely ignored hints. Exiting.`);
+                return {
+                    slide: currentSlide,
+                    rounds: round,
+                    finalScore: previousScore,
+                    repairs: allRepairs,
+                    converged: false,
+                    totalCost,
+                    totalInputTokens,
+                    totalOutputTokens,
+                    warning: 'Repairs ineffective - hints ignored by renderer'
+                };
+            }
+            previousSvgHash = currentSvgHash;
 
             const components = currentSlide.layoutPlan?.components || [];
 
@@ -1275,6 +1694,25 @@ export async function runQwenVisualArchitectLoop(
             const repairs = normalizeRepairs(rawRepairs);
 
             console.log(`[VISUAL ARCHITECT] Score: ${currentScore}/100, Verdict: ${verdict}, Repairs: ${repairs.length}`);
+
+            // STAGNATION DETECTION: If same issue categories persist, abort
+            if (detectStagnation(repairHistory, repairs)) {
+                console.warn(`[VISUAL ARCHITECT] 🔄 STAGNATION DETECTED: Same issues persist. Recommending layout reroute or content simplification.`);
+                return {
+                    slide: currentSlide,
+                    rounds: round,
+                    finalScore: currentScore,
+                    repairs: allRepairs,
+                    converged: false,
+                    totalCost,
+                    totalInputTokens,
+                    totalOutputTokens,
+                    warning: 'Budget abort: stagnation - same issues persist across rounds'
+                };
+            }
+            
+            // Track repairs for stagnation detection
+            repairHistory.push(repairs);
 
             // Check convergence conditions
             if (verdict === 'accept' || currentScore >= TARGET_SCORE) {

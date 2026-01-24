@@ -972,6 +972,7 @@ export interface DirectorOptions {
     topic: string;
     slideCount?: number;
     stylePreference?: 'corporate' | 'creative' | 'minimal' | 'data-heavy';
+    styleMode?: 'corporate' | 'professional' | 'serendipitous'; // NEW: StyleMode from slideTypes
     config?: Partial<DirectorConfig>;  // Allow override of defaults
 }
 
@@ -1024,7 +1025,7 @@ export async function runDirector(
     costTracker: CostTracker,
     onProgress?: (status: string, percent?: number) => void
 ): Promise<DeckBlueprint> {
-    const { topic, slideCount } = options;
+    const { topic, slideCount, styleMode } = options;  // Extract styleMode
     const config = resolveConfig(options.config);  // Use mode presets
     
     // Initialize timing tracker
@@ -1150,7 +1151,7 @@ export async function runDirector(
             // -----------------------------------------------------------------
             let routerDecision;
             try {
-                routerDecision = await runRouter(slideMeta, costTracker);
+                routerDecision = await runRouter(slideMeta, costTracker, undefined, styleMode);
             } catch (routeErr: any) {
                 console.warn(`[DIRECTOR] Router failed for slide ${i + 1}:`, routeErr.message);
                 routerDecision = { layoutVariant: 'standard-vertical' };
@@ -1170,6 +1171,17 @@ export async function runDirector(
             let qualityResult: ContentQualityResult = { passes: false };
             const profile = getLayoutQualityProfile(layoutId);
 
+            // Build style-aware content hint for content planner
+            const styleAwareHint = styleMode ? {
+                maxBullets: constraints.maxBullets,
+                maxCharsPerBullet: constraints.maxCharsPerBullet,
+                styleMode,
+                archetype: undefined, // Director doesn't have archetype inference yet
+                preferDiagram: styleMode === 'serendipitous',
+                preferMetrics: styleMode === 'corporate' && !isHeroSlide,
+                avoidBullets: styleMode === 'serendipitous' && isHeroSlide
+            } : undefined;
+
             // BIDIRECTIONAL LOOP: Keep adjusting until quality passes or limits hit
             let totalAttempts = 0;
             const MAX_TOTAL_ATTEMPTS = 4; // Safety valve
@@ -1185,7 +1197,8 @@ export async function runDirector(
                             factsToContext(facts, slideMeta),
                             costTracker,
                             [],
-                            { maxBullets: constraints.maxBullets, maxCharsPerBullet: constraints.maxCharsPerBullet }
+                            { maxBullets: constraints.maxBullets, maxCharsPerBullet: constraints.maxCharsPerBullet },
+                            styleAwareHint  // Pass style-aware hint
                         );
                     } catch (planErr: any) {
                         console.warn(`[DIRECTOR] ContentPlanner failed for slide ${i + 1}:`, planErr.message);

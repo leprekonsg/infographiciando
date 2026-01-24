@@ -1,8 +1,8 @@
-import { NarrativeTrail } from "../../types/slideTypes";
+import { NarrativeTrail, StyleMode, StyleProfile, SlideArchetype, getStyleProfile, getBulletsMax } from "../../types/slideTypes";
 import { PROMPTS } from "../promptRegistry";
 import { createJsonInteraction, CostTracker, ThinkingLevel, MODEL_AGENTIC } from "../interactionsClient";
 
-// --- AGENT 4: CONTENT PLANNER (Phase 1: Context Folding, Phase 2: Density Constraints) ---
+// --- AGENT 4: CONTENT PLANNER (Phase 1: Context Folding, Phase 2: Density Constraints, Phase 3: Style-Aware) ---
 
 /**
  * Density hints for content planning based on layout constraints
@@ -11,6 +11,18 @@ export interface ContentDensityHint {
     maxBullets?: number;        // Max bullet points (default 3)
     maxCharsPerBullet?: number; // Max chars per bullet (default 80)
     maxDataPoints?: number;     // Max data points (default 3)
+}
+
+/**
+ * Style-aware content planning hints
+ * Extends density hints with style-specific guidance
+ */
+export interface StyleAwareContentHint extends ContentDensityHint {
+    styleMode?: StyleMode;
+    archetype?: SlideArchetype;
+    preferDiagram?: boolean;    // For serendipitous: prefer visual over bullets
+    preferMetrics?: boolean;    // For corporate/data: prefer quantitative content
+    avoidBullets?: boolean;     // For hero archetypes in serendipitous mode
 }
 
 /**
@@ -27,6 +39,94 @@ export interface ContentPlanResult {
         title?: string;
         data: Array<{ label: string; value: number; color?: string }>;
     };
+    // NEW: Style-driven content decisions
+    contentStrategy?: {
+        visualFirst: boolean;   // True if content should emphasize visuals over text
+        preferredFormat: 'bullets' | 'metrics' | 'diagram' | 'narrative';
+    };
+}
+
+/**
+ * Get style-adjusted density hints
+ * Applies style profile constraints to base density hints
+ */
+function getStyleAdjustedDensityHints(
+    baseHint: ContentDensityHint | undefined,
+    styleMode: StyleMode | undefined,
+    archetype: SlideArchetype | undefined
+): ContentDensityHint {
+    const style = getStyleProfile(styleMode);
+    const arch = archetype || 'narrative';
+    
+    // Get style-specific bullet max for this archetype
+    const styleBulletMax = getBulletsMax(style, arch);
+    
+    // Apply style-specific adjustments
+    const baseMaxBullets = baseHint?.maxBullets ?? 3;
+    const baseMaxChars = baseHint?.maxCharsPerBullet ?? 80;
+    const baseMaxDataPoints = baseHint?.maxDataPoints ?? 3;
+    
+    // Serendipitous mode: dramatically reduce text
+    if (style.mode === 'serendipitous') {
+        return {
+            maxBullets: Math.min(baseMaxBullets, styleBulletMax, 2),
+            maxCharsPerBullet: Math.min(baseMaxChars, 60), // Shorter, punchier
+            maxDataPoints: Math.min(baseMaxDataPoints, 2)  // Focus on impact
+        };
+    }
+    
+    // Corporate mode: disciplined but complete
+    if (style.mode === 'corporate') {
+        return {
+            maxBullets: Math.min(baseMaxBullets, styleBulletMax),
+            maxCharsPerBullet: Math.min(baseMaxChars, 70),
+            maxDataPoints: baseMaxDataPoints // Corporate loves data
+        };
+    }
+    
+    // Professional: balanced
+    return {
+        maxBullets: Math.min(baseMaxBullets, styleBulletMax),
+        maxCharsPerBullet: baseMaxChars,
+        maxDataPoints: baseMaxDataPoints
+    };
+}
+
+/**
+ * Determine content strategy based on style and archetype
+ */
+function determineContentStrategy(
+    styleMode: StyleMode | undefined,
+    archetype: SlideArchetype | undefined,
+    hasDataPoints: boolean
+): ContentPlanResult['contentStrategy'] {
+    const style = getStyleProfile(styleMode);
+    const arch = archetype || 'narrative';
+    
+    // Serendipitous mode: visual-first for most archetypes
+    if (style.mode === 'serendipitous') {
+        if (arch === 'hero' || arch === 'concept') {
+            return { visualFirst: true, preferredFormat: 'narrative' };
+        }
+        if (arch === 'data' && hasDataPoints) {
+            return { visualFirst: true, preferredFormat: 'metrics' };
+        }
+        return { visualFirst: true, preferredFormat: 'diagram' };
+    }
+    
+    // Corporate mode: data-driven where possible
+    if (style.mode === 'corporate') {
+        if (arch === 'data' || (arch === 'comparison' && hasDataPoints)) {
+            return { visualFirst: false, preferredFormat: 'metrics' };
+        }
+        return { visualFirst: false, preferredFormat: 'bullets' };
+    }
+    
+    // Professional: balanced
+    if (hasDataPoints && (arch === 'data' || arch === 'comparison')) {
+        return { visualFirst: false, preferredFormat: 'metrics' };
+    }
+    return { visualFirst: false, preferredFormat: 'bullets' };
 }
 
 /**
@@ -147,7 +247,7 @@ function normalizeDataPoints(
 }
 
 /**
- * Content Planner with Narrative History and Density Constraints
+ * Content Planner with Narrative History, Density Constraints, and Style-Aware Planning
  * 
  * RETURNS: ContentPlanResult - A guaranteed-valid content plan object
  * 
@@ -156,13 +256,15 @@ function normalizeDataPoints(
  * @param costTracker - Cost tracking
  * @param recentHistory - Last 2 slides for narrative arc awareness (Phase 1 Context Folding)
  * @param densityHint - Spatial budget constraints to prevent overflow (Phase 2)
+ * @param styleHint - Style-aware content planning hints (Phase 3)
  */
 export async function runContentPlanner(
     meta: any,
     factsContext: string,
     costTracker: CostTracker,
     recentHistory?: NarrativeTrail[],
-    densityHint?: ContentDensityHint
+    densityHint?: ContentDensityHint,
+    styleHint?: StyleAwareContentHint
 ): Promise<ContentPlanResult> {
     // Validate input early - fail gracefully with actionable fallback
     if (!meta || typeof meta !== 'object') {
@@ -170,18 +272,22 @@ export async function runContentPlanner(
         return createFallbackContentPlan({ title: 'Untitled Slide' }, 'Invalid slide metadata');
     }
 
-    console.log(`[CONTENT PLANNER] Planning content for: "${meta.title}"...`);
+    const styleMode = styleHint?.styleMode;
+    const archetype = styleHint?.archetype;
+    
+    console.log(`[CONTENT PLANNER] Planning content for: "${meta.title}"${styleMode ? ` (style: ${styleMode})` : ''}...`);
     if (recentHistory?.length) {
         console.log(`[CONTENT PLANNER] Narrative context: ${recentHistory.length} previous slides`);
     }
 
-    // Extract density limits with sensible defaults
-    const maxBullets = densityHint?.maxBullets ?? 3;
-    const maxCharsPerBullet = densityHint?.maxCharsPerBullet ?? 80;
-    const maxDataPoints = densityHint?.maxDataPoints ?? 3;
+    // Apply style-adjusted density limits
+    const adjustedHint = getStyleAdjustedDensityHints(densityHint, styleMode, archetype);
+    const maxBullets = adjustedHint.maxBullets ?? 3;
+    const maxCharsPerBullet = adjustedHint.maxCharsPerBullet ?? 80;
+    const maxDataPoints = adjustedHint.maxDataPoints ?? 3;
 
-    if (densityHint) {
-        console.log(`[CONTENT PLANNER] Density budget: max ${maxBullets} bullets, ${maxCharsPerBullet} chars each`);
+    if (styleHint || densityHint) {
+        console.log(`[CONTENT PLANNER] Density budget: max ${maxBullets} bullets, ${maxCharsPerBullet} chars each${styleMode ? ` (${styleMode} mode)` : ''}`);
     }
 
     // Truncate facts context to prevent token overflow
@@ -237,7 +343,10 @@ export async function runContentPlanner(
         // Fix: Use MODEL_AGENTIC with undefined thinkingLevel for pure generation
         const result = await createJsonInteraction<any>(
             MODEL_AGENTIC,
-            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, safeFactsContext, recentHistory, densityHint),
+            PROMPTS.CONTENT_PLANNER.TASK(meta.title, meta.purpose, safeFactsContext, recentHistory, {
+                ...adjustedHint,
+                styleMode  // Pass styleMode embedded in density hint for prompt styling
+            }),
             contentPlanSchema,
             {
                 systemInstruction: PROMPTS.CONTENT_PLANNER.ROLE,
@@ -276,7 +385,11 @@ export async function runContentPlanner(
             }
         }
 
-        console.log(`[CONTENT PLANNER] ✅ Success: ${normalizedPlan.keyPoints.length} keyPoints, ${normalizedPlan.dataPoints.length} dataPoints`);
+        // Add style-driven content strategy (Phase 3)
+        const hasDataPoints = normalizedPlan.dataPoints.length > 0 || !!normalizedPlan.chartSpec;
+        normalizedPlan.contentStrategy = determineContentStrategy(styleMode, archetype, hasDataPoints);
+
+        console.log(`[CONTENT PLANNER] ✅ Success: ${normalizedPlan.keyPoints.length} keyPoints, ${normalizedPlan.dataPoints.length} dataPoints${styleMode ? ` (${styleMode} → ${normalizedPlan.contentStrategy?.preferredFormat})` : ''}`);
         return normalizedPlan;
 
     } catch (e: any) {

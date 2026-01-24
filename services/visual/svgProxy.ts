@@ -103,24 +103,14 @@ export function generateSvgProxy(
     svg += buildComponentManifest(components);
 
     // Track which component each element belongs to (for ID assignment)
-    // Build a map of element positions to likely component indices
+    // CRITICAL: Use componentIdx from VisualElement if available (set by spatialRenderer)
+    // This is the authoritative mapping from visual elements to layoutPlan.components
     const elementToComponentMap = new Map<number, number>();
     
-    // Simple heuristic: match elements to components by type and order
-    let typeCounters: Record<string, number> = {};
     elements.forEach((el, elIdx) => {
-        const elType = (el as any).componentType || el.type;
-        // Match text elements to text-bullets, shapes to metric-cards, etc.
-        const componentIdx = components.findIndex((c, cIdx) => {
-            const cType = c.type;
-            const expectedElType = cType === 'text-bullets' ? 'text' :
-                                   cType === 'metric-cards' ? 'shape' :
-                                   cType === 'chart-frame' ? 'shape' :
-                                   cType === 'process-flow' ? 'shape' :
-                                   cType === 'icon-grid' ? 'shape' : 'text';
-            return el.type === expectedElType && !elementToComponentMap.has(cIdx);
-        });
-        if (componentIdx >= 0) {
+        // spatialRenderer sets componentIdx on each VisualElement
+        const componentIdx = (el as any).componentIdx;
+        if (componentIdx !== undefined && componentIdx >= 0 && componentIdx < components.length) {
             elementToComponentMap.set(elIdx, componentIdx);
         }
     });
@@ -163,8 +153,8 @@ export function generateSvgProxy(
     let currentSize = svg.length;
     let renderedCount = 0;
     
-    // Track rendered elements by type for generating sequential IDs
-    const renderedTypeCounters: Record<string, number> = {};
+    // Track sub-element indices within each component (for elements that spawn multiple SVG elements)
+    const componentSubElementCounters: Record<number, number> = {};
 
     for (const { el, originalIdx } of prioritizedElements) {
 
@@ -176,20 +166,34 @@ export function generateSvgProxy(
 
         let elementSvg = '';
         
-        // Generate a stable ID that Visual Architect can reference
-        // Format: "{element-type}-{sequential-index}" e.g., "text-title-0", "text-bullets-0"
-        const elTypeKey = el.type === 'text' && el.bold ? 'text-title' :
-                          el.type === 'text' ? 'text-bullets' :
-                          el.type === 'shape' ? 'shape-card' : 'element';
-        renderedTypeCounters[elTypeKey] = (renderedTypeCounters[elTypeKey] || 0);
-        const elementId = `${elTypeKey}-${renderedTypeCounters[elTypeKey]}`;
-        renderedTypeCounters[elTypeKey]++;
-        
-        // Map this element back to a component index if possible
+        // CRITICAL: Use component-based IDs that directly map to layoutPlan.components
+        // Format: "{component-type}-{component-index}[-{sub-element-index}]"
+        // Example: "text-bullets-0", "text-bullets-0-1" (second element from same component)
         const componentIdx = elementToComponentMap.get(originalIdx);
-        const componentIdAttr = componentIdx !== undefined 
-            ? ` data-component-idx="${componentIdx}" data-component-id="${components[componentIdx]?.type}-${componentIdx}"`
-            : '';
+        let elementId: string;
+        let componentIdAttr: string;
+        
+        if (componentIdx !== undefined && componentIdx < components.length) {
+            const component = components[componentIdx];
+            const componentType = component?.type || 'unknown';
+            // Track sub-elements within the same component
+            componentSubElementCounters[componentIdx] = (componentSubElementCounters[componentIdx] || 0);
+            const subIdx = componentSubElementCounters[componentIdx];
+            componentSubElementCounters[componentIdx]++;
+            
+            // First sub-element: just "{type}-{idx}", subsequent: "{type}-{idx}-{sub}"
+            elementId = subIdx === 0 
+                ? `${componentType}-${componentIdx}` 
+                : `${componentType}-${componentIdx}-${subIdx}`;
+            componentIdAttr = ` data-component-idx="${componentIdx}"`;
+        } else {
+            // Orphan element (not mapped to a component) - use element type
+            const elTypeKey = el.type === 'text' && el.bold ? 'title' :
+                              el.type === 'text' ? 'text' :
+                              el.type === 'shape' ? 'shape' : 'element';
+            elementId = `orphan-${elTypeKey}-${originalIdx}`;
+            componentIdAttr = '';
+        }
 
         if (el.type === 'text') {
             const fontSize = el.fontSize || 12;
