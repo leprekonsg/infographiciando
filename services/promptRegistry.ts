@@ -295,9 +295,21 @@ OUTPUT: Return JSON with:
       
       CRITICAL COMPONENT TYPE RULE:
       The "type" field MUST be EXACTLY one of: "text-bullets", "metric-cards", "process-flow", "icon-grid", "chart-frame", "diagram-svg"
-      DO NOT concatenate types. DO NOT add suffixes. DO NOT repeat words.
-      WRONG: "text-bullets-metric-cards", "metric-cardsMetricCards", "text-bullets_safe-zone"
-      RIGHT: "text-bullets"
+      
+      COMMON ERRORS TO AVOID:
+      ❌ NEVER concatenate component types: "text-bullets-metric-cards" is WRONG
+      ❌ NEVER add suffixes or numbers: "text-bullets-1-1-1" is WRONG
+      ❌ NEVER include layout names in type: "split-left-text-bullets" is WRONG
+      ❌ NEVER repeat patterns: "metric-cardsMetricCards" is WRONG
+      ❌ NEVER use slashes: "text-bullets/split-left-text" is WRONG
+      
+      ✓ CORRECT examples:
+      - "type": "text-bullets"
+      - "type": "metric-cards"
+      - "type": "process-flow"
+      
+      Remember: The layout variant (like "split-left-text" or "hero-centered") is in ROUTER_CONFIG, NOT in the component type.
+      Component types are ONLY the 6 types listed above.
       
       diagram-svg usage rules:
         * Use when visualFocus suggests: "ecosystem", "cycle", "integration", "closed-loop", "sovereignty", "interconnected"

@@ -190,11 +190,14 @@ function detectAndCleanDegeneratedStrings(obj: any, maxDepth = 5): any {
  * - 'diagram-svg, ' (trailing punctuation)
  * - 'text-bulletsLookupError: ...' (error messages embedded)
  * - 'text-bullets-and-no-icon-bullets-and-...' (LLM degeneration)
+ * - 'text-bullets/split-left-text-bullets-1-1-1-1...' (layout-type confusion)
  * 
  * ENHANCED: Now catches more degeneration patterns including:
  * - CamelCase repetition (MetricCardsMetricCards...)
  * - Underscore/hyphen repetition (_safe-zone_text-safe-zone...)
  * - Mixed pattern hallucinations
+ * - Numeric suffix repetition (-1-1-1-1...)
+ * - Layout-type confusion (text-bullets/split-left-text-bullets...)
  */
 function preSanitizeComponentType(rawType: string): string {
     if (!rawType || typeof rawType !== 'string') return 'text-bullets';
@@ -202,6 +205,34 @@ function preSanitizeComponentType(rawType: string): string {
     // FAST PATH: Already valid type
     const trimmed = rawType.trim().toLowerCase();
     if (SUPPORTED_COMPONENT_TYPES.includes(trimmed)) return trimmed;
+    
+    // FAST CHECK: Numeric suffix degeneration (-1-1-1-1...)
+    // This is a VERY common degeneration pattern where the model outputs "type-1-1-1-1..."
+    if (/(-1){3,}|(-\d){4,}/.test(trimmed)) {
+        // Extract valid type before the numeric garbage
+        for (const validType of SUPPORTED_COMPONENT_TYPES) {
+            if (trimmed.startsWith(validType)) {
+                console.warn(`[AUTO-REPAIR] Cleaned numeric degeneration from type: "${trimmed.slice(0, 40)}..." → "${validType}"`);
+                return validType;
+            }
+        }
+        // No valid prefix, default to text-bullets
+        console.warn(`[AUTO-REPAIR] Numeric degeneration with no valid prefix → text-bullets`);
+        return 'text-bullets';
+    }
+    
+    // FAST CHECK: Layout-type confusion (text-bullets/split-left-text-bullets...)
+    // The model concatenates layout variant with component type
+    if (trimmed.includes('/')) {
+        const parts = trimmed.split('/');
+        for (const part of parts) {
+            const cleanPart = part.split('-').slice(0, 2).join('-'); // Take first two hyphen-segments
+            if (SUPPORTED_COMPONENT_TYPES.includes(cleanPart)) {
+                console.warn(`[AUTO-REPAIR] Extracted type from slash-confusion: "${trimmed.slice(0, 40)}..." → "${cleanPart}"`);
+                return cleanPart;
+            }
+        }
+    }
     
     // Strip trailing punctuation and whitespace
     let cleaned = rawType.trim().replace(/[,;:\s]+$/, '').trim();
@@ -1096,9 +1127,23 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             c.content = capList(cleanContent, maxItems, 'bullet items');
         }
 
-        if (c.type === 'chart-frame' && c.data) {
+        if (c.type === 'chart-frame') {
+            // CRITICAL: Check for empty/missing data FIRST before any normalization
+            // This catches the "Chart 'Untitled' has no data points" issue at the source
+            if (!c.data || !Array.isArray(c.data) || c.data.length === 0) {
+                console.warn(`[AUTO-REPAIR] chart-frame has no data (was: ${JSON.stringify(c.data)}), converting to text-bullets`);
+                convertChartFrameToTextBullets(c, 'no chart data available');
+                return; // Skip further chart processing
+            }
+            
+            // Also check for missing/placeholder title
+            if (!c.title || c.title.toLowerCase() === 'untitled' || c.title.length < 3) {
+                // Try to infer title from slide context
+                c.title = slide.title || slide.layoutPlan?.title || 'Data Analysis';
+                addWarning(`Inferred chart title: "${c.title}"`);
+            }
+            
             // Normalize chart data
-            if (!Array.isArray(c.data)) c.data = [];
             c.data = c.data.map((d: any, idx: number) => {
                 if (typeof d === 'string') {
                     try {
@@ -1111,12 +1156,21 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             }).filter((d: any) => d && typeof d.value === 'number')
                 .map((d: any) => ({
                     ...d,
-                    label: truncateText(String(d.label || ''), CONTENT_LIMITS.chartLabel, 'chart label')
+                    label: truncateText(String(d.label || `Data ${d.value || ''}`), CONTENT_LIMITS.chartLabel, 'chart label')
                 }));
 
+            // Post-normalization check: if no valid data points remain, convert to text-bullets
             if (!c.data || c.data.length === 0) {
-                console.warn(`[AUTO-REPAIR] Empty chart-frame data, converting to text-bullets`);
-                convertChartFrameToTextBullets(c, 'no data available');
+                console.warn(`[AUTO-REPAIR] chart-frame has no valid data points after normalization, converting to text-bullets`);
+                convertChartFrameToTextBullets(c, 'no valid data points');
+                return;
+            }
+            
+            // Minimum 2 data points required for meaningful chart
+            if (c.data.length < 2) {
+                console.warn(`[AUTO-REPAIR] chart-frame has only ${c.data.length} data point(s), need at least 2. Converting to text-bullets`);
+                convertChartFrameToTextBullets(c, 'insufficient data points for chart');
+                return;
             }
         }
 

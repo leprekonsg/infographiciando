@@ -66,11 +66,18 @@ function getStyleAdjustedDensityHints(
     const baseMaxChars = baseHint?.maxCharsPerBullet ?? 80;
     const baseMaxDataPoints = baseHint?.maxDataPoints ?? 3;
     
-    // Serendipitous mode: dramatically reduce text
+    // CRITICAL FIX: Ensure minimum floor for bullets to prevent empty content
+    // Even hero slides in serendipitous mode need at least 1 bullet for content generation
+    // The visual-first approach should be achieved through layout selection, not by
+    // generating empty content plans that cause downstream failures
+    const MINIMUM_BULLETS = 1;
+    const MINIMUM_CHARS = 50;
+    
+    // Serendipitous mode: dramatically reduce text but maintain minimum
     if (style.mode === 'serendipitous') {
         return {
-            maxBullets: Math.min(baseMaxBullets, styleBulletMax, 2),
-            maxCharsPerBullet: Math.min(baseMaxChars, 60), // Shorter, punchier
+            maxBullets: Math.max(MINIMUM_BULLETS, Math.min(baseMaxBullets, styleBulletMax, 2)),
+            maxCharsPerBullet: Math.max(MINIMUM_CHARS, Math.min(baseMaxChars, 60)), // Shorter, punchier
             maxDataPoints: Math.min(baseMaxDataPoints, 2)  // Focus on impact
         };
     }
@@ -78,16 +85,16 @@ function getStyleAdjustedDensityHints(
     // Corporate mode: disciplined but complete
     if (style.mode === 'corporate') {
         return {
-            maxBullets: Math.min(baseMaxBullets, styleBulletMax),
-            maxCharsPerBullet: Math.min(baseMaxChars, 70),
+            maxBullets: Math.max(MINIMUM_BULLETS, Math.min(baseMaxBullets, styleBulletMax)),
+            maxCharsPerBullet: Math.max(MINIMUM_CHARS, Math.min(baseMaxChars, 70)),
             maxDataPoints: baseMaxDataPoints // Corporate loves data
         };
     }
     
     // Professional: balanced
     return {
-        maxBullets: Math.min(baseMaxBullets, styleBulletMax),
-        maxCharsPerBullet: baseMaxChars,
+        maxBullets: Math.max(MINIMUM_BULLETS, Math.min(baseMaxBullets, styleBulletMax)),
+        maxCharsPerBullet: Math.max(MINIMUM_CHARS, baseMaxChars),
         maxDataPoints: baseMaxDataPoints
     };
 }

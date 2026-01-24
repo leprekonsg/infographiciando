@@ -249,6 +249,22 @@ function hasEntropyDegeneration(text: string): boolean {
         return true;
     }
 
+    // NEW: Catch "-1-1-1-1-1-1" degeneration pattern (split-left-text-bullets-1-1-1...)
+    // This happens when the model concatenates layout variant with component type and adds repetitive suffixes
+    const numericRepeatPattern = /(-1){5,}|(-\d){6,}/;
+    if (numericRepeatPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Numeric suffix repetition detected (e.g., -1-1-1-1...)`);
+        return true;
+    }
+
+    // NEW: Catch layout-type confusion pattern (split-left-text-bullets-...)
+    // The model confuses layout variants with component types and concatenates them
+    const layoutTypeConfusionPattern = /(split-(?:left|right)-text|hero-centered|bento-grid|standard-vertical)[-_]?(text-bullets|metric-cards|process-flow|icon-grid|chart-frame)/i;
+    if (layoutTypeConfusionPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Layout-type confusion detected (layout variant concatenated with component type)`);
+        return true;
+    }
+
     // NEW: Underscore-separated repetition (catches "id_icon_label_id_icon_label...")
     const underscoreRepeatPattern = /([a-z]{2,}_[a-z]{2,}_[a-z]{2,}_)\1{2,}/i;
     if (underscoreRepeatPattern.test(sample)) {
@@ -1517,10 +1533,10 @@ export async function createInteraction(
     if (extractedText) {
         // --- CASE 3 FIX: Degenerate output ("0-0-0" or low-entropy loops) ---
         // Degeneration happens when the model gets stuck in repetition loops.
-        // FIX STRATEGY: Instead of reducing tokens (which causes truncation), we:
-        // 1. Use temperature=0.0 for determinism
-        // 2. INCREASE token budget slightly to allow proper JSON completion
-        // 3. Add stop sequences implicitly through simpler prompt structure
+        // FIX STRATEGY: 
+        // 1. First retry with temperature=0.0 for determinism
+        // 2. If still degenerated, fall back to MODEL_SIMPLE (different model architecture)
+        // 3. Simplify prompt to avoid layout-type confusion
         if (hasEntropyDegeneration(extractedText)) {
             console.warn(`[INTERACTIONS CLIENT] Degenerate output detected. Reissuing with stabilized config...`);
 
@@ -1559,9 +1575,46 @@ export async function createInteraction(
 
                 for (const output of retryResponse.outputs || []) {
                     if (output.type === 'text') {
+                        // Check if retry ALSO produced degeneration
+                        if (hasEntropyDegeneration(output.text)) {
+                            console.warn(`[INTERACTIONS CLIENT] Degeneration persists after retry. Falling back to ${MODEL_SIMPLE}...`);
+                            break; // Fall through to MODEL_SIMPLE fallback below
+                        }
                         console.log(`[INTERACTIONS CLIENT] Degeneration retry succeeded`);
                         return output.text;
                     }
+                }
+                
+                // If we got here, degeneration persisted. Try MODEL_SIMPLE as last resort
+                console.warn(`[INTERACTIONS CLIENT] Attempting MODEL_SIMPLE fallback for persistent degeneration...`);
+                const simpleFallbackRequest: InteractionRequest = {
+                    model: MODEL_SIMPLE,
+                    input: prompt,
+                    system_instruction: options.systemInstruction,
+                    response_format: options.responseFormat,
+                    response_mime_type: options.responseMimeType,
+                    generation_config: {
+                        temperature: 0.0,
+                        max_output_tokens: Math.min(options.maxOutputTokens ?? 4096, 3072),
+                        thinking_level: undefined
+                    }
+                };
+                
+                try {
+                    const simpleFallbackResponse = await client.create(simpleFallbackRequest);
+                    if (costTracker) {
+                        const usage = normalizeUsage(simpleFallbackResponse);
+                        if (usage) costTracker.addUsage(normalizeModelName(MODEL_SIMPLE), usage);
+                    }
+                    
+                    for (const output of simpleFallbackResponse.outputs || []) {
+                        if (output.type === 'text' && !hasEntropyDegeneration(output.text)) {
+                            console.log(`[INTERACTIONS CLIENT] MODEL_SIMPLE fallback succeeded`);
+                            return output.text;
+                        }
+                    }
+                } catch (simpleFallbackErr: any) {
+                    console.error(`[INTERACTIONS CLIENT] MODEL_SIMPLE fallback failed:`, simpleFallbackErr.message);
                 }
             } catch (retryErr: any) {
                 console.error(`[INTERACTIONS CLIENT] Degeneration retry failed:`, retryErr.message);
@@ -1824,14 +1877,34 @@ export async function createJsonInteraction<T = any>(
 
             // Remove any remaining degenerated component type values
             // Pattern: "type": "valid-type-garbage-garbage-garbage..."
-            const degeneratedTypePattern = /"type"\s*:\s*"([a-z-]+)(?:[-_][a-z-]+){5,}[^"]*"/gi;
+            // ENHANCED: Also catches layout-type confusion like "text-bullets/split-left-text-bullets-1-1-1..."
+            const degeneratedTypePattern = /"type"\s*:\s*"([a-z-]+)(?:[\/]?[-_][a-z0-9-]+){3,}[^"]*"/gi;
             repaired = repaired.replace(degeneratedTypePattern, (match, validPart) => {
                 // Extract just the first valid component type
                 const validTypes = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
-                const extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t.replace('-', '')))
-                    || validTypes.find(t => validPart.toLowerCase().includes(t.split('-')[0]))
-                    || 'text-bullets';
-                console.warn(`[JSON REPAIR] Extracted base type from degeneration: "${extracted}"`);
+                // Try exact match first
+                let extracted = validTypes.find(t => validPart.toLowerCase() === t);
+                // Then try prefix match
+                if (!extracted) {
+                    extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t));
+                }
+                // Then try partial match
+                if (!extracted) {
+                    extracted = validTypes.find(t => validPart.toLowerCase().includes(t.split('-')[0]));
+                }
+                // Fallback
+                if (!extracted) extracted = 'text-bullets';
+                console.warn(`[JSON REPAIR] Extracted base type from degeneration: "${extracted}" (was: "${validPart.slice(0, 40)}...")`);
+                return `"type": "${extracted}"`;
+            });
+            
+            // NEW: Also clean the specific -1-1-1-1 pattern that appears in the logs
+            // Pattern: "text-bullets/split-left-text-bullets-1-1-1-1-1..."
+            const numericDegenerationPattern = /"type"\s*:\s*"([a-z-]+)\/[a-z-]+(-1){3,}[^"]*"/gi;
+            repaired = repaired.replace(numericDegenerationPattern, (match, validPart) => {
+                const validTypes = ['text-bullets', 'metric-cards', 'process-flow', 'icon-grid', 'chart-frame', 'diagram-svg'];
+                const extracted = validTypes.find(t => validPart.toLowerCase().startsWith(t)) || 'text-bullets';
+                console.warn(`[JSON REPAIR] Extracted type from numeric degeneration: "${extracted}"`);
                 return `"type": "${extracted}"`;
             });
             
