@@ -655,6 +655,22 @@ export class SpatialLayoutEngine {
       let lines = comp.content || [];
       const hasTitle = !!comp.title;
 
+      // PRE-EMPTIVE DENSITY CHECK: If zone is very small, reduce content BEFORE calculating fit
+      // This prevents truncation mid-render which looks worse than fewer, complete bullets
+      const zoneArea = zone.w * zone.h;
+      const MAX_LINES_FOR_SMALL_ZONE = 2;
+      const MAX_LINES_FOR_MEDIUM_ZONE = 3;
+      
+      if (zoneArea < 0.3 && lines.length > MAX_LINES_FOR_SMALL_ZONE) {
+        // Very small zone (e.g., split layout secondary area) - limit to 2 bullets max
+        lines = lines.slice(0, MAX_LINES_FOR_SMALL_ZONE);
+        this.addWarning(`Zone '${zone.id}' is small (${zoneArea.toFixed(2)} area), limited to ${MAX_LINES_FOR_SMALL_ZONE} bullets`);
+      } else if (zoneArea < 0.5 && lines.length > MAX_LINES_FOR_MEDIUM_ZONE) {
+        // Medium zone - limit to 3 bullets
+        lines = lines.slice(0, MAX_LINES_FOR_MEDIUM_ZONE);
+        this.addWarning(`Zone '${zone.id}' is medium (${zoneArea.toFixed(2)} area), limited to ${MAX_LINES_FOR_MEDIUM_ZONE} bullets`);
+      }
+
       // ENHANCED OVERFLOW PREVENTION: If we have too many lines for the zone, try these in order:
       // 1. Auto-scale text down to fit
       // 2. If scaling isn't enough, truncate character count per line

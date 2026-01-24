@@ -993,10 +993,29 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 c.title = truncateText(c.title, CONTENT_LIMITS.title, 'text-bullets title');
             }
 
+            // Semantic similarity helper for deduplication
+            const calcSimilarity = (a: string, b: string): number => {
+                const wordsA = new Set(a.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+                const wordsB = new Set(b.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+                if (wordsA.size === 0 || wordsB.size === 0) return 0;
+                const intersection = [...wordsA].filter(w => wordsB.has(w)).length;
+                const union = new Set([...wordsA, ...wordsB]).size;
+                return union > 0 ? intersection / union : 0;
+            };
+
             const unique = new Set();
             const cleanContent: string[] = [];
             const rawItems = Array.isArray(c.content) ? c.content : [];
             const bulletCount = rawItems.length;
+            
+            // Placeholder/boilerplate detection - expanded list
+            const PLACEHOLDER_PHRASES = new Set([
+                'key points', 'key insight', 'main point', 'bullet point',
+                'content pending', 'data visualization', 'see notes', 
+                'overview', 'summary', 'content', 'no data available',
+                'placeholder', 'tbd', 'coming soon', 'insert text'
+            ]);
+            
             c.content.forEach((s: any) => {
                 // Convert non-strings to strings
                 let text = typeof s === 'string' ? s : JSON.stringify(s);
@@ -1004,6 +1023,14 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 if (isGarbage(norm)) {
                     norm = norm.substring(0, 50) + "...";
                 }
+                
+                // Skip placeholder content
+                const lowerNorm = norm.toLowerCase();
+                if (PLACEHOLDER_PHRASES.has(lowerNorm) || lowerNorm.length < 4) {
+                    addWarning(`Skipped placeholder bullet: "${norm.slice(0, 30)}"`);
+                    return;
+                }
+                
                 const layoutVariantForText = slide.routerConfig?.layoutVariant || 'standard-vertical';
                 const layoutBulletCaps: Record<string, number> = {
                     'split-left-text': 2,
@@ -1036,7 +1063,18 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
 
                 norm = truncateText(norm, bulletCharCap, 'bullet text');
                 const key = norm.toLowerCase();
-                if (!unique.has(key) && norm.length > 0) {
+                
+                // Exact duplicate check
+                if (unique.has(key)) return;
+                
+                // Semantic similarity check: skip if >75% similar to any existing bullet
+                const isTooSimilar = cleanContent.some(existing => calcSimilarity(norm, existing) > 0.75);
+                if (isTooSimilar) {
+                    addWarning(`Removed redundant bullet (>75% similar): "${norm.slice(0, 30)}..."`);
+                    return;
+                }
+                
+                if (norm.length > 0) {
                     unique.add(key);
                     cleanContent.push(norm);
                 }
@@ -1091,35 +1129,50 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             if (!c.diagramType || typeof c.diagramType !== 'string') {
                 console.warn(`[AUTO-REPAIR] diagram-svg missing diagramType, inferring from context`);
                 
-                // Try to infer diagram type from elements or title
+                // Try to infer diagram type from elements or title - EXPANDED KEYWORDS
                 const title = String(c.title || c.centralTheme || slide.title || '').toLowerCase();
+                const purpose = String(slide.purpose || (slide as any).meta?.purpose || '').toLowerCase();
+                const combined = `${title} ${purpose}`;
                 const elements = c.elements || [];
                 
-                if (title.includes('layer') || title.includes('stack')) {
+                // Extended keyword matching with synonyms
+                if (/layer|stack|tier|level|foundation|architecture|infra/i.test(combined)) {
                     c.diagramType = 'layered-stack';
-                } else if (title.includes('ecosystem') || title.includes('cycle') || title.includes('circular')) {
+                } else if (/ecosystem|cycle|circular|loop|continuous|recurring|lifecycle/i.test(combined)) {
                     c.diagramType = 'circular-ecosystem';
-                } else if (title.includes('hub') || title.includes('radial') || title.includes('spoke')) {
+                } else if (/hub|radial|spoke|central|core|satellite|orbit/i.test(combined)) {
                     c.diagramType = 'radial-hub';
-                } else if (title.includes('flow') || title.includes('process') || title.includes('sequence')) {
+                } else if (/flow|process|sequence|step|pipeline|workflow|journey/i.test(combined)) {
                     c.diagramType = 'flow-sequence';
-                } else if (title.includes('hierarchy') || title.includes('tree') || title.includes('org')) {
+                } else if (/hierarch|tree|org|structure|taxonomy|parent|child/i.test(combined)) {
                     c.diagramType = 'hierarchy-tree';
-                } else if (title.includes('venn') || title.includes('overlap') || title.includes('intersection')) {
+                } else if (/venn|overlap|intersection|common|shared|union/i.test(combined)) {
                     c.diagramType = 'venn-overlap';
-                } else if (elements.length >= 3) {
-                    // Default based on element count
-                    c.diagramType = elements.length <= 4 ? 'circular-ecosystem' : 'layered-stack';
+                } else if (/impact|effect|quantif|metric|data|stat|result/i.test(combined)) {
+                    // NEW: Data/metrics topics → radial-hub works well
+                    c.diagramType = 'radial-hub';
+                } else if (/future|vision|conclusion|summary|era|evolution/i.test(combined)) {
+                    // NEW: Forward-looking topics → circular ecosystem
+                    c.diagramType = 'circular-ecosystem';
+                } else if (elements.length >= 3 && elements.length <= 5) {
+                    // Default based on element count - 3-5 elements = radial hub
+                    c.diagramType = 'radial-hub';
+                } else if (elements.length > 5) {
+                    // Many elements = layered stack
+                    c.diagramType = 'layered-stack';
                 } else {
                     // Ultimate fallback - convert to text-bullets instead of breaking
-                    console.warn(`[AUTO-REPAIR] Cannot infer diagram type, converting to text-bullets`);
+                    console.warn(`[AUTO-REPAIR] Cannot infer diagram type from "${combined.slice(0, 50)}", converting to text-bullets`);
                     c.type = 'text-bullets';
-                    c.title = c.title || c.centralTheme || 'Key Concepts';
+                    // Use a descriptive title based on slide context, not generic "Key Concepts"
+                    c.title = c.title || c.centralTheme || (slide.layoutPlan?.title ? `${slide.layoutPlan.title} Overview` : 'Key Insights');
                     c.content = (c.elements || []).map((e: any) => 
-                        e.label || e.title || e.name || 'Concept'
-                    ).slice(0, 5);
+                        e.label || e.title || e.name || e.description || ''
+                    ).filter((s: string) => s.length > 3).slice(0, 5);
                     if (c.content.length === 0) {
-                        c.content = ['Core concept 1', 'Core concept 2', 'Core concept 3'];
+                        // Don't inject placeholder content - use slide context
+                        const slideTitle = slide.layoutPlan?.title || slide.title || 'this topic';
+                        c.content = [`See speaker notes for details on ${slideTitle}`];
                     }
                     delete c.elements;
                     delete c.centralTheme;

@@ -143,7 +143,31 @@ function createFallbackContentPlan(meta: any, reason: string): ContentPlanResult
 }
 
 /**
+ * Calculate semantic similarity between two strings using word overlap
+ * Returns 0-1 where 1 is identical
+ */
+function calculateSimilarity(a: string, b: string): number {
+    if (!a || !b) return 0;
+    const wordsA = new Set(a.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+    const wordsB = new Set(b.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2));
+    if (wordsA.size === 0 || wordsB.size === 0) return 0;
+    
+    const intersection = [...wordsA].filter(w => wordsB.has(w)).length;
+    const union = new Set([...wordsA, ...wordsB]).size;
+    return union > 0 ? intersection / union : 0;
+}
+
+/**
+ * Check if new text is too similar to any existing text in the array
+ * Threshold: 0.75 = 75% word overlap considered redundant
+ */
+function isTooSimilarToExisting(newText: string, existingTexts: string[], threshold = 0.75): boolean {
+    return existingTexts.some(existing => calculateSimilarity(newText, existing) > threshold);
+}
+
+/**
  * Normalizes and validates keyPoints with density constraints
+ * Now includes semantic similarity detection to prevent redundant bullets
  */
 function normalizeKeyPoints(
     items: any[],
@@ -155,7 +179,8 @@ function normalizeKeyPoints(
     const purpose = String(meta?.purpose || '').trim().toLowerCase();
     const banned = new Set([
         'generated slide.', 'generated slide', 'overview', 'summary', 
-        'key points', 'content', 'slide content', 'main points'
+        'key points', 'content', 'slide content', 'main points',
+        'key insight', 'main point', 'bullet point', 'content pending'
     ]);
     const uniq = new Set<string>();
     const cleaned: string[] = [];
@@ -171,6 +196,18 @@ function normalizeKeyPoints(
         if (lower === title || lower === purpose) continue;
         if (uniq.has(lower)) continue;
         
+        // NEW: Check semantic similarity to prevent near-duplicate bullets
+        if (isTooSimilarToExisting(text, cleaned)) {
+            console.warn(`[CONTENT PLANNER] Skipping redundant bullet: "${text.slice(0, 40)}..."`);  
+            continue;
+        }
+        
+        // NEW: Also check similarity to title/purpose (catches restated titles)
+        if (calculateSimilarity(text, title) > 0.7 || calculateSimilarity(text, purpose) > 0.7) {
+            console.warn(`[CONTENT PLANNER] Skipping bullet that restates title/purpose`);
+            continue;
+        }
+        
         uniq.add(lower);
         // Truncate to max chars per bullet with ellipsis
         const truncated = text.length > maxCharsPerBullet 
@@ -181,9 +218,11 @@ function normalizeKeyPoints(
         if (cleaned.length >= maxBullets) break;
     }
 
-    // Guarantee at least one valid key point
+    // Guarantee at least one valid key point - use purpose with context, not generic phrase
     if (cleaned.length === 0) {
-        const fallbackPoint = meta?.purpose || meta?.title || 'Key insight';
+        const fallbackPoint = meta?.purpose && meta.purpose !== 'Content' && meta.purpose.length > 10
+            ? meta.purpose 
+            : (meta?.title && meta.title.length > 5 ? `Overview of ${meta.title}` : 'See speaker notes for details');
         return [fallbackPoint.length > maxCharsPerBullet 
             ? fallbackPoint.slice(0, maxCharsPerBullet - 1) + '…' 
             : fallbackPoint];

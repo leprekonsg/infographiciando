@@ -841,11 +841,14 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
 /** 
  * SHIPPING-CRITICAL placeholder strings that should NEVER appear in exported PPTX.
  * These indicate incomplete content that slipped through generation/repair.
+ * 
+ * CRITICAL: "Key Points" is only blocked when it's STANDALONE (as a bullet item itself).
+ * When it appears as a component title with actual content bullets, it's acceptable.
  */
 const SHIPPING_BLOCK_PLACEHOLDERS = [
   'No Data Available',
   'Data Visualization',
-  'Key Points',         // Only when standalone (no actual points follow)
+  // 'Key Points' REMOVED from blocklist - it's valid as a title when content follows
   '[Insert',            // [Insert text here] style
   'Coming Soon',
   'TBD',
@@ -854,6 +857,24 @@ const SHIPPING_BLOCK_PLACEHOLDERS = [
   'Placeholder',
   'Lorem ipsum',
   '...',               // Ellipsis-only content
+  'Content pending',
+  'See notes',
+  'Overview',          // Only when standalone
+  'Summary',           // Only when standalone
+];
+
+/**
+ * Additional patterns that are placeholder-like when appearing as BULLET CONTENT
+ * but are valid as component TITLES
+ */
+const BULLET_ONLY_PLACEHOLDERS = [
+  'Key Points',
+  'Key Insight',
+  'Main Point', 
+  'Bullet Point',
+  'Overview',
+  'Summary',
+  'Content',
 ];
 
 /**
@@ -910,8 +931,21 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
     return null;
   };
   
+  // Check for bullet-specific placeholders (not blocked in titles)
+  const isBulletPlaceholder = (text: string): string | null => {
+    if (!text || typeof text !== 'string') return null;
+    const trimmed = text.trim().toLowerCase();
+    
+    for (const placeholder of BULLET_ONLY_PLACEHOLDERS) {
+      if (trimmed === placeholder.toLowerCase()) {
+        return placeholder;
+      }
+    }
+    return null;
+  };
+  
   components.forEach((comp, idx) => {
-    // Check component title (all types)
+    // Check component title (all types) - DON'T block bullet-only placeholders in titles
     if ('title' in comp && comp.title) {
       const blocked = isBlockedPlaceholder(comp.title);
       if (blocked) {
@@ -927,7 +961,8 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
     // Type-specific checks
     if (comp.type === 'text-bullets') {
       (comp.content || []).forEach((bullet, bIdx) => {
-        const blocked = isBlockedPlaceholder(bullet);
+        // Check against both block lists for bullet content
+        const blocked = isBlockedPlaceholder(bullet) || isBulletPlaceholder(bullet);
         if (blocked) {
           blockedContent.push({
             componentIndex: idx,
@@ -1376,14 +1411,29 @@ export function validateDeckCoherence(slides: SlideNode[]): CoherenceReport {
 
   // 2. Narrative Arc Validation
   // Intro slides should be early, conclusion slides should be late
+  // IMPROVED: More specific keyword detection to avoid false positives
   slides.forEach((slide, idx) => {
     const title = slide.layoutPlan?.title?.toLowerCase() || '';
     const purpose = (slide.purpose || (slide as any).meta?.purpose || '').toLowerCase();
+    const combined = `${title} ${purpose}`;
 
-    const isIntro = title.includes('intro') || title.includes('overview') ||
-                    purpose.includes('intro') || purpose.includes('hook');
-    const isConclusion = title.includes('conclusion') || title.includes('summary') ||
-                         title.includes('takeaway') || purpose.includes('conclusion');
+    // STRICTER intro detection: must be an actual introduction, not just mention "overview"
+    // Avoid false positives like "Technical Overview" or "Market Overview" mid-deck
+    const introPatterns = [
+      /^intro/,                           // Starts with "intro"
+      /^welcome/,
+      /^agenda/,
+      /introduction to/,
+      /what we.ll cover/,
+      /today.s (agenda|topic)/,
+    ];
+    const isIntro = introPatterns.some(p => p.test(combined)) ||
+                    (purpose === 'hook' || purpose === 'introduction');
+    
+    // Also more specific - "overview" alone mid-deck is often valid
+    // Only flag if it's clearly meant as a deck introduction
+    const isConclusion = /^conclusion|^summary|^takeaway|^key takeaway|^final|^wrap.?up|^next steps$/i.test(title) ||
+                         purpose === 'conclusion';
 
     // Intro after slide 2 is suspicious
     if (isIntro && idx > 2 && slides.length > 4) {
