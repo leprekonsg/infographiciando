@@ -142,6 +142,36 @@ function buildMockComponentsFromContentPlan(
     return components;
 }
 
+/**
+ * Check if dataPoints are valid for metric-cards rendering.
+ * CRITICAL: Must match canUseMetricCards() in slideAgentService.ts exactly!
+ * Requires at least 2 dataPoints with BOTH value AND label (not either/or).
+ * 
+ * Previously this used lenient "hasValue || hasLabel" which caused Qwen to
+ * select metrics-rail layouts that Generator would later reject.
+ */
+function hasValidMetricData(dataPoints: any[]): boolean {
+    if (!Array.isArray(dataPoints) || dataPoints.length < 2) return false;
+    
+    // Count how many dataPoints have BOTH value AND label (strict validation)
+    // This must match canUseMetricCards() to prevent layout/generator mismatch
+    const validCount = dataPoints.filter((dp: any) => {
+        if (!dp || typeof dp !== 'object') return false;
+        
+        // Must have a label that's a non-empty string
+        const hasLabel = typeof dp.label === 'string' && dp.label.trim().length > 0;
+        
+        // Must have a value that's defined, non-null, and non-empty when stringified
+        const hasValue = dp.value !== undefined && 
+                         dp.value !== null && 
+                         String(dp.value).trim().length > 0;
+        
+        return hasLabel && hasValue; // STRICT: require BOTH
+    }).length;
+    
+    return validCount >= 2;
+}
+
 function pickCandidateLayoutVariants(
     slideMeta: any,
     contentPlan: any,
@@ -152,12 +182,16 @@ function pickCandidateLayoutVariants(
 
     const keyPoints = Array.isArray(contentPlan?.keyPoints) ? contentPlan.keyPoints : [];
     const dataPoints = Array.isArray(contentPlan?.dataPoints) ? contentPlan.dataPoints : [];
+    
+    // CRITICAL: Check DATA QUALITY not just quantity for metric-dependent layouts
+    const canUseMetrics = hasValidMetricData(dataPoints);
 
     if (slideMeta?.type === SLIDE_TYPES.TITLE || slideMeta?.order === 1) {
         variants.add('hero-centered');
     }
 
-    if (dataPoints.length >= 3) {
+    // Only suggest metric-heavy layouts if we have VALID metric data
+    if (canUseMetrics && dataPoints.length >= 3) {
         variants.add('bento-grid');
         variants.add('dashboard-tiles');
     }
@@ -168,14 +202,30 @@ function pickCandidateLayoutVariants(
 
     if (keyPoints.length <= 2) {
         variants.add('split-left-text');
-        variants.add('metrics-rail');
+        // ONLY suggest metrics-rail if we have VALID metric data (min 2 with value+label)
+        if (canUseMetrics) {
+            variants.add('metrics-rail');
+        }
     }
 
-    if (keyPoints.length >= 3 && dataPoints.length === 0) {
+    if (keyPoints.length >= 3 && !canUseMetrics) {
         variants.add('asymmetric-grid');
     }
+    
+    // If no variants selected yet, add safe defaults based on content
+    if (variants.size === 0) {
+        if (keyPoints.length > 0) {
+            variants.add('split-left-text');
+            variants.add('standard-vertical');
+        } else {
+            variants.add('hero-centered');
+        }
+    }
 
-    const fallbackPool = (LayoutVariantSchema.options as LayoutVariant[]).filter(v => !variants.has(v));
+    const fallbackPool = (LayoutVariantSchema.options as LayoutVariant[]).filter(v => !variants.has(v) && ![
+        // Exclude metric-dependent layouts from fallback if we lack valid metrics
+        ...(canUseMetrics ? [] : ['metrics-rail', 'dashboard-tiles', 'bento-grid'])
+    ].includes(v));
     for (const v of fallbackPool) {
         if (variants.size >= 3) break;
         variants.add(v);

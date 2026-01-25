@@ -1515,6 +1515,20 @@ export function renderWithLayeredComposition(
           populateIcon(el.icon);
         }
 
+        // Connector elements require from/to coordinates; derive from placement if missing
+        if (el.type === 'connector') {
+          const from = el.from ?? { x: position.x, y: position.y + (position.h / 2) };
+          const to = el.to ?? { x: position.x + position.w, y: position.y + (position.h / 2) };
+
+          return {
+            type: 'connector',
+            from,
+            to,
+            style: el.style || 'line',
+            color: el.color || palette.secondary
+          };
+        }
+
         return {
           type: el.type,
           position,

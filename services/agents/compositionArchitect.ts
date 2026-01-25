@@ -185,136 +185,35 @@ const buildCompositionTask = (
 ): string => {
   const style = getStyleProfile(styleMode);
   
-  return `
-TASK: Plan the layer structure and compositional primitives for a premium slide.
+  // COMPACT PROMPT: Reduced token count to prevent truncation (was causing mid-JSON cutoff)
+  return `Plan layer structure for a premium slide.
 
-SLIDE CONTEXT:
+CONTEXT:
 - Title: "${slideTitle}"
-- Purpose: ${slidePurpose}
-- Layout Variant: ${routerConfig.layoutVariant}
-- Render Mode: ${routerConfig.renderMode}
-- Visual Focus: ${routerConfig.visualFocus || 'General content'}
-- Density Budget: max ${routerConfig.densityBudget?.maxItems ?? 4} items, ${routerConfig.densityBudget?.maxChars ?? 500} chars
+- Layout: ${routerConfig.layoutVariant}
+- Budget: ${variationBudget?.toFixed(2) || '0.5'} (0=safe, 1=bold)${styleMode ? ` [${styleMode}]` : ''}
+- Content: ${contentSummary.substring(0, 200)}${contentSummary.length > 200 ? '...' : ''}
 
-CONTENT SUMMARY:
-${contentSummary}
+${styleMode === 'corporate' ? 'STYLE: Corporate (max stability, clean grids, subtle decorations only)' : 
+  styleMode === 'serendipitous' ? 'STYLE: Serendipitous (bold visuals, high whitespace, asymmetric layouts OK)' : 
+  'STYLE: Professional (balanced modern)'}
 
-${styleMode ? `
-STYLE MODE: ${styleMode.toUpperCase()}
-${styleMode === 'corporate' ? `
-CORPORATE CONSTRAINTS (Manus-grade stability):
-- Maximum visual stability and consistency
-- Clean grids, no asymmetric layouts
-- Decorative elements: subtle only (badges, underlines)
-- Negative space minimum: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%
-- Max components per slide: ${style.maxComponentsPerSlide}
-- FORBIDDEN: overlapping elements, bold surprises, asymmetric emphasis
-` : styleMode === 'serendipitous' ? `
-SERENDIPITOUS CONSTRAINTS (Visual-first impact):
-- Visual dominance over text (fewer bullets, bolder visuals)
-- High negative space: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%+ 
-- Max components: ${style.maxComponentsPerSlide} (less is more)
-- ENCOURAGED: asymmetric layouts, floating stats, dramatic whitespace
-- ENCOURAGED: bold surprises, icon glows, quote callouts
-- FORBIDDEN: dense bullet lists, "template-y" standard layouts
-` : `
-PROFESSIONAL CONSTRAINTS (Balanced modern):
-- Modern, clean aesthetic with moderate variation
-- Negative space: ${(style.negativeSpaceMinRatio * 100).toFixed(0)}%
-- Asymmetry allowed where appropriate
-`}
-` : ''}
+${usedSurprises?.length ? `AVOID REPEATING: ${usedSurprises.slice(0, 3).join(', ')}` : ''}
 
-${serendipityDNA ? `THEME DNA:
-- Motifs: ${serendipityDNA.motifs?.join(', ')}
-- Card Style Preference: ${serendipityDNA.cardStyle || 'glass'}
-- Accent Density: ${serendipityDNA.accentDensity || 'balanced'}
-- Composition Bias: ${serendipityDNA.compositionBias || 'balanced'}` : ''}
+DECISIONS NEEDED:
+1. BACKGROUND: solid/gradient/mesh - must have quiet zones for text
+2. DECORATIVE (0-2): category-badge, icon-glow, accent-underline, gradient-divider
+3. CONTENT PATTERN (pick ONE):
+   - single-hero: Large title, max breathing room
+   - card-row: 2-4 horizontal cards with icon+title+body
+   - split-content: Text left + visual right
+   - metrics-rail: KPIs left + narrative right
+4. SURPRISES (based on budget):
+   - 0-0.3: max 1 subtle (icon-glow)
+   - 0.4-0.6: 1-2 moderate (badge + glow)
+   - 0.7-1.0: 2 bold (asymmetric, floating-stat)
 
-VARIATION BUDGET: ${variationBudget?.toFixed(2) || '0.5'} (0=conservative, 1=bold)${styleMode ? ` [${styleMode}-adjusted]` : ''}
-
-${narrativeTrail?.length ? `PREVIOUS SLIDES (avoid repetition):
-${narrativeTrail.map(t => `- ${t.title}: ${t.mainPoint}`).join('\n')}` : ''}
-
-${usedSurprises?.length ? `ALREADY USED SURPRISES (avoid repeating):
-${usedSurprises.join(', ')}` : ''}
-
-YOUR DECISIONS:
-
-1. BACKGROUND LAYER:
-   - Type: solid | gradient | image | mesh
-   - If mesh: which pattern? (circuit, topological, particle, bokeh)
-   - Gradient guidance: Use 2-tone dark gradients (e.g., #0c1425 → #1a2744)
-   - RULE: Background must provide quiet zones for text readability
-
-2. DECORATIVE LAYER (0-3 elements):
-   - Category Badge: Use for slides with clear category (e.g., "⚙️ PROCESS", "📊 DATA"). Place top-left.
-   - Gradient Dividers: Use sparingly between major sections
-   - Icon Glows: Subtle glow behind card icons for depth
-   - Accent Shapes: Underlines for hero titles, brackets for quotes
-   - RULE: Decorative elements should be SUBTLE - if they distract from content, remove them
-
-3. CONTENT STRUCTURE - Choose ONE pattern:
-
-   SINGLE-HERO: For opening slides, section headers, powerful quotes
-   - Large centered title (48pt)
-   - Optional subtitle below
-   - Zero cards, maximum breathing room
-   - Best with gradient background + optional badge
-
-   CARD-ROW: For comparing 2-4 items horizontally
-   - Title at top
-   - Row of glass cards below
-   - Each card: icon-in-circle + overline + title + body
-   - Best for: features, comparisons, options
-
-   NARRATIVE-FLOW (PREMIUM): For storytelling in 3 acts
-   - Like card-row but specifically 3 cards telling a story:
-     Card 1: 🔺 THE PROBLEM (warning icon, red-tinted)
-     Card 2: 💡 THE INSIGHT (lightbulb icon, blue)
-     Card 3: 🚀 THE SOLUTION (rocket icon, green)
-   - Use when content has: trap→mandate→destination or problem→approach→outcome
-   - Each card: icon-in-circle + overline + bold title + explanatory body
-
-   SPLIT-CONTENT: For text + visual side-by-side
-   - Left: Title + bullet points
-   - Right: Chart, diagram, or large icon
-   - Good for data + context
-
-   METRICS-RAIL: For KPIs and statistics
-   - Left rail: 2-4 large metrics
-   - Right: Supporting narrative
-   - Best for data-heavy slides
-
-   CARD-GRID: For 4-6 items in a 2x2 or 2x3 grid
-   - Compact cards
-   - Best for features, capabilities, team members
-
-4. SERENDIPITY ALLOCATION (based on variation budget):
-   - Budget 0.0-0.3: Conservative - max 1 subtle element (icon-glow OR accent-underline)
-   - Budget 0.4-0.6: Moderate - 1-2 elements (badge + glow, or underline + floating-stat)
-   - Budget 0.7-1.0: Bold - 2 elements + creative choices (asymmetric layouts, quote-callout)
-
-   SURPRISE TYPES:
-   - category-badge: Pill at top-left with icon + label (e.g., "⚙️ PROCESS")
-   - accent-underline: Gradient underline below hero title
-   - icon-glow: Soft glow behind icon containers
-   - quote-callout: Pull quote with large quote marks
-   - asymmetric-emphasis: One card larger than siblings
-   - connector-flow: Arrows or lines between cards for flow
-   - floating-stat: Large number floating in corner
-   - gradient-divider: Horizontal fade between sections
-
-5. CARD ANATOMY (when using cards):
-   - Icon: Required, in circle container, brand color
-   - Overline: Optional uppercase text above title (e.g., "STEP 1")
-   - Title: Bold, 1-2 lines
-   - Body: Regular text, 2-3 lines max
-   - Style: glass (default), solid (for emphasis), outline (for subtlety)
-
-OUTPUT: Return a JSON object matching the CompositionPlan schema.
-Include brief reasoning for your decisions, referencing the Design Commandments.
-`;
+OUTPUT: JSON matching CompositionPlan schema. Include brief reasoning.`;
 }
 
 
@@ -355,9 +254,9 @@ const COMPOSITION_PLAN_SCHEMA = {
               type: "string",
               enum: ["single-hero", "card-row", "card-grid", "split-content", "metrics-rail", "narrative-flow"]
             },
-            cardCount: { type: "number" },
+            cardCount: { type: "integer" },  // FIX: Use "integer" instead of "number" for clearer JSON schema compliance
             cardStyle: { type: "string", enum: ["glass", "solid", "outline", "gradient", "elevated"] },
-            textBlockCount: { type: "number" }
+            textBlockCount: { type: "integer" }  // FIX: Use "integer" instead of "number"
           },
           required: ["pattern"]
         },
@@ -371,6 +270,7 @@ const COMPOSITION_PLAN_SCHEMA = {
         variationBudget: { type: "number" },
         allocatedSurprises: {
           type: "array",
+          maxItems: 3,  // FIX: Limit array size to prevent excessive output
           items: {
             type: "object",
             properties: {

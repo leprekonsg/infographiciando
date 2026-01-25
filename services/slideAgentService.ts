@@ -369,8 +369,22 @@ function applySpatialPreflightAdjustments(
     const hasTruncation = warnings.some(w => /truncated|hidden|title dropped/i.test(String(w)));
     const hasUnplaced = warnings.some(w => /unplaced component/i.test(String(w)));
 
+    const densityBudget = updatedSlide.routerConfig?.densityBudget;
+    const maxItemsBudget = Math.max(3, densityBudget?.maxItems ?? 5);
+
+    const countTotalItems = (comps: any[]) => comps.reduce((sum, comp) => {
+        if (comp.type === 'text-bullets') return sum + (comp.content?.length || 0);
+        if (comp.type === 'metric-cards') return sum + (comp.metrics?.length || 0);
+        if (comp.type === 'process-flow') return sum + (comp.steps?.length || 0);
+        if (comp.type === 'icon-grid') return sum + (comp.items?.length || 0);
+        return sum;
+    }, 0);
+
     if (!hasTruncation && !hasUnplaced) {
-        return { slide: updatedSlide, adjustments };
+        const totalItems = countTotalItems(updatedSlide.layoutPlan?.components || []);
+        if (totalItems <= maxItemsBudget) {
+            return { slide: updatedSlide, adjustments };
+        }
     }
 
     const variant = updatedSlide.routerConfig?.layoutVariant || 'standard-vertical';
@@ -426,6 +440,34 @@ function applySpatialPreflightAdjustments(
             if (before !== c.items.length) adjustments.push('reduced icons');
         }
     });
+
+    // Enforce overall item budget even if no truncation warnings are present
+    if (countTotalItems(components) > maxItemsBudget) {
+        const reductionOrder = ['text-bullets', 'icon-grid', 'process-flow', 'metric-cards'];
+
+        for (const type of reductionOrder) {
+            if (countTotalItems(components) <= maxItemsBudget) break;
+            components.forEach((c: any) => {
+                if (countTotalItems(components) <= maxItemsBudget || c.type !== type) return;
+                if (type === 'text-bullets' && Array.isArray(c.content) && c.content.length > 1) {
+                    c.content = c.content.slice(0, Math.max(1, c.content.length - 1));
+                    adjustments.push('reduced items to budget');
+                }
+                if (type === 'icon-grid' && Array.isArray(c.items) && c.items.length > 2) {
+                    c.items = c.items.slice(0, Math.max(2, c.items.length - 1));
+                    adjustments.push('reduced items to budget');
+                }
+                if (type === 'process-flow' && Array.isArray(c.steps) && c.steps.length > 2) {
+                    c.steps = c.steps.slice(0, Math.max(2, c.steps.length - 1));
+                    adjustments.push('reduced items to budget');
+                }
+                if (type === 'metric-cards' && Array.isArray(c.metrics) && c.metrics.length > 2) {
+                    c.metrics = c.metrics.slice(0, Math.max(2, c.metrics.length - 1));
+                    adjustments.push('reduced items to budget');
+                }
+            });
+        }
+    }
 
     if (hasUnplaced || components.length > limits.maxComponents) {
         const prefer = updatedSlide.type === 'data-viz'
@@ -1041,6 +1083,29 @@ async function runGenerator(
     // Apply deterministic visual focus enforcement early to avoid repeated validation loops
     const enforcedVisualDesignSpec = enforceVisualFocusInSpec(visualDesignSpec, routerConfig.visualFocus);
 
+    // ============================================================================
+    // EARLY LAYOUT PRECONDITION CHECK (Observe → Think → Act principle)
+    // ============================================================================
+    // Check if the requested layout is compatible with available content BEFORE
+    // starting the generation loop. This prevents wasted LLM calls and cascading
+    // reroutes that appear as duplicated warnings in the UI.
+    // ============================================================================
+    const LAYOUT_METRIC_REQUIREMENTS: Record<string, { needsMetrics: boolean; minComponents?: number }> = {
+        'metrics-rail': { needsMetrics: true, minComponents: 2 },
+        'dashboard-tiles': { needsMetrics: true },
+        'bento-grid': { needsMetrics: true }
+    };
+    
+    const layoutReq = LAYOUT_METRIC_REQUIREMENTS[routerConfig.layoutVariant];
+    if (layoutReq?.needsMetrics && !canUseMetricCards(safeContentPlan.dataPoints)) {
+        console.log(`[GENERATOR] Early layout precondition failed: ${routerConfig.layoutVariant} requires valid metric-cards data but dataPoints are insufficient. Auto-rerouting to standard-vertical.`);
+        routerConfig = {
+            ...routerConfig,
+            layoutVariant: 'standard-vertical' as any,
+            layoutIntent: `${routerConfig.layoutIntent || ''} (precondition: no valid metrics for ${routerConfig.layoutVariant})`.trim()
+        };
+    }
+
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
             const isRecoveryAttempt = attempt > 0;
@@ -1067,17 +1132,29 @@ async function runGenerator(
             const minComponents = ['split-left-text', 'split-right-text'].includes(layoutVariant) ? 2 : 1;
             const maxComponents = ['bento-grid'].includes(layoutVariant) ? 3 : 2;
 
-            // CRITICAL FIX: Pre-check if we have valid dataPoints for metric-cards
-            // If not, steer away from metric-cards in examples to prevent empty arrays
-            const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
+            // CRITICAL FIX: Use proper canUseMetricCards check (validates both count AND structure)
+            // This ensures dataPoints have valid {label, value} pairs, not just array length
+            const hasValidDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
 
-            // SCHEMA GUIDANCE: Since schema is now ultra-minimal, provide explicit JSON examples
-            // CRITICAL: metric-cards example MUST show full array structure with 2+ items
-            // The model outputs empty metrics:[] because the minimal schema doesn't define inner structure
-            // FALLBACK MODEL: Exclude diagram-svg (2.5-flash degenerates on it)
-            const metricExample = hasValidDataPoints
-                ? `metric-cards: {"type":"metric-cards","metrics":[{"value":"${safeContentPlan.dataPoints[0]?.value || '42M'}","label":"${safeContentPlan.dataPoints[0]?.label || 'Metric'}","icon":"TrendingUp"},{"value":"${safeContentPlan.dataPoints[1]?.value || '85%'}","label":"${safeContentPlan.dataPoints[1]?.label || 'Growth'}","icon":"Activity"}]}`
-                : `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}`;
+            // Build metric example with ACTUAL dataPoint values to seed the model's output
+            // This follows the "Observe → Think → Act" principle: inject real data, not placeholders
+            let metricExample: string;
+            if (hasValidDataPoints) {
+                // Extract valid dataPoints with proper fallbacks
+                const validDps = safeContentPlan.dataPoints
+                    .filter((d: any) => d && (d.value !== undefined || d.label))
+                    .slice(0, 3);
+                const metricsJson = validDps.map((dp: any, i: number) => {
+                    const value = String(dp.value ?? dp.amount ?? dp.metric ?? 'N/A').slice(0, 15);
+                    const label = String(dp.label ?? dp.name ?? `Metric ${i+1}`).slice(0, 25);
+                    const icon = dp.icon ?? ['TrendingUp', 'Activity', 'BarChart'][i % 3];
+                    return `{"value":"${value}","label":"${label}","icon":"${icon}"}`;
+                }).join(',');
+                metricExample = `metric-cards: {"type":"metric-cards","metrics":[${metricsJson}]}`;
+            } else {
+                // No valid dataPoints - steer towards text-bullets
+                metricExample = `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}`;
+            }
 
             // SIMPLIFIED EXAMPLES for fallback model - no diagram-svg, no spatial zones terminology
             const componentExamples = usingFallbackModel
@@ -1291,17 +1368,59 @@ Expected structure:
                     ];
                 }
                 
-                // PRECONDITION CHECK: Convert metric-cards to text-bullets if dataPoints insufficient
+                // ============================================================================
+                // EMPTY ARRAY PREVENTION (Fixed 2026-01-26)
+                // ============================================================================
+                // The Generator sometimes outputs component types with empty arrays:
+                // - metric-cards with metrics: []
+                // - icon-grid with items: []
+                // This causes autoRepair to convert them to text-bullets, which may
+                // then trigger layout incompatibility. Catch this EARLY and either:
+                // 1. Populate with available data, or
+                // 2. Convert to text-bullets immediately
+                // ============================================================================
                 const hasEnoughDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
+                
                 candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
-                    if (c.type === 'metric-cards' && !hasEnoughDataPoints) {
-                        console.warn(`[GENERATOR] Precondition failed: metric-cards without valid dataPoints → text-bullets`);
-                        return {
-                            type: 'text-bullets',
-                            title: c.title || 'Key Points',
-                            content: safeContentPlan.keyPoints.slice(0, 3)
-                        };
+                    // METRIC-CARDS: Check both precondition AND actual array content
+                    if (c.type === 'metric-cards') {
+                        const hasMetricsArray = Array.isArray(c.metrics) && c.metrics.length >= 2;
+                        if (!hasEnoughDataPoints || !hasMetricsArray) {
+                            console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${c.metrics?.length || 0}) → text-bullets`);
+                            return {
+                                type: 'text-bullets',
+                                title: c.title || 'Key Points',
+                                content: safeContentPlan.keyPoints.slice(0, 3)
+                            };
+                        }
                     }
+                    
+                    // ICON-GRID: Check if items array is populated
+                    if (c.type === 'icon-grid') {
+                        const hasItemsArray = Array.isArray(c.items) && c.items.length >= 2;
+                        if (!hasItemsArray) {
+                            console.warn(`[GENERATOR] Precondition failed: icon-grid without valid items (${c.items?.length || 0}) → text-bullets`);
+                            return {
+                                type: 'text-bullets',
+                                title: c.title || 'Features',
+                                content: safeContentPlan.keyPoints.slice(0, 3)
+                            };
+                        }
+                    }
+                    
+                    // PROCESS-FLOW: Check if steps array is populated
+                    if (c.type === 'process-flow') {
+                        const hasStepsArray = Array.isArray(c.steps) && c.steps.length >= 2;
+                        if (!hasStepsArray) {
+                            console.warn(`[GENERATOR] Precondition failed: process-flow without valid steps (${c.steps?.length || 0}) → text-bullets`);
+                            return {
+                                type: 'text-bullets',
+                                title: c.title || 'Process',
+                                content: safeContentPlan.keyPoints.slice(0, 3)
+                            };
+                        }
+                    }
+                    
                     return c;
                 });
             }
@@ -1311,20 +1430,89 @@ Expected structure:
                 candidate.content = safeContentPlan.keyPoints;
             }
 
-            // Auto-add chart frame if needed
+            // Auto-add chart frame if needed - with DATA VALIDATION
+            // Only add chart-frame if chartSpec has valid data array with at least 2 points
+            // This prevents the "[AUTO-REPAIR] chart-frame has no data" cascade
             if (candidate.type === 'data-viz' && candidate.chartSpec && candidate.layoutPlan?.components) {
                 const hasFrame = candidate.layoutPlan.components.some((c: any) => c.type === 'chart-frame');
-                if (!hasFrame) {
+                const hasValidChartData = Array.isArray(candidate.chartSpec.data) && 
+                                          candidate.chartSpec.data.length >= 2 &&
+                                          candidate.chartSpec.data.every((d: any) => 
+                                              d && typeof d.value === 'number' && d.label
+                                          );
+                
+                if (!hasFrame && hasValidChartData) {
                     candidate.layoutPlan.components.push({
                         type: 'chart-frame',
                         title: candidate.chartSpec.title || "Data Analysis",
                         chartType: (['bar', 'pie', 'doughnut', 'line'].includes(candidate.chartSpec.type) ? candidate.chartSpec.type : 'bar') as any,
                         data: candidate.chartSpec.data
                     });
+                } else if (!hasFrame && !hasValidChartData) {
+                    console.log(`[GENERATOR] Skipping chart-frame: chartSpec.data invalid (length: ${candidate.chartSpec.data?.length || 0})`);
                 }
             }
 
             candidate = autoRepairSlide(candidate, styleGuide);
+            
+            // ============================================================================
+            // LAYOUT-COMPONENT COMPATIBILITY CHECK (Post-autoRepair Safety Net)
+            // ============================================================================
+            // After autoRepair may convert metric-cards/icon-grid to text-bullets,
+            // check if the layout is still appropriate. This is a SAFETY NET for cases
+            // where the early precondition check passed but autoRepair changed components.
+            // Note: The early check (before generation loop) handles most cases.
+            // ============================================================================
+            const LAYOUT_REQUIREMENTS: Record<string, string[]> = {
+                'bento-grid': ['metric-cards', 'icon-grid', 'chart-frame'],
+                'dashboard-tiles': ['metric-cards', 'chart-frame'],
+                'metrics-rail': ['metric-cards']
+            };
+            
+            const currentLayout = candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant;
+            const requiredTypes = LAYOUT_REQUIREMENTS[currentLayout];
+            
+            // Only run this check if we're still on a metric-dependent layout
+            // (early precondition check may have already rerouted)
+            if (requiredTypes && candidate.layoutPlan?.components) {
+                const componentTypes = candidate.layoutPlan.components.map((c: any) => c.type);
+                const hasRequiredType = requiredTypes.some(rt => componentTypes.includes(rt));
+                
+                // Also check component count for layouts that need 2+ components
+                const LAYOUT_MIN_COMPONENTS: Record<string, number> = {
+                    'metrics-rail': 2,
+                    'split-left-text': 2,
+                    'split-right-text': 2
+                };
+                const minRequired = LAYOUT_MIN_COMPONENTS[currentLayout];
+                const hasEnoughComponents = !minRequired || candidate.layoutPlan.components.length >= minRequired;
+                
+                if (!hasRequiredType || !hasEnoughComponents) {
+                    // Layout requires specific components that are missing - reroute to standard-vertical
+                    const reason = !hasRequiredType 
+                        ? `${currentLayout} requires ${requiredTypes.join(' or ')}` 
+                        : `${currentLayout} requires at least ${minRequired} components`;
+                    
+                    // Avoid duplicate warnings if early precondition already added one
+                    const alreadyWarned = (candidate.warnings || []).some(w => 
+                        String(w).includes('precondition') || String(w).includes('Auto-rerouted')
+                    );
+                    
+                    if (!alreadyWarned) {
+                        console.warn(`[GENERATOR] Post-repair check: ${reason}. Auto-rerouting to standard-vertical.`);
+                        candidate.warnings = [
+                            ...(candidate.warnings || []),
+                            `Auto-rerouted layout to standard-vertical: ${reason}`
+                        ];
+                    }
+                    
+                    candidate.routerConfig = {
+                        ...candidate.routerConfig,
+                        layoutVariant: 'standard-vertical' as any
+                    };
+                }
+            }
+            
             const preflight = applySpatialPreflightAdjustments(candidate, styleGuide);
             candidate = preflight.slide;
             if (preflight.adjustments.length > 0) {
@@ -2219,14 +2407,16 @@ export const generateAgenticDeck = async (
             //
             // SOLUTION: Downgrade slide type from "data-viz" to "content-main" when:
             // 1. No chartSpec exists (no chart definition)
-            // 2. dataPoints < 2 (insufficient for metric-cards)
+            // 2. dataPoints lack valid value+label pairs (insufficient for metric-cards)
             // This keeps the agentic contract clean - each agent gets accurate context.
             // ============================================================================
             const hasChartSpec = safeContentPlan.chartSpec && safeContentPlan.chartSpec.type;
-            const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
+            // FIX: Use canUseMetricCards for consistent data quality check across all code paths
+            // Previous check (length >= 2) didn't validate data STRUCTURE, causing downstream failures
+            const hasValidDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
             
             if (slideMeta.type === 'data-viz' && !hasChartSpec && !hasValidDataPoints) {
-                console.log(`[ORCHESTRATOR] ⚠️ data-viz slide "${slideMeta.title}" lacks data (chartSpec: ${!!hasChartSpec}, dataPoints: ${safeContentPlan.dataPoints.length})`);
+                console.log(`[ORCHESTRATOR] ⚠️ data-viz slide "${slideMeta.title}" lacks valid data (chartSpec: ${!!hasChartSpec}, validDataPoints: ${hasValidDataPoints})`);
                 console.log(`[ORCHESTRATOR] Downgrading slide type: data-viz → content-main`);
                 slideMeta.type = 'content-main';
                 // Also update purpose to reflect the change
@@ -2235,18 +2425,31 @@ export const generateAgenticDeck = async (
                 }
             }
 
-            // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
+            // CREATIVITY FIX: If dataPoints are insufficient for metric-cards, steer away from metric-heavy layouts
             if (!hasValidDataPoints) {
-                // Add metrics-rail and dashboard-tiles to avoid list (they require metrics)
-                const metricHeavyLayouts = ['metrics-rail', 'dashboard-tiles'];
+                // ============================================================================
+                // LAYOUT-DATA COMPATIBILITY (Fixed 2026-01-25)
+                // ============================================================================
+                // Certain layouts REQUIRE metric-cards, icon-grid, or chart-frame components.
+                // If content plan lacks VALID data for these (not just array length!), avoid 
+                // selecting incompatible layouts BEFORE generation rather than rerouting AFTER.
+                //
+                // KEY: canUseMetricCards checks for {label, value} pairs, not just count
+                //
+                // Layouts requiring data components:
+                // - bento-grid: needs metric-cards or icon-grid (card-based layout)
+                // - dashboard-tiles: needs metric-cards or chart-frame
+                // - metrics-rail: needs metric-cards
+                // ============================================================================
+                const dataRequiringLayouts = ['bento-grid', 'dashboard-tiles', 'metrics-rail'];
                 slideConstraints.avoidLayoutVariants = [
                     ...(slideConstraints.avoidLayoutVariants || []),
-                    ...metricHeavyLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
+                    ...dataRequiringLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
                 ];
-                console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding metric-heavy layouts`);
+                console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding data-requiring layouts: ${dataRequiringLayouts.join(', ')}`);
 
                 // STYLE-AWARE FALLBACK: Corporate mode without data degrades to professional
-                if (styleMode === 'corporate' && !hasValidDataPoints) {
+                if (styleMode === 'corporate') {
                     console.log(`[ORCHESTRATOR] Corporate mode with no data - degrading to professional for this slide`);
                     // Note: We don't change the global styleMode, just log the degradation
                 }

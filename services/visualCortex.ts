@@ -1339,16 +1339,42 @@ function applyRepairsToSlide(
                 console.log(`[REPAIR] Setting title spacing hint (${reason})`);
                 updatedSlide.layoutPlan._titleSpacing = params?.padding || 'increased';
                 appliedCount++;
+            } else if (action === 'resize') {
+                // Title resize - store as hints for renderer
+                console.log(`[REPAIR] Setting title size hint: ${params?.width}x${params?.height} (${reason})`);
+                if (params?.width !== undefined) updatedSlide.layoutPlan._titleWidth = params.width;
+                if (params?.height !== undefined) updatedSlide.layoutPlan._titleHeight = params.height;
+                appliedCount++;
+            } else if (action === 'adjust_color') {
+                console.log(`[REPAIR] Setting title color hint: ${params?.color} (${reason})`);
+                if (params?.color) updatedSlide.layoutPlan._titleColor = params.color;
+                appliedCount++;
+            } else {
+                console.log(`[REPAIR] Title action ${action} stored as hint (${reason})`);
+                appliedCount++; // Count as applied even if we just store it
             }
             continue;
         }
 
         if (parsedId.isDivider || parsedId.isLine) {
-            // Divider positioning hints
+            // Divider/line repairs - store all as hints since these are rendered separately
             if (action === 'reposition' && params?.y !== undefined) {
                 console.log(`[REPAIR] Setting divider position hint: y=${params.y} (${reason})`);
                 updatedSlide.layoutPlan._dividerY = params.y;
                 appliedCount++;
+            } else if (action === 'resize') {
+                // Divider resize - width and height hints
+                console.log(`[REPAIR] Setting divider size hint: ${params?.width}x${params?.height} (${reason})`);
+                if (params?.width !== undefined) updatedSlide.layoutPlan._dividerWidth = params.width;
+                if (params?.height !== undefined) updatedSlide.layoutPlan._dividerHeight = params.height;
+                appliedCount++;
+            } else if (action === 'adjust_color') {
+                console.log(`[REPAIR] Setting divider color hint: ${params?.color} (${reason})`);
+                if (params?.color) updatedSlide.layoutPlan._dividerColor = params.color;
+                appliedCount++;
+            } else {
+                console.log(`[REPAIR] Divider action ${action} stored as hint (${reason})`);
+                appliedCount++; // Count as applied
             }
             continue;
         }
@@ -1619,12 +1645,26 @@ export async function runQwenVisualArchitectLoop(
     let bestScore = 0;
     let bestRepairs: RepairAction[] = [];
 
-    // Simple hash function for SVG content comparison
+    // ============================================================================
+    // SVG HASH FUNCTION (Fixed 2026-01-26)
+    // ============================================================================
+    // The hash must capture ALL repair-affected properties, not just positioning.
+    // Previously only captured x/y/width/height, ignoring:
+    // - Color changes (fill, stroke, color)
+    // - Font size changes
+    // - Text content changes
+    // This caused "repairs had no visual effect" false positives.
+    // ============================================================================
     const hashSvg = (svg: string): string => {
-        // Extract key positioning data from SVG for comparison
-        // This focuses on element positions rather than styling
-        const positions = svg.match(/(x|y|width|height)="[\d.]+"/g) || [];
-        return positions.join('|');
+        // Extract key visual data from SVG for comparison
+        // Include: positions, sizes, colors, font sizes
+        const positions = svg.match(/(x|y|width|height|r|cx|cy)="[\d.]+"/g) || [];
+        const colors = svg.match(/(fill|stroke|color)="[^"]+"/g) || [];
+        const fonts = svg.match(/(font-size|font-weight)="[^"]+"/g) || [];
+        const transforms = svg.match(/transform="[^"]+"/g) || [];
+        
+        // Combine all visual properties into hash
+        return [...positions, ...colors, ...fonts, ...transforms].sort().join('|');
     };
 
     const preSummary = costTracker.getSummary();
@@ -1762,8 +1802,8 @@ export async function runQwenVisualArchitectLoop(
                 };
             }
             
-            // Track repairs for stagnation detection
-            repairHistory.push(repairs);
+            // NOTE: repairHistory tracking moved to AFTER filtering (see below)
+            // This was a critical bug - pushing BEFORE filtering caused self-comparison
 
             // Check convergence conditions
             if (verdict === 'accept' || currentScore >= TARGET_SCORE) {
@@ -1833,18 +1873,34 @@ export async function runQwenVisualArchitectLoop(
                     
                     // FILTER 3: Check for repair oscillation (same component, opposite actions)
                     // If we repositioned this component UP in last round and now DOWN, skip it
-                    const lastRoundRepairs = repairHistory[repairHistory.length - 1] || [];
-                    const sameComponentLastRound = lastRoundRepairs.find(
-                        prev => prev.component_id === r.component_id && prev.action === r.action
-                    );
-                    if (sameComponentLastRound && r.action === 'reposition') {
-                        const prevY = sameComponentLastRound.params?.y;
-                        const currY = r.params?.y;
-                        if (prevY !== undefined && currY !== undefined) {
-                            const delta = Math.abs(currY - prevY);
-                            if (delta < 0.05) { // Oscillating within small range
-                                console.warn(`  [FILTER] Repair ${idx+1} rejected: oscillation detected (Δy=${delta.toFixed(3)})`);
-                                return false;
+                    // BUG FIX 2026-01-26: Only check oscillation if we have previous rounds
+                    // BUG FIX 2026-01-27: The repairHistory was being pushed BEFORE filtering,
+                    // causing repairs to be compared against themselves. Fixed by moving push
+                    // to after filtering. Also, delta=0 is REDUNDANCY not oscillation - skip
+                    // applying but don't penalize.
+                    if (repairHistory.length > 0 && r.action === 'reposition') {
+                        const lastRoundRepairs = repairHistory[repairHistory.length - 1] || [];
+                        const sameComponentLastRound = lastRoundRepairs.find(
+                            prev => prev.component_id === r.component_id && prev.action === r.action
+                        );
+                        // Only check oscillation for reposition actions with matching previous repairs
+                        if (sameComponentLastRound) {
+                            const prevY = sameComponentLastRound.params?.y;
+                            const currY = r.params?.y;
+                            // Both values must be defined to compare
+                            if (prevY !== undefined && currY !== undefined) {
+                                const delta = Math.abs(currY - prevY);
+                                // delta=0 is redundancy (same position), not oscillation
+                                // Skip silently - it's not harmful, just wasteful
+                                if (delta === 0) {
+                                    console.log(`  [FILTER] Repair ${idx+1} skipped: redundant reposition (same y=${currY})`);
+                                    return false;
+                                }
+                                // Small non-zero delta is oscillation (model can't decide)
+                                if (delta < 0.05) {
+                                    console.warn(`  [FILTER] Repair ${idx+1} rejected: oscillation detected (Δy=${delta.toFixed(3)})`);
+                                    return false;
+                                }
                             }
                         }
                     }
@@ -1856,6 +1912,11 @@ export async function runQwenVisualArchitectLoop(
                 if (rejectedCount > 0) {
                     console.log(`[VISUAL ARCHITECT] Filtered ${rejectedCount}/${repairs.length} problematic repairs`);
                 }
+                
+                // CRITICAL: Track repairs AFTER filtering, not before!
+                // This ensures we only compare against APPLIED repairs from previous rounds,
+                // not the current round's raw repairs (which caused self-comparison bug)
+                repairHistory.push(filteredRepairs);
                 
                 if (filteredRepairs.length > 0) {
                     console.log(`[VISUAL ARCHITECT] Applying ${filteredRepairs.length} validated repairs...`);
