@@ -379,7 +379,7 @@ export async function runLayoutRepair(
                 items: {
                     type: "object",
                     properties: {
-                        type: { type: "string", enum: ["text-bullets", "metric-cards", "process-flow", "icon-grid", "chart-frame", "title-section"] }
+                        type: { type: "string", enum: ["text-bullets", "metric-cards", "process-flow", "icon-grid", "chart-frame"] }
                     },
                     required: ["type"]
                 }

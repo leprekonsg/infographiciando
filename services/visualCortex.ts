@@ -1398,45 +1398,53 @@ function applyRepairsToSlide(
                 break;
 
             case 'adjust_spacing':
-                // CRITICAL FIX: Spacing increases cause overflow in tight layouts
-                // Only apply spacing adjustments that REDUCE space, not increase it
-                const currentLineHeight = (component as any)._hintLineHeight || 1.4;
+                // ============================================================================
+                // SPACING REPAIR STRATEGY (Fixed 2026-01-25)
+                // ============================================================================
+                // PROBLEM: Qwen-VL requests spacing increases (lineHeight > 1.0) to improve
+                // readability, but our fit calculation used these as multipliers, which
+                // INCREASED required height and made overflow WORSE.
+                //
+                // SOLUTION: 
+                // 1. lineHeight > 1.0 is stored as a VISUAL HINT only (not used in fit calc)
+                // 2. lineHeight < 1.0 (compression) IS used in fit calc to allow tighter packing
+                // 3. For readability requests, we simplify content instead of increasing spacing
+                // ============================================================================
+                const currentLineHeight = (component as any)._hintLineHeight || 1.0;
                 const requestedLineHeight = params?.lineHeight;
                 
-                // SAFETY: Never increase line height above 1.5 (causes overflow)
-                // If Qwen-VL requests > 1.5, that's a signal that content reduction is needed
-                // Prefer simplify_content or resize over silent clamping
+                // ============================================================================
+                // CONSERVATIVE REPAIR STRATEGY (Fixed 2026-01-26)
+                // ============================================================================
+                // CRITICAL INSIGHT: Content simplification (removing items) causes score DROPS
+                // because Qwen-VL then critiques the slide as "sparse" or "incomplete".
+                // 
+                // ROOT CAUSE: The old strategy converted spacing requests → content removal.
+                // This destroyed user information AND hurt visual scores.
+                //
+                // NEW STRATEGY: Apply ONLY non-destructive repairs:
+                // 1. lineHeight 1.0-1.5: Apply as visual hint (mild readability improvement)
+                // 2. lineHeight > 1.5: Cap at 1.3 (safe maximum), but NEVER remove content
+                // 3. Content simplification: ONLY via explicit 'simplify_content' action,
+                //    and only when score is critically low (<50) - not as spacing fallback
+                // ============================================================================
                 if (requestedLineHeight && requestedLineHeight > 1.5) {
-                    console.warn(`[REPAIR] lineHeight ${requestedLineHeight} > max 1.5 for ${component_id}. Triggering content simplification.`);
-                    
-                    // Instead of clamping, reduce content if possible
-                    const hasReducibleContent = 
-                        (component.type === 'text-bullets' && Array.isArray((component as any).content) && (component as any).content.length > 2) ||
-                        (component.type === 'metric-cards' && Array.isArray((component as any).metrics) && (component as any).metrics.length > 2) ||
-                        (component.type === 'process-flow' && Array.isArray((component as any).steps) && (component as any).steps.length > 3);
-                    
-                    if (hasReducibleContent) {
-                        // Remove 1 item to make room instead of forcing tight spacing
-                        if (component.type === 'text-bullets') {
-                            (component as any).content = (component as any).content.slice(0, -1);
-                        } else if (component.type === 'metric-cards') {
-                            (component as any).metrics = (component as any).metrics.slice(0, -1);
-                        } else if (component.type === 'process-flow') {
-                            (component as any).steps = (component as any).steps.slice(0, -1);
-                        }
-                        console.log(`[REPAIR] Simplified content for ${component_id} (removed 1 item) instead of excessive line-height`);
-                        // Now we can use a comfortable 1.45 line-height
-                        (component as any)._hintLineHeight = 1.45;
-                    } else {
-                        // Component can't be reduced further, clamp to max but log warning
-                        (component as any)._hintLineHeight = 1.5;
-                        console.warn(`[REPAIR] Clamped lineHeight to 1.5 (content cannot be reduced further)`);
-                    }
+                    // Cap at safe maximum, but DON'T remove content
+                    console.warn(`[REPAIR] lineHeight ${requestedLineHeight} > 1.5. Capping at 1.3 (no content removal).`);
+                    (component as any)._hintLineHeight = 1.3;
+                    appliedCount++;
+                } else if (requestedLineHeight && requestedLineHeight > 1.0) {
+                    // Safe range: apply directly as readability hint
+                    (component as any)._hintLineHeight = requestedLineHeight;
+                    console.log(`[REPAIR] Applied lineHeight ${requestedLineHeight} to ${component_id} (readability hint)`);
+                    appliedCount++;
                 } else if (params?.lineHeight !== undefined) {
-                    (component as any)._hintLineHeight = Math.min(params.lineHeight, 1.5); // Always enforce max
+                    // For values <= 1.2, store as-is (will be used if < 1.0)
+                    (component as any)._hintLineHeight = params.lineHeight;
+                    appliedCount++;
                 }
                 
-                console.log(`[REPAIR] Adjusting spacing ${component_id}: padding=${params?.padding}, lineHeight=${(component as any)._hintLineHeight || params?.lineHeight} (${reason})`);
+                console.log(`[REPAIR] Spacing adjusted for ${component_id}: padding=${params?.padding}, lineHeight=${(component as any)._hintLineHeight || 1.0} (${reason})`);
                 
                 // Padding increases are generally safe
                 if (params?.padding !== undefined) (component as any)._hintPadding = params.padding;
@@ -1445,33 +1453,62 @@ function applyRepairsToSlide(
                 break;
 
             case 'simplify_content':
-                console.log(`[REPAIR] Simplifying ${component_id}: remove ${params?.removeCount} items (${reason})`);
+                // ============================================================================
+                // CONSERVATIVE CONTENT SIMPLIFICATION (Fixed 2026-01-26)
+                // ============================================================================
+                // Only simplify if component has EXCESSIVE items that truly cause overflow.
+                // Aggressive removal hurts scores more than it helps (sparse slide critique).
+                // 
+                // Thresholds:
+                // - text-bullets: Only remove if > 5 items (keep at least 3)
+                // - metric-cards: Only remove if > 4 items (keep at least 2)  
+                // - process-flow: Only remove if > 5 steps (keep at least 3)
+                // - icon-grid: Only remove if > 6 items (keep at least 4)
+                // ============================================================================
                 const removeCount = params?.removeCount || 1;
-                // Truncate arrays (bullets, metrics, etc.)
-                if (component.type === 'text-bullets' && 'content' in component) {
-                    const content = (component as any).content;
-                    if (Array.isArray(content) && content.length > removeCount) {
-                        (component as any).content = content.slice(0, -removeCount);
-                        appliedCount++;
+                const SIMPLIFY_THRESHOLDS = {
+                    'text-bullets': { min: 3, trigger: 5 },
+                    'metric-cards': { min: 2, trigger: 4 },
+                    'process-flow': { min: 3, trigger: 5 },
+                    'icon-grid': { min: 4, trigger: 6 }
+                };
+                
+                const threshold = SIMPLIFY_THRESHOLDS[component.type as keyof typeof SIMPLIFY_THRESHOLDS];
+                
+                if (!threshold) {
+                    console.warn(`[REPAIR] simplify_content skipped: ${component.type} not supported`);
+                    break;
+                }
+                
+                // Get the content array
+                let contentArray: any[] | undefined;
+                if (component.type === 'text-bullets') contentArray = (component as any).content;
+                else if (component.type === 'metric-cards') contentArray = (component as any).metrics;
+                else if (component.type === 'process-flow') contentArray = (component as any).steps;
+                else if (component.type === 'icon-grid') contentArray = (component as any).items;
+                
+                if (!Array.isArray(contentArray)) {
+                    console.warn(`[REPAIR] simplify_content skipped: no array found for ${component.type}`);
+                    break;
+                }
+                
+                // Only simplify if above trigger threshold and would stay above minimum
+                if (contentArray.length > threshold.trigger && contentArray.length - removeCount >= threshold.min) {
+                    const newLength = contentArray.length - removeCount;
+                    console.log(`[REPAIR] Simplifying ${component_id}: ${contentArray.length} → ${newLength} items (reason: ${reason})`);
+                    
+                    if (component.type === 'text-bullets') {
+                        (component as any).content = contentArray.slice(0, newLength);
+                    } else if (component.type === 'metric-cards') {
+                        (component as any).metrics = contentArray.slice(0, newLength);
+                    } else if (component.type === 'process-flow') {
+                        (component as any).steps = contentArray.slice(0, newLength);
+                    } else if (component.type === 'icon-grid') {
+                        (component as any).items = contentArray.slice(0, newLength);
                     }
-                } else if (component.type === 'metric-cards' && 'metrics' in component) {
-                    const metrics = (component as any).metrics;
-                    if (Array.isArray(metrics) && metrics.length > removeCount) {
-                        (component as any).metrics = metrics.slice(0, -removeCount);
-                        appliedCount++;
-                    }
-                } else if (component.type === 'process-flow' && 'steps' in component) {
-                    const steps = (component as any).steps;
-                    if (Array.isArray(steps) && steps.length > removeCount) {
-                        (component as any).steps = steps.slice(0, -removeCount);
-                        appliedCount++;
-                    }
-                } else if (component.type === 'icon-grid' && 'items' in component) {
-                    const items = (component as any).items;
-                    if (Array.isArray(items) && items.length > removeCount) {
-                        (component as any).items = items.slice(0, -removeCount);
-                        appliedCount++;
-                    }
+                    appliedCount++;
+                } else {
+                    console.log(`[REPAIR] simplify_content SKIPPED for ${component_id}: ${contentArray.length} items below trigger ${threshold.trigger} or would go below min ${threshold.min}`);
                 }
                 break;
         }
@@ -1765,11 +1802,74 @@ export async function runQwenVisualArchitectLoop(
                 };
             }
 
-            // Step 4: Apply repairs (already normalized)
+            // Step 4: Apply repairs (with error reflection - filter problematic repairs)
             if (repairs.length > 0) {
-                console.log(`[VISUAL ARCHITECT] Applying ${repairs.length} repairs...`);
-                currentSlide = applyRepairsToSlide(currentSlide, repairs, styleGuide);
-                allRepairs = [...allRepairs, ...repairs];
+                // ============================================================================
+                // ERROR REFLECTION: Filter repairs before applying
+                // ============================================================================
+                // Based on Phil Schmid's agentic framework: "Tool latency feedback disrupts the 
+                // reasoning loop - the model hallucinates forward." We filter repairs that:
+                // 1. Request excessive spacing (lineHeight > 1.5 causes overflow, not readability)
+                // 2. Move elements outside safe bounds (y < 0.05 or y > 0.85 causes clipping)
+                // 3. Contradict previous successful repairs (prevents oscillation)
+                // ============================================================================
+                
+                const filteredRepairs = repairs.filter((r, idx) => {
+                    // FILTER 1: Excessive spacing requests (hallucination pattern)
+                    // When Qwen-VL sees "cramped" text, it over-requests spacing
+                    if (r.action === 'adjust_spacing' && r.params?.lineHeight && r.params.lineHeight > 1.5) {
+                        console.warn(`  [FILTER] Repair ${idx+1} rejected: excessive lineHeight ${r.params.lineHeight} > 1.5`);
+                        return false;
+                    }
+                    
+                    // FILTER 2: Out-of-bounds repositioning
+                    if (r.action === 'reposition') {
+                        const y = r.params?.y;
+                        if (y !== undefined && (y < 0.05 || y > 0.85)) {
+                            console.warn(`  [FILTER] Repair ${idx+1} rejected: y=${y} out of safe bounds [0.05, 0.85]`);
+                            return false;
+                        }
+                    }
+                    
+                    // FILTER 3: Check for repair oscillation (same component, opposite actions)
+                    // If we repositioned this component UP in last round and now DOWN, skip it
+                    const lastRoundRepairs = repairHistory[repairHistory.length - 1] || [];
+                    const sameComponentLastRound = lastRoundRepairs.find(
+                        prev => prev.component_id === r.component_id && prev.action === r.action
+                    );
+                    if (sameComponentLastRound && r.action === 'reposition') {
+                        const prevY = sameComponentLastRound.params?.y;
+                        const currY = r.params?.y;
+                        if (prevY !== undefined && currY !== undefined) {
+                            const delta = Math.abs(currY - prevY);
+                            if (delta < 0.05) { // Oscillating within small range
+                                console.warn(`  [FILTER] Repair ${idx+1} rejected: oscillation detected (Δy=${delta.toFixed(3)})`);
+                                return false;
+                            }
+                        }
+                    }
+                    
+                    return true;
+                });
+                
+                const rejectedCount = repairs.length - filteredRepairs.length;
+                if (rejectedCount > 0) {
+                    console.log(`[VISUAL ARCHITECT] Filtered ${rejectedCount}/${repairs.length} problematic repairs`);
+                }
+                
+                if (filteredRepairs.length > 0) {
+                    console.log(`[VISUAL ARCHITECT] Applying ${filteredRepairs.length} validated repairs...`);
+                    
+                    // Log each repair for debugging
+                    filteredRepairs.forEach((r, i) => {
+                        console.log(`  [Repair ${i+1}] ${r.action} on ${r.component_id}: ${JSON.stringify(r.params)} - "${r.reason}"`);
+                    });
+                    
+                    currentSlide = applyRepairsToSlide(currentSlide, filteredRepairs, styleGuide);
+                    allRepairs = [...allRepairs, ...filteredRepairs];
+                } else {
+                    console.warn('[VISUAL ARCHITECT] All repairs filtered out - keeping current state');
+                }
             } else {
                 console.warn('[VISUAL ARCHITECT] No repairs suggested, exiting');
                 // FIX: Return best slide if current is worse

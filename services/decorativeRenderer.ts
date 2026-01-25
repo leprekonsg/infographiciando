@@ -51,6 +51,30 @@ export interface DecorativeRenderContext {
 // MAIN DISPATCHER
 // ============================================================================
 
+// Normalize decorative element types from compositionArchitect to supported renderer types
+// This mapping bridges the gap between what the LLM generates and what we can render
+const DECORATIVE_TYPE_MAP: Record<string, string> = {
+  // Direct mappings
+  'badge': 'badge',
+  'divider': 'divider',
+  'accent-shape': 'accent-shape',
+  'glow': 'glow',
+  'connector': 'connector',
+  
+  // CompositionArchitect-generated types → supported types
+  'category-badge': 'badge',
+  'floating-stat': 'badge',        // Render as badge with stat styling
+  'icon-glow': 'glow',
+  'accent-underline': 'divider',   // Render as horizontal divider
+  'gradient-underline': 'divider', // Render as horizontal divider
+  'gradient-divider': 'divider',
+  'connector-flow': 'connector',
+  'connector-lines': 'connector',
+  'quote-callout': 'badge',        // Render as styled badge
+  'asymmetric-emphasis': 'accent-shape',
+  'narrative-flow-pattern': 'connector',  // Render as flow connector
+};
+
 export function renderDecorativeElement(
   element: DecorativeElement,
   context: DecorativeRenderContext
@@ -66,19 +90,29 @@ export function renderDecorativeElement(
     return [];
   }
   
-  switch (element.type) {
+  // Normalize the element type using the mapping
+  const rawType = (element as any).type;
+  const normalizedType = DECORATIVE_TYPE_MAP[rawType] || rawType;
+  
+  // If the type was mapped, create a modified element with the normalized type
+  const normalizedElement = normalizedType !== rawType
+    ? { ...element, type: normalizedType, _originalType: rawType }
+    : element;
+  
+  switch (normalizedType) {
     case 'badge':
-      return renderBadge(element as BadgeElement, context);
+      return renderBadge(normalizedElement as BadgeElement, context);
     case 'divider':
-      return renderDivider(element as DividerElement, context);
+      return renderDivider(normalizedElement as DividerElement, context);
     case 'accent-shape':
-      return renderAccentShape(element as AccentShapeElement, context);
+      return renderAccentShape(normalizedElement as AccentShapeElement, context);
     case 'glow':
-      return renderGlow(element as GlowElement, context);
+      return renderGlow(normalizedElement as GlowElement, context);
     case 'connector':
-      return renderConnector(element as ConnectorElement, context);
+      return renderConnector(normalizedElement as ConnectorElement, context);
     default:
-      console.warn(`[DecorativeRenderer] Unknown element type: ${(element as any).type}`);
+      // Only warn if we truly don't recognize the type after normalization
+      console.warn(`[DecorativeRenderer] Unknown element type: ${rawType} (normalized: ${normalizedType})`);
       return [];
   }
 }
@@ -482,6 +516,14 @@ export function renderConnector(
 ): VisualElement[] {
   const elements: VisualElement[] = [];
   const color = connector.color || context.palette.secondary;
+  
+  // Null safety: ensure from/to coordinates exist
+  if (!connector.from || !connector.to || 
+      typeof connector.from.x !== 'number' || typeof connector.from.y !== 'number' ||
+      typeof connector.to.x !== 'number' || typeof connector.to.y !== 'number') {
+    console.warn('[DecorativeRenderer] Connector missing valid from/to coordinates, skipping');
+    return elements; // Return empty array instead of crashing
+  }
   
   // Calculate line geometry
   const dx = connector.to.x - connector.from.x;

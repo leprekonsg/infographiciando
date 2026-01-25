@@ -275,20 +275,42 @@ function reportFailure(model: string, isQuota: boolean) {
 }
 
 export async function runJsonRepair(brokenJson: string, schema: any, tracker?: TokenTracker): Promise<any> {
+  // CIRCUIT BREAKER: Check if input is hopelessly degenerated (don't waste API call)
+  const last200 = brokenJson.slice(-200).toLowerCase();
+  const degenerationPatterns = [
+    /(is_the_correct|the_correct_type|must_be_exactly)/i,
+    /(_type_[a-z-]+_){2,}/i,
+    /([a-z_-]{4,})\1{4,}/i,
+    /([a-z0-9])\1{10,}/
+  ];
+  
+  if (degenerationPatterns.some(p => p.test(last200))) {
+    console.warn("[JSON REPAIR] Input is severely degenerated - skipping model repair");
+    throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Input too degenerated to repair");
+  }
+
   try {
     // JSON Repair: Pattern matching task → MODEL_SIMPLE (2.5 Flash)
     // 95% cheaper than Pro, sufficient for structural repair (not deep synthesis)
     console.log("[JSON REPAIR] Attempting repair with 2.5 Flash...");
     const safeInput = brokenJson.length > 15000 ? brokenJson.substring(0, 15000) + "...(truncated)" : brokenJson;
 
-    return await callAI(
+    // Add timeout protection to prevent infinite hangs
+    const REPAIR_TIMEOUT_MS = 30000; // 30 second max for repair
+    const repairPromise = callAI(
       MODEL_SIMPLE,
       PROMPTS.JSON_REPAIRER.TASK(safeInput),
       { mode: 'json', schema: schema, config: { temperature: 0.0, maxOutputTokens: 8192 } }, // temp=0 for deterministic repair
       tracker
     );
-  } catch (e) {
-    console.error("[JSON REPAIR] Repair failed.", e);
+
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('JSON repair timeout after 30s')), REPAIR_TIMEOUT_MS)
+    );
+
+    return await Promise.race([repairPromise, timeoutPromise]);
+  } catch (e: any) {
+    console.error("[JSON REPAIR] Repair failed:", e.message);
     throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Agent repair failed.");
   }
 }

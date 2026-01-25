@@ -512,7 +512,16 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
   }
 
   // 4. CHECK: Mode Compliance (Demoted to Warning - graceful degradation is OK)
-  if (routerConfig?.renderMode === 'data-viz' || slide.type === 'data-viz') {
+  // ============================================================================
+  // FIX 2026-01-26: Only check data-viz compliance if slide.type is STILL data-viz.
+  // The orchestrator may have downgraded data-viz → content-main when no data was
+  // available, which is intentional graceful degradation. Don't warn in that case.
+  // ============================================================================
+  const isDataVizSlide = slide.type === 'data-viz';
+  const isDataVizRouterMode = routerConfig?.renderMode === 'data-viz';
+  
+  // Only warn if the slide is STILL marked as data-viz (not downgraded)
+  if (isDataVizSlide) {
     const hasChartFrame = components.some(c => c.type === 'chart-frame');
     const hasChartSpec = !!slide.chartSpec;
     // Also check for metric-cards which is an acceptable fallback for data-viz
@@ -528,6 +537,8 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
       });
     }
   }
+  // Note: If router requested data-viz but slide.type is now content-main,
+  // that's an intentional downgrade - no warning needed.
 
   // 5. CHECK: Structure Integrity
   components.forEach(c => {

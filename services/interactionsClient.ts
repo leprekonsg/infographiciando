@@ -99,6 +99,21 @@ function classifyJsonFailure(text: string): JsonClassification {
         return { type: 'degeneration', confidence: 'high' };
     }
 
+    // NEW: Instruction echo detection (LLM repeating prompt instructions)
+    // Catches patterns like "_TYPE_metric-cards_IS_THE_CORRECT_TYPE_"
+    const instructionEchoPattern = /(IS_THE_CORRECT|THE_CORRECT_TYPE|MUST_BE_EXACTLY|CRITICAL_RULE|DO_NOT_USE)/i;
+    if (instructionEchoPattern.test(last500)) {
+        console.warn(`[JSON CLASSIFY] Detected instruction echo pattern (LLM repeating prompt text)`);
+        return { type: 'degeneration', confidence: 'high' };
+    }
+
+    // NEW: Repeated _TYPE_ pattern (another form of instruction echoing)
+    const typeEchoPattern = /(_TYPE_[a-z-]+_){2,}/i;
+    if (typeEchoPattern.test(last500)) {
+        console.warn(`[JSON CLASSIFY] Detected _TYPE_ echo pattern`);
+        return { type: 'degeneration', confidence: 'high' };
+    }
+
     // Check for string array pattern: ["item1", "item2", ...]
     if (/^\s*\[\s*"[^"]*"\s*(,\s*"[^"]*"\s*)*\]\s*$/.test(trimmed)) {
         return { type: 'string_array', confidence: 'high' };
@@ -219,7 +234,7 @@ function extractLongestValidPrefix(text: string): { json: string; discarded: str
 
 // Detect low-entropy/degenerate output patterns (e.g., "0-0-0", "o0o0o0", repeated chars, word loops)
 // NOTE: Must be careful not to flag legitimate JSON patterns like multiple "none" values
-// ENHANCED: Now catches CamelCase repetition and component type hallucinations
+// ENHANCED: Now catches CamelCase repetition, component type hallucinations, and instruction echoing
 function hasEntropyDegeneration(text: string): boolean {
     const sample = text.slice(-800).toLowerCase(); // Increased window to catch patterns
     const originalSample = text.slice(-800); // Keep original case for CamelCase detection
@@ -229,6 +244,21 @@ function hasEntropyDegeneration(text: string): boolean {
     if (/(?:\b0\b[\s,\-]*){6,}/.test(sample)) return true;
     if (/(?:o0){5,}/.test(sample)) return true;
     if (/([a-z0-9])\1{10,}/.test(sample)) return true;
+
+    // NEW: Instruction echo detection (LLM repeating prompt instructions)
+    // Catches patterns like "_TYPE_metric-cards_IS_THE_CORRECT_TYPE_metric-cards_IS_THE_CORRECT_"
+    const instructionEchoPattern = /(IS_THE_CORRECT|THE_CORRECT_TYPE|MUST_BE_EXACTLY|CRITICAL_RULE|DO_NOT_USE)/i;
+    if (instructionEchoPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Instruction echo detected (LLM repeating prompt text)`);
+        return true;
+    }
+
+    // NEW: Repeated _TYPE_ pattern (common instruction echo pattern)
+    const typeEchoPattern = /(_TYPE_[a-z-]+_){2,}/i;
+    if (typeEchoPattern.test(sample)) {
+        console.warn(`[DEGENERATION] _TYPE_ echo pattern detected`);
+        return true;
+    }
 
     // NEW: CamelCase repetition detection (catches "MetricCardsMetricCardsMetricCards...")
     // This is a common LLM failure mode when generating component types
@@ -262,6 +292,21 @@ function hasEntropyDegeneration(text: string): boolean {
     const layoutTypeConfusionPattern = /(split-(?:left|right)-text|hero-centered|bento-grid|standard-vertical)[-_]?(text-bullets|metric-cards|process-flow|icon-grid|chart-frame)/i;
     if (layoutTypeConfusionPattern.test(sample)) {
         console.warn(`[DEGENERATION] Layout-type confusion detected (layout variant concatenated with component type)`);
+        return true;
+    }
+
+    // NEW: Visual-zone repetition pattern (catches "visual-zone_visual-component_diagram-svg_left-visual-zone...")
+    // This happens when 2.5-flash degenerates on complex prompts designed for 3-flash
+    const visualZoneRepeatPattern = /(visual-zone|visual-component|left-visual|right-visual|diagram-svg)[-_].*\1[-_].*\1/i;
+    if (visualZoneRepeatPattern.test(sample)) {
+        console.warn(`[DEGENERATION] Visual-zone repetition pattern detected (2.5-flash prompt mismatch)`);
+        return true;
+    }
+
+    // NEW: Zone-component alternation pattern (catches "zone_component_zone_component_zone...")
+    const zoneComponentAlternation = /(zone|component|visual|diagram)[-_]([a-z]+[-_]){2,}\1/i;
+    if (zoneComponentAlternation.test(sample)) {
+        console.warn(`[DEGENERATION] Zone-component alternation pattern detected`);
         return true;
     }
 
@@ -524,6 +569,137 @@ export const MODEL_AGENTIC = 'gemini-3-flash-preview';
 
 /** High-volume/simple tasks: classification, JSON structuring, pattern matching (79% cheaper than Flash) */
 export const MODEL_SIMPLE = 'gemini-2.5-flash';
+
+// --- GLOBAL CIRCUIT BREAKER ---
+// Tracks model health across all requests to avoid repeated failures
+// Pattern: If a model fails consistently, route to fallback automatically
+
+interface CircuitBreakerState {
+    failureCount: number;
+    lastFailureTime: number;
+    lastSuccessTime: number;
+    isOpen: boolean; // true = circuit is open (model is down, use fallback)
+}
+
+const CIRCUIT_BREAKER_CONFIG = {
+    /** Number of failures before opening the circuit */
+    FAILURE_THRESHOLD: 2,
+    /** Time (ms) to keep circuit open before testing the primary model again */
+    RECOVERY_TIMEOUT_MS: 60_000, // 1 minute
+    /** Time window (ms) for counting failures - reset if no failures in this window */
+    FAILURE_WINDOW_MS: 30_000, // 30 seconds
+};
+
+const circuitBreakerState: Map<string, CircuitBreakerState> = new Map();
+
+/**
+ * Get or initialize circuit breaker state for a model
+ */
+function getCircuitState(model: string): CircuitBreakerState {
+    const normalized = normalizeModelName(model);
+    if (!circuitBreakerState.has(normalized)) {
+        circuitBreakerState.set(normalized, {
+            failureCount: 0,
+            lastFailureTime: 0,
+            lastSuccessTime: Date.now(),
+            isOpen: false
+        });
+    }
+    return circuitBreakerState.get(normalized)!;
+}
+
+/**
+ * Record a model failure. Opens circuit if threshold exceeded.
+ */
+function recordModelFailure(model: string, errorCode: number): void {
+    const state = getCircuitState(model);
+    const now = Date.now();
+    
+    // Reset count if outside failure window
+    if (now - state.lastFailureTime > CIRCUIT_BREAKER_CONFIG.FAILURE_WINDOW_MS) {
+        state.failureCount = 0;
+    }
+    
+    state.failureCount++;
+    state.lastFailureTime = now;
+    
+    // Open circuit if threshold exceeded
+    if (state.failureCount >= CIRCUIT_BREAKER_CONFIG.FAILURE_THRESHOLD) {
+        state.isOpen = true;
+        console.warn(`🔴 [CIRCUIT BREAKER] Circuit OPENED for ${model} after ${state.failureCount} failures (error ${errorCode})`);
+    }
+}
+
+/**
+ * Record a model success. Closes circuit.
+ */
+function recordModelSuccess(model: string): void {
+    const state = getCircuitState(model);
+    state.failureCount = 0;
+    state.lastSuccessTime = Date.now();
+    
+    if (state.isOpen) {
+        state.isOpen = false;
+        console.log(`🟢 [CIRCUIT BREAKER] Circuit CLOSED for ${model} after successful request`);
+    }
+}
+
+/**
+ * Check if we should use the primary model or fallback.
+ * Returns the model to use (original or fallback).
+ */
+function getEffectiveModel(requestedModel: string, fallbackModel: string): { model: string; isFallback: boolean; reason?: string } {
+    const state = getCircuitState(requestedModel);
+    const now = Date.now();
+    
+    // If circuit is closed, use primary model
+    if (!state.isOpen) {
+        return { model: requestedModel, isFallback: false };
+    }
+    
+    // Circuit is open - check if recovery timeout has passed
+    const timeSinceLastFailure = now - state.lastFailureTime;
+    if (timeSinceLastFailure > CIRCUIT_BREAKER_CONFIG.RECOVERY_TIMEOUT_MS) {
+        // Allow a test request to the primary model (half-open state)
+        console.log(`🟡 [CIRCUIT BREAKER] Testing ${requestedModel} after ${Math.round(timeSinceLastFailure/1000)}s recovery period...`);
+        return { model: requestedModel, isFallback: false, reason: 'recovery_test' };
+    }
+    
+    // Circuit is open and recovery timeout hasn't passed - use fallback
+    console.log(`🔴 [CIRCUIT BREAKER] Routing to ${fallbackModel} (circuit open for ${requestedModel}, ${Math.round((CIRCUIT_BREAKER_CONFIG.RECOVERY_TIMEOUT_MS - timeSinceLastFailure)/1000)}s until recovery test)`);
+    return { 
+        model: fallbackModel, 
+        isFallback: true, 
+        reason: `Circuit open (${state.failureCount} recent failures)` 
+    };
+}
+
+/**
+ * Check if circuit breaker is currently active for a model.
+ * Useful for callers to adapt their prompts/schemas before making requests.
+ * Returns true if the primary model (MODEL_AGENTIC) is being bypassed due to failures.
+ */
+export function isCircuitBreakerActive(model: string = MODEL_AGENTIC): boolean {
+    const state = getCircuitState(model);
+    if (!state.isOpen) return false;
+    
+    // Check if recovery timeout has passed (half-open state = not active)
+    const now = Date.now();
+    const timeSinceLastFailure = now - state.lastFailureTime;
+    return timeSinceLastFailure < CIRCUIT_BREAKER_CONFIG.RECOVERY_TIMEOUT_MS;
+}
+
+/**
+ * Reset circuit breaker for a specific model (useful for testing)
+ */
+export function resetCircuitBreaker(model?: string): void {
+    if (model) {
+        circuitBreakerState.delete(normalizeModelName(model));
+    } else {
+        circuitBreakerState.clear();
+    }
+    console.log(`[CIRCUIT BREAKER] Reset${model ? ` for ${model}` : ' all circuits'}`);
+}
 
 // --- QWEN FALLBACK CLIENT ---
 // Used when Gemini returns empty responses (content filtered, rate limited, or server errors)
@@ -913,13 +1089,41 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
     /**
      * Create a new interaction (single turn)
      * Includes automatic retry with exponential backoff for transient errors (500, 503)
+     * Uses circuit breaker pattern for automatic model fallback on persistent failures
      */
     async create(request: InteractionRequest): Promise<InteractionResponse> {
         const MAX_RETRIES = 2;
         const BASE_DELAY_MS = 2000;
+        
+        // --- CIRCUIT BREAKER: Check if we should use fallback model ---
+        const requestedModel = request.model || MODEL_AGENTIC;
+        const isFirstTurn = !request.previous_interaction_id;
+        
+        // Only apply circuit breaker for first-turn requests to avoid cross-model context issues
+        let effectiveModel = requestedModel;
+        let usingFallback = false;
+        
+        if (isFirstTurn && normalizeModelName(requestedModel) === normalizeModelName(MODEL_AGENTIC)) {
+            const circuitResult = getEffectiveModel(requestedModel, MODEL_SIMPLE);
+            effectiveModel = circuitResult.model;
+            usingFallback = circuitResult.isFallback;
+            
+            if (usingFallback) {
+                // Update request to use fallback model
+                request = {
+                    ...request,
+                    model: effectiveModel,
+                    generation_config: {
+                        ...(request.generation_config || {}),
+                        // Slightly reduce token budget for simpler model
+                        max_output_tokens: Math.min(request.generation_config?.max_output_tokens ?? 4096, 4096),
+                    }
+                };
+            }
+        }
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            console.log(`[INTERACTIONS CLIENT] Sending request to ${request.model || 'model'}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}...`);
+            console.log(`[INTERACTIONS CLIENT] Sending request to ${request.model || 'model'}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}${usingFallback ? ' (circuit breaker fallback)' : ''}...`);
 
             const controller = new AbortController();
             const timeoutMs = 300_000; // 5 minute timeout
@@ -946,6 +1150,11 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     const errorText = await response.text();
                     const status = response.status;
 
+                    // --- CIRCUIT BREAKER: Record failure for the requested model ---
+                    if ((status === 500 || status === 503) && !usingFallback) {
+                        recordModelFailure(requestedModel, status);
+                    }
+
                     // Check for transient errors that warrant retry
                     const isTransient = status === 500 || status === 503 || status === 429;
 
@@ -956,6 +1165,47 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                         clearInterval(progressInterval);
                         await new Promise(r => setTimeout(r, delay));
                         continue; // Retry
+                    }
+
+                    // --- CIRCUIT BREAKER: Last-ditch fallback if not already using fallback ---
+                    if (status === 500 && attempt === MAX_RETRIES && !usingFallback && isFirstTurn) {
+                        console.warn(`🔴 [CIRCUIT BREAKER] Final fallback to ${MODEL_SIMPLE} after exhausting retries`);
+                        try {
+                            const fallbackRequest: InteractionRequest = {
+                                ...request,
+                                model: MODEL_SIMPLE,
+                                previous_interaction_id: undefined,
+                                generation_config: {
+                                    ...(request.generation_config || {}),
+                                    temperature: Math.min(request.generation_config?.temperature ?? 0.2, 0.2),
+                                    max_output_tokens: Math.min(request.generation_config?.max_output_tokens ?? 4096, 4096),
+                                    thinking_level: request.generation_config?.thinking_level
+                                }
+                            };
+
+                            clearTimeout(timeoutId);
+                            clearInterval(progressInterval);
+                            
+                            const fallbackResponse = await fetch(`${INTERACTIONS_API_BASE}?key=${this.apiKey}`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(fallbackRequest)
+                            });
+
+                            if (fallbackResponse.ok) {
+                                const rawFallback = await fallbackResponse.json();
+                                const normalizedUsage = normalizeUsage(rawFallback);
+                                if (normalizedUsage) {
+                                    rawFallback.usage = normalizedUsage;
+                                } else if (rawFallback?.usage) {
+                                    rawFallback.usage = normalizeUsage({ usage: rawFallback.usage }) || rawFallback.usage;
+                                }
+                                console.log(`🟢 [CIRCUIT BREAKER] Fallback to ${MODEL_SIMPLE} succeeded`);
+                                return rawFallback;
+                            }
+                        } catch (fallbackErr: any) {
+                            console.error(`[CIRCUIT BREAKER] Final fallback failed:`, fallbackErr.message);
+                        }
                     }
 
                     // Parse and provide actionable guidance for common errors
@@ -1015,6 +1265,12 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                 } else if (raw?.usage) {
                     raw.usage = normalizeUsage({ usage: raw.usage }) || raw.usage;
                 }
+                
+                // --- CIRCUIT BREAKER: Record success to close circuit ---
+                if (!usingFallback) {
+                    recordModelSuccess(requestedModel);
+                }
+                
                 return raw;
             } catch (err: any) {
                 if (err.name === 'AbortError') {
@@ -1633,9 +1889,10 @@ export async function createInteraction(
         // Wait before retry (500 errors are often transient)
         await new Promise(r => setTimeout(r, 2000));
 
-        console.warn(`[INTERACTIONS CLIENT] Retrying with thinking disabled...`);
+        console.warn(`[INTERACTIONS CLIENT] Retrying with thinking disabled and temp=0 for stability...`);
 
         // Retry without thinking to maximize output budget
+        // CRITICAL: Use temperature=0 to avoid degeneration on retries
         const retryRequest: InteractionRequest = {
             model: MODEL_SIMPLE,  // Use simpler model for reliability
             input: prompt,
@@ -1643,8 +1900,8 @@ export async function createInteraction(
             response_format: options.responseFormat,
             response_mime_type: options.responseMimeType,
             generation_config: {
-                temperature: 0.1,  // Lower temp for deterministic output
-                max_output_tokens: (options.maxOutputTokens || 8192) + 2048,  // More budget
+                temperature: 0.0,  // Zero temp for deterministic output (was 0.1 - caused degeneration)
+                max_output_tokens: Math.min((options.maxOutputTokens || 8192), 4096),  // Cap output to reduce degeneration risk
                 thinking_level: undefined  // No thinking
             }
         };
@@ -1753,6 +2010,27 @@ export async function createJsonInteraction<T = any>(
         throw new Error('API returned empty response. Check API status or retry.');
     }
 
+    // --- LAYER 0.5: Early degeneration check (BEFORE attempting parse) ---
+    // Detect degenerated output immediately to avoid wasting time on parse/repair
+    // This catches the browser hang scenario where repair loops infinitely on garbage
+    if (hasEntropyDegeneration(text)) {
+        console.error(`[JSON PARSE] EARLY DEGENERATION DETECTED - skipping parse and repair`);
+        console.error(`[JSON PARSE] Response length: ${text.length}, Last 80 chars: "${text.slice(-80)}"`);
+        return {
+            layoutPlan: {
+                title: "Content",
+                background: "solid",
+                components: [{
+                    type: "text-bullets",
+                    title: "Key Points",
+                    content: ["Content generation encountered an issue.", "Slide will use fallback content."]
+                }]
+            },
+            speakerNotesLines: ['Recovered from degenerated model output.'],
+            selfCritique: { readabilityScore: 0.5, textDensityStatus: "optimal", layoutAction: "keep" }
+        } as T;
+    }
+
     // --- LAYER 1: Direct Parse ---
     try {
         return JSON.parse(text) as T;
@@ -1793,8 +2071,12 @@ export async function createJsonInteraction<T = any>(
             const last200 = text.slice(-200);
             const repetitionDensity = (last200.match(/([a-z_-]{3,})\1/gi) || []).length;
             
-            if (repetitionDensity > 5) {
-                console.error(`[JSON REPAIR] Severe degeneration detected (repetition density: ${repetitionDensity})`);
+            // Also check for visual-zone pattern specifically (common with 2.5-flash fallback)
+            const hasVisualZoneDegeneration = /visual[-_]zone.*visual[-_]zone/i.test(last200) ||
+                                               /visual[-_]component.*visual[-_]component/i.test(last200);
+            
+            if (repetitionDensity > 5 || hasVisualZoneDegeneration) {
+                console.error(`[JSON REPAIR] Severe degeneration detected (repetition density: ${repetitionDensity}, visual-zone: ${hasVisualZoneDegeneration})`);
                 console.error(`[JSON REPAIR] Skipping repair attempts - returning fallback immediately`);
                 
                 return {
@@ -1807,7 +2089,7 @@ export async function createJsonInteraction<T = any>(
                             content: ["Content generation encountered a processing issue.", "The slide will be regenerated."]
                         }]
                     },
-                    speakerNotesLines: ['Slide recovered from degenerated output.'],
+                    speakerNotesLines: ['Slide recovered from degenerated output (model fallback).'],
                     selfCritique: { readabilityScore: 0.5, textDensityStatus: "optimal", layoutAction: "keep" }
                 } as T;
             }

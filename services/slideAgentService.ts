@@ -72,7 +72,7 @@ export const DEFAULT_STYLE_MODE: StyleMode = 'professional';
 // - Simple tasks: 2.5 Flash (classification, JSON structuring)
 // - Reasoning: 3 Pro (reserved for >1M context, rarely needed)
 
-import { MODEL_AGENTIC } from "./interactionsClient";
+import { MODEL_AGENTIC, isCircuitBreakerActive } from "./interactionsClient";
 
 const MAX_AGENT_ITERATIONS = 10; // Global escape hatch per Phil Schmid's recommendation (reduced from 15 for faster convergence)
 
@@ -131,6 +131,73 @@ function ensureValidContentPlan(plan: any, meta: any): ContentPlanResult {
 }
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
+
+// ============================================================================
+// BELIEF ANCHOR: Component Type Validation
+// ============================================================================
+// "Tools aren't just APIs - they're belief anchors." - Phil Schmid
+// These constants and validators ensure the model can only output valid types.
+// Any drift from these exact strings triggers immediate repair.
+// ============================================================================
+
+const VALID_COMPONENT_TYPES = new Set([
+    'text-bullets',
+    'metric-cards', 
+    'process-flow',
+    'icon-grid',
+    'chart-frame',
+    'diagram-svg'
+]);
+
+/**
+ * Validates a component type string against the belief anchor.
+ * Returns the validated type or 'text-bullets' as a safe fallback.
+ */
+function validateComponentType(rawType: string | undefined): string {
+    if (!rawType) return 'text-bullets';
+    
+    // Exact match (fast path)
+    const normalized = rawType.toLowerCase().trim();
+    if (VALID_COMPONENT_TYPES.has(normalized)) {
+        return normalized;
+    }
+    
+    // Check for degeneration patterns (type + garbage)
+    for (const validType of VALID_COMPONENT_TYPES) {
+        if (normalized.startsWith(validType)) {
+            console.warn(`[BELIEF ANCHOR] Type degeneration detected: "${rawType.slice(0, 40)}" → "${validType}"`);
+            return validType;
+        }
+    }
+    
+    // Check for embedded type
+    for (const validType of VALID_COMPONENT_TYPES) {
+        if (normalized.includes(validType)) {
+            console.warn(`[BELIEF ANCHOR] Extracted type from garbage: "${rawType.slice(0, 40)}" → "${validType}"`);
+            return validType;
+        }
+    }
+    
+    console.warn(`[BELIEF ANCHOR] Unknown type "${rawType.slice(0, 40)}" → "text-bullets" (safe fallback)`);
+    return 'text-bullets';
+}
+
+/**
+ * Pre-flight check for metric-cards precondition.
+ * Returns true if dataPoints are sufficient for metric-cards.
+ */
+function canUseMetricCards(dataPoints: any[] | undefined): boolean {
+    if (!dataPoints || !Array.isArray(dataPoints)) return false;
+    const validPoints = dataPoints.filter(d => 
+        d && 
+        typeof d.label === 'string' && 
+        d.label.trim().length > 0 &&
+        d.value !== undefined &&
+        d.value !== null &&
+        String(d.value).trim().length > 0
+    );
+    return validPoints.length >= 2;
+}
 
 const hashStringToUnit = (input: string): number => {
     let hash = 0;
@@ -255,6 +322,31 @@ function computeDynamicBulletCharCap(
     const fontAdjusted = Math.round(baseCap * (14 / fontSize) * monospacePenalty);
     const countAdjusted = bulletCount >= 3 ? Math.round(fontAdjusted * 0.9) : fontAdjusted;
     return Math.max(30, Math.min(countAdjusted, 100)); // Tighter limits for safety
+}
+
+// Sanitize slide-level text fields to avoid outline-sized titles/purposes
+function sanitizeSlideText(value: string, maxLen = 160): string {
+    if (!value || typeof value !== 'string') return value as any;
+    let text = value.replace(/\r/g, '').trim();
+
+    // Strip "Slide X:" prefix if present
+    text = text.replace(/^slide\s*\d+\s*[:\-]\s*/i, '').trim();
+
+    // If multiple lines, keep the first meaningful line
+    if (text.includes('\n')) {
+        const firstLine = text.split('\n').find(line => line.trim().length > 0);
+        if (firstLine) text = firstLine.trim();
+    }
+
+    // Collapse extra whitespace
+    text = text.replace(/\s{2,}/g, ' ').trim();
+
+    // Truncate aggressively to avoid oversized prompts
+    if (text.length > maxLen) {
+        text = text.slice(0, maxLen).trim();
+    }
+
+    return text;
 }
 
 function applySpatialPreflightAdjustments(
@@ -719,11 +811,7 @@ async function runRecursiveVisualCritique(
                         // I will add the necessary import in a separate step if needed. 
                         // But I can't "Add import" and "Replace block" in one transaction easily unless I overwrite the whole file.
 
-                        // Plan: I'll write the code assuming `SpatialLayoutEngine` is available or I can use dynamic import()?
-                        // TypeScript dynamic import `const { SpatialLayoutEngine } = await import('./spatialRenderer');`
-                        // That works!
-
-                        const { SpatialLayoutEngine } = await import('./spatialRenderer');
+                        // SpatialLayoutEngine is already statically imported at the top of this file
                         const renderer = new SpatialLayoutEngine();
 
                         // Re-render
@@ -957,12 +1045,21 @@ async function runGenerator(
         try {
             const isRecoveryAttempt = attempt > 0;
 
+            // --- CIRCUIT BREAKER AWARENESS ---
+            // Check if we're being routed to fallback model (2.5-flash) due to 3-flash failures
+            // If so, use a simplified prompt that 2.5-flash can handle reliably
+            const usingFallbackModel = isCircuitBreakerActive(MODEL_AGENTIC);
+            if (usingFallbackModel) {
+                console.warn(`[GENERATOR] Circuit breaker active - using simplified prompt for 2.5-flash`);
+            }
+
             // TOKEN BUDGET: Reduced from 5120/7168 to prevent bloat
             // Schema maxItems constraints enforce brevity (max 3 components, max 5 items per array)
             // NOTE: We do NOT escalate to MODEL_REASONING (Pro) because:
             // - Pro uses reasoning tokens that reduce output budget
             // - Flash is faster, cheaper, and equally capable for JSON generation
-            const maxTokens = isRecoveryAttempt ? 4096 : 3072;
+            // INCREASE budget for fallback model to avoid truncation-induced degeneration
+            const maxTokens = usingFallbackModel ? 4096 : (isRecoveryAttempt ? 4096 : 3072);
 
             // ULTRA-COMPACT component examples - minimize prompt tokens to maximize output budget
             // Layout-specific component requirements
@@ -977,11 +1074,19 @@ async function runGenerator(
             // SCHEMA GUIDANCE: Since schema is now ultra-minimal, provide explicit JSON examples
             // CRITICAL: metric-cards example MUST show full array structure with 2+ items
             // The model outputs empty metrics:[] because the minimal schema doesn't define inner structure
+            // FALLBACK MODEL: Exclude diagram-svg (2.5-flash degenerates on it)
             const metricExample = hasValidDataPoints
                 ? `metric-cards: {"type":"metric-cards","metrics":[{"value":"${safeContentPlan.dataPoints[0]?.value || '42M'}","label":"${safeContentPlan.dataPoints[0]?.label || 'Metric'}","icon":"TrendingUp"},{"value":"${safeContentPlan.dataPoints[1]?.value || '85%'}","label":"${safeContentPlan.dataPoints[1]?.label || 'Growth'}","icon":"Activity"}]}`
                 : `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}`;
 
-            const componentExamples = `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
+            // SIMPLIFIED EXAMPLES for fallback model - no diagram-svg, no spatial zones terminology
+            const componentExamples = usingFallbackModel
+                ? `COMPONENT TYPES (pick 1-2):
+text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
+${metricExample}
+process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
+icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}`
+                : `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
 text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
 ${metricExample}
 process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
@@ -1030,6 +1135,26 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                     ? `\nVISUAL FOCUS: Include the theme "${routerConfig.visualFocus}" in component text.`
                     : '';
                 basePrompt = `Fix these errors: ${errorSummary}${visualFocusHint}\n\nContent: ${JSON.stringify(safeContentPlan)}`;
+            } else if (usingFallbackModel) {
+                // --- SIMPLIFIED PROMPT FOR 2.5-FLASH FALLBACK ---
+                // Remove all spatial zone terminology, diagram-svg references, and complex layout concepts
+                // that cause 2.5-flash to degenerate into repetition loops
+                const simplifiedPrompt = `Generate a slide layout JSON for: "${meta.title}"
+
+Content to include:
+${safeContentPlan.keyPoints.map((p, i) => `${i+1}. ${p}`).join('\n')}
+${safeContentPlan.dataPoints?.length ? `\nData: ${safeContentPlan.dataPoints.map(d => `${d.label}: ${d.value}`).join(', ')}` : ''}
+
+Requirements:
+- Output ONLY valid JSON, no markdown or explanations
+- Use 1-2 components maximum
+- Use ONLY these component types: "text-bullets", "metric-cards", "process-flow", "icon-grid"
+- Keep text short (bullets under 80 chars)
+- Include title in layoutPlan
+
+Expected structure:
+{"layoutPlan":{"title":"...", "background":"solid", "components":[...]}}`;
+                basePrompt = simplifiedPrompt;
             } else {
                 basePrompt = PROMPTS.VISUAL_DESIGNER.TASK(
                     JSON.stringify(safeContentPlan),
@@ -1042,7 +1167,8 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
 
             // PROMPT BUDGETING: Hard circuit breaker for prompt length
             // Prevent constraint violations by progressively shedding context
-            const MAX_PROMPT_CHARS = 12000;
+            // LOWER limit for fallback model to avoid overwhelming it
+            const MAX_PROMPT_CHARS = usingFallbackModel ? 6000 : 12000;
             let prompt = `${basePrompt}\n\n${componentExamples}`;
 
             if (prompt.length > MAX_PROMPT_CHARS) {
@@ -1081,21 +1207,41 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                 prompt = basePrompt;
             }
 
+            // System instruction - simplified for fallback model
+            const systemInstruction = usingFallbackModel
+                ? "You are a JSON generator. Output ONLY valid JSON with no explanations or markdown."
+                : PROMPTS.VISUAL_DESIGNER.ROLE;
 
-
-            // Always use MODEL_AGENTIC (Flash) - it's faster and doesn't truncate
+            // Always use MODEL_AGENTIC (Flash) - circuit breaker will route to 2.5-flash if needed
             const raw = await createJsonInteraction(
-                MODEL_AGENTIC,  // ALWAYS Flash - never escalate to Pro
+                MODEL_AGENTIC,  // Circuit breaker may route to MODEL_SIMPLE automatically
                 prompt,
                 minimalGeneratorSchema,
                 {
-                    systemInstruction: PROMPTS.VISUAL_DESIGNER.ROLE,
-                    temperature: isRecoveryAttempt ? 0.0 : 0.1,
+                    systemInstruction,
+                    temperature: usingFallbackModel ? 0.0 : (isRecoveryAttempt ? 0.0 : 0.1),
                     maxOutputTokens: maxTokens,
                     thinkingLevel: undefined
                 },
                 costTracker
             );
+
+            // Check for degeneration fallback response (returned by early abort in createJsonInteraction)
+            // These have generic titles like "Content" or "Content Recovery" from the fallback logic
+            const isDegenerationFallback = raw?.layoutPlan?.title === 'Content' || 
+                                           raw?.layoutPlan?.title === 'Content Recovery' ||
+                                           raw?.speakerNotesLines?.some((n: string) => 
+                                               n.includes('degenerated') || n.includes('recovery') || n.includes('issue')
+                                           );
+            
+            if (isDegenerationFallback) {
+                console.warn(`[GENERATOR] Detected degeneration fallback response - will retry with lower temperature`);
+                generatorFailures++;
+                if (generatorFailures > 1) {
+                    throw new Error('Repeated degeneration - circuit breaker');
+                }
+                continue; // Try again with recovery attempt
+            }
 
             if (!raw || !raw.layoutPlan) {
                 throw new Error("Invalid generator output: missing layoutPlan");
@@ -1119,6 +1265,46 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
                 validation: undefined,
                 warnings: []
             };
+
+            // ============================================================================
+            // BELIEF ANCHOR ENFORCEMENT (pre-autoRepair)
+            // ============================================================================
+            // Apply type validation BEFORE autoRepairSlide to catch degeneration early.
+            // This prevents garbage types from polluting downstream processing.
+            // ============================================================================
+            if (candidate.layoutPlan?.components) {
+                let beliefAnchorFixed = 0;
+                candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
+                    const validatedType = validateComponentType(c.type);
+                    if (validatedType !== c.type) {
+                        beliefAnchorFixed++;
+                        return { ...c, type: validatedType };
+                    }
+                    return c;
+                });
+                
+                if (beliefAnchorFixed > 0) {
+                    console.log(`[GENERATOR] Belief anchor enforced: fixed ${beliefAnchorFixed} component type(s)`);
+                    candidate.warnings = [
+                        ...(candidate.warnings || []),
+                        `Belief anchor: ${beliefAnchorFixed} component type(s) normalized`
+                    ];
+                }
+                
+                // PRECONDITION CHECK: Convert metric-cards to text-bullets if dataPoints insufficient
+                const hasEnoughDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
+                candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
+                    if (c.type === 'metric-cards' && !hasEnoughDataPoints) {
+                        console.warn(`[GENERATOR] Precondition failed: metric-cards without valid dataPoints → text-bullets`);
+                        return {
+                            type: 'text-bullets',
+                            title: c.title || 'Key Points',
+                            content: safeContentPlan.keyPoints.slice(0, 3)
+                        };
+                    }
+                    return c;
+                });
+            }
 
             // Use safeContentPlan (not raw contentPlan) for guaranteed-valid keyPoints
             if (Array.isArray(safeContentPlan.keyPoints) && safeContentPlan.keyPoints.length > 0) {
@@ -1292,7 +1478,7 @@ CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with valu
             }
 
             const qualityFlags = (candidate.warnings || []).some(w =>
-                /Qwen QA flagged|Auto-rerouted layout|Converted .* to text-bullets|Preflight adjustments|Validation:/i.test(String(w))
+                /Qwen QA flagged|Visual critique|Auto-rerouted layout|Layout adjusted by Qwen selector|Converted .* to text-bullets|Preflight adjustments|Validation:/i.test(String(w))
             );
 
             // CRITICAL: Check for STRUCTURAL issues (overflow/truncation) vs COSMETIC issues
@@ -1802,6 +1988,53 @@ export const generateAgenticDeck = async (
     onProgress: (status: string, percent?: number) => void,
     options?: GenerationOptions
 ): Promise<EditableSlideDeck> => {
+    // TOPIC SANITIZATION: Detect when user provides full outline vs simple topic
+    // If user pastes a complete presentation outline, extract just the core topic
+    // This prevents the entire outline from being sent to each slide generator
+    let sanitizedTopic = topic.trim();
+    
+    // Detect common outline patterns (Slide 1:, Slide 2:, bullet points, etc.)
+    const looksLikeFullOutline = (
+        /Slide\s*\d+\s*:/i.test(sanitizedTopic) ||
+        /•\s*Title:|•\s*Content:|•\s*Visual:/i.test(sanitizedTopic) ||
+        sanitizedTopic.split('\n').length > 10 ||
+        sanitizedTopic.length > 2000
+    );
+    
+    if (looksLikeFullOutline) {
+        console.warn(`[ORCHESTRATOR] Detected full outline input (${sanitizedTopic.length} chars, ${sanitizedTopic.split('\\n').length} lines). Extracting core topic...`);
+        
+        // Try to extract the presentation title from common patterns
+        // Pattern 1: "Presentation: Topic Name"
+        const presentationMatch = sanitizedTopic.match(/^Presentation:\s*([^\n]+)/i);
+        // Pattern 2: First line before any "Slide X:" or "Audience:"
+        const firstLineMatch = sanitizedTopic.match(/^([^\n•]+)/);
+        // Pattern 3: Title field in slide 1
+        const titleFieldMatch = sanitizedTopic.match(/Title:\s*([^\n•]+)/i);
+        
+        if (presentationMatch) {
+            sanitizedTopic = presentationMatch[1].trim();
+        } else if (titleFieldMatch) {
+            sanitizedTopic = titleFieldMatch[1].trim();
+        } else if (firstLineMatch && firstLineMatch[1].length < 200) {
+            sanitizedTopic = firstLineMatch[1].trim();
+        } else {
+            // Fallback: truncate to first 200 chars
+            sanitizedTopic = sanitizedTopic.substring(0, 200).split('\n')[0].trim();
+        }
+        
+        console.log(`[ORCHESTRATOR] Extracted topic: "${sanitizedTopic}"`);
+    }
+    
+    // Safety cap: even after extraction, cap topic length
+    if (sanitizedTopic.length > 500) {
+        console.warn(`[ORCHESTRATOR] Topic still too long (${sanitizedTopic.length} chars), truncating to 500`);
+        sanitizedTopic = sanitizedTopic.substring(0, 500);
+    }
+    
+    // Use sanitized topic for rest of generation
+    topic = sanitizedTopic;
+
     // Extract style mode with fallback to default
     const styleMode: StyleMode = options?.styleMode || DEFAULT_STYLE_MODE;
     const styleProfile = getStyleProfile(styleMode);
@@ -1885,7 +2118,9 @@ export const generateAgenticDeck = async (
 
     // 3. PER-SLIDE GENERATION with Context Folding + Circuit Breaker + Style-Awareness
     for (let i = 0; i < totalSlides; i++) {
-        const slideMeta = outline.slides[i];
+        const slideMeta = { ...outline.slides[i] };
+        slideMeta.title = sanitizeSlideText(String(slideMeta.title || ''), 160) || `Slide ${i + 1}`;
+        slideMeta.purpose = sanitizeSlideText(String(slideMeta.purpose || ''), 240) || 'Content';
         let slideConstraints: RouterConstraints = {};
 
         try {
@@ -1974,9 +2209,33 @@ export const generateAgenticDeck = async (
 
             console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints${safeContentPlan.contentStrategy ? ` (${safeContentPlan.contentStrategy.preferredFormat})` : ''}`);
 
-            // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
-            // This prevents Generator from outputting empty metrics:[] arrays
+            // ============================================================================
+            // DATA-VIZ MODE MISMATCH PREVENTION (Fixed 2026-01-26)
+            // ============================================================================
+            // ROOT CAUSE: Architect assigns "data-viz" type based on slide purpose, but 
+            // Content Planner may not find quantitative data in facts. Generator then
+            // outputs metric-cards with empty arrays, autoRepair converts to text-bullets,
+            // and validator throws WARN_MODE_MISMATCH.
+            //
+            // SOLUTION: Downgrade slide type from "data-viz" to "content-main" when:
+            // 1. No chartSpec exists (no chart definition)
+            // 2. dataPoints < 2 (insufficient for metric-cards)
+            // This keeps the agentic contract clean - each agent gets accurate context.
+            // ============================================================================
+            const hasChartSpec = safeContentPlan.chartSpec && safeContentPlan.chartSpec.type;
             const hasValidDataPoints = safeContentPlan.dataPoints && safeContentPlan.dataPoints.length >= 2;
+            
+            if (slideMeta.type === 'data-viz' && !hasChartSpec && !hasValidDataPoints) {
+                console.log(`[ORCHESTRATOR] ⚠️ data-viz slide "${slideMeta.title}" lacks data (chartSpec: ${!!hasChartSpec}, dataPoints: ${safeContentPlan.dataPoints.length})`);
+                console.log(`[ORCHESTRATOR] Downgrading slide type: data-viz → content-main`);
+                slideMeta.type = 'content-main';
+                // Also update purpose to reflect the change
+                if (slideMeta.purpose?.toLowerCase().includes('data') || slideMeta.purpose?.toLowerCase().includes('metric')) {
+                    slideMeta.purpose = slideMeta.purpose.replace(/\bdata\b/gi, 'key findings').replace(/\bmetric\b/gi, 'insight');
+                }
+            }
+
+            // CREATIVITY FIX: If dataPoints are insufficient, steer away from metric-heavy layouts
             if (!hasValidDataPoints) {
                 // Add metrics-rail and dashboard-tiles to avoid list (they require metrics)
                 const metricHeavyLayouts = ['metrics-rail', 'dashboard-tiles'];
@@ -2420,6 +2679,12 @@ export const generateAgenticDeck = async (
     console.log(`[ORCHESTRATOR]   - Visual Repair Success: ${visualRepairSuccess}/${visualCritiqueAttempts > 0 ? visualCritiqueAttempts : 1}`);
     console.log(`[ORCHESTRATOR]   - System 2 Cost: $${system2TotalCost.toFixed(4)} (${costSummary.totalCost > 0 ? (system2TotalCost / costSummary.totalCost * 100).toFixed(1) : 0}% of total)`);
     console.log(`[ORCHESTRATOR]   - System 2 Tokens: ${system2TotalInputTokens} in, ${system2TotalOutputTokens} out`);
+    if (costSummary.qwenVL) {
+        console.log(`[ORCHESTRATOR] 👁️  QWEN-VL VISUAL CORTEX:`);
+        console.log(`[ORCHESTRATOR]   - Qwen-VL Calls: ${costSummary.qwenVL.calls}`);
+        console.log(`[ORCHESTRATOR]   - Qwen-VL Cost: $${costSummary.qwenVL.cost.toFixed(4)}`);
+        console.log(`[ORCHESTRATOR]   - Qwen-VL Tokens: ${costSummary.qwenVL.inputTokens} in, ${costSummary.qwenVL.outputTokens} out`);
+    }
 
     // Compute metrics for reliability targets
     const deckMetrics: DeckMetrics = {

@@ -238,6 +238,22 @@ OUTPUT: Return JSON with:
       - Every string value must be a single line. Do not include literal newline characters inside any string.
       - Prefer short strings. Shorten by removing adjectives or clauses—never invent new content.
       - NEVER echo the prompt, schema, or examples. Do not repeat instruction text inside any field.
+      ═══════════════════════════════════════════════════════════════════════════
+      BELIEF ANCHOR: TITLE UNIQUENESS (CRITICAL)
+      ═══════════════════════════════════════════════════════════════════════════
+      The slide title is ALREADY rendered in the title zone via layoutPlan.title.
+      
+      ⛔ NEVER OUTPUT:
+      - A "title-section" component (redundant, will be stripped)
+      - Component titles that repeat layoutPlan.title verbatim
+      - Bullet text that starts with the slide title
+      
+      ✅ DO THIS INSTEAD:
+      - Use a SHORT SUBTITLE for components (different from slide title)
+      - Or OMIT component.title entirely if not needed
+      
+      SIMILARITY CHECK (run mentally before outputting):
+      If component.title shares >60% words with layoutPlan.title → change it or omit it.
       - Do NOT output speakerNotesLines; they are generated automatically.
       - NO REPETITION: Do not repeat the same word more than twice in a row.
       - GRID LIMITS: For 'icon-grid', generate exactly 3-6 items. Never exceed 6.
@@ -284,32 +300,28 @@ OUTPUT: Return JSON with:
       - Lower split: metrics on left, feature comparisons on right.
       - Keep descriptions to 1–2 sentences; metrics limited to 2; features limited to 2.
 
-      Component type selection:
-      - ONLY USE THESE EXACT STRINGS (case-sensitive):
-        * "text-bullets" - Lists, key points, standard text content
-        * "metric-cards" - Statistics, KPIs, numeric data with labels (REQUIRES dataPoints)
-        * "process-flow" - Sequential steps, workflows, timelines
-        * "icon-grid" - Features, benefits, categories (2-4 columns)
-        * "chart-frame" - Bar, pie, line, or doughnut charts
-        * "diagram-svg" - Circular ecosystems, closed-loop systems
+      ═══════════════════════════════════════════════════════════════════════════
+      BELIEF ANCHOR: COMPONENT TYPES (STRICT ENUM - NO VARIATIONS)
+      ═══════════════════════════════════════════════════════════════════════════
+      The "type" field MUST be EXACTLY one of these 6 strings (case-sensitive):
       
-      CRITICAL COMPONENT TYPE RULE:
-      The "type" field MUST be EXACTLY one of: "text-bullets", "metric-cards", "process-flow", "icon-grid", "chart-frame", "diagram-svg"
+      ┌─────────────────┬──────────────────────────────────────────────────────┐
+      │ "text-bullets"  │ Lists, key points, standard text content             │
+      │ "metric-cards"  │ Statistics, KPIs with labels (REQUIRES dataPoints≥2)│
+      │ "process-flow"  │ Sequential steps, workflows, timelines              │
+      │ "icon-grid"     │ Features, benefits, categories (3-5 items)          │
+      │ "chart-frame"   │ Bar, pie, line, or doughnut charts                  │
+      │ "diagram-svg"   │ Circular ecosystems, closed-loop systems            │
+      └─────────────────┴──────────────────────────────────────────────────────┘
       
-      COMMON ERRORS TO AVOID:
-      ❌ NEVER concatenate component types: "text-bullets-metric-cards" is WRONG
-      ❌ NEVER add suffixes or numbers: "text-bullets-1-1-1" is WRONG
-      ❌ NEVER include layout names in type: "split-left-text-bullets" is WRONG
-      ❌ NEVER repeat patterns: "metric-cardsMetricCards" is WRONG
-      ❌ NEVER use slashes: "text-bullets/split-left-text" is WRONG
+      ⛔ FORBIDDEN TYPE PATTERNS (will cause validation failure):
+      - "title-section" (title is rendered separately in layoutPlan.title)
+      - Any suffixes: "text-bullets-1", "metric-cards-primary" ❌
+      - Any prefixes: "main-text-bullets", "hero-metric-cards" ❌
+      - Any concatenations: "text-bullets/split-left-text" ❌
       
-      ✓ CORRECT examples:
-      - "type": "text-bullets"
-      - "type": "metric-cards"
-      - "type": "process-flow"
-      
-      Remember: The layout variant (like "split-left-text" or "hero-centered") is in ROUTER_CONFIG, NOT in the component type.
-      Component types are ONLY the 6 types listed above.
+      ✅ CORRECT: {"type": "text-bullets", ...}
+      ❌ WRONG: {"type": "text-bullets-1-1-1", ...}
       
       diagram-svg usage rules:
         * Use when visualFocus suggests: "ecosystem", "cycle", "integration", "closed-loop", "sovereignty", "interconnected"
@@ -341,9 +353,26 @@ OUTPUT: Return JSON with:
       - icon-grid: items must have 3–5 items
       - process-flow: steps must have 3–4 items
 
-      CRITICAL METRIC-CARDS RULE:
-      If CONTENT_PLAN.dataPoints is empty or has fewer than 2 items, DO NOT USE metric-cards.
-      Use text-bullets or icon-grid instead. Empty metrics:[] will fail validation and waste compute.
+      ═══════════════════════════════════════════════════════════════════════════
+      PRECONDITION CHECK: metric-cards (VERIFY BEFORE USING)
+      ═══════════════════════════════════════════════════════════════════════════
+      BEFORE outputting type: "metric-cards", you MUST verify:
+      
+      1. Does CONTENT_PLAN.dataPoints exist? □ YES → continue  □ NO → use text-bullets
+      2. Does dataPoints have ≥2 items?      □ YES → continue  □ NO → use text-bullets
+      3. Are values numeric or %/$ strings?  □ YES → continue  □ NO → use text-bullets
+      
+      IF ANY CHECK FAILS: Default to "text-bullets" with the keyPoints.
+      
+      WHY THIS MATTERS:
+      - Empty metrics:[] causes validation failure
+      - Placeholder values ("N/A", "TBD", "-") fail quality gates
+      - This check SAVES compute by avoiding repair loops
+      
+      EXAMPLE DECISION TREE:
+      CONTENT_PLAN: {keyPoints: ["AI adoption growing"], dataPoints: []}  → "text-bullets" ✓
+      CONTENT_PLAN: {keyPoints: [...], dataPoints: [{label:"Growth", value:"85%"}]} → "text-bullets" (only 1 item)
+      CONTENT_PLAN: {keyPoints: [...], dataPoints: [{...}, {...}]} → "metric-cards" ✓
 
       INPUTS:
       CONTENT_PLAN: ${contentPlanJson}

@@ -184,6 +184,56 @@ function detectAndCleanDegeneratedStrings(obj: any, maxDepth = 5): any {
     return obj;
 }
 
+// Normalize and de-duplicate titles to prevent repeated or outline-style strings
+const normalizeTitleText = (input: string): string => {
+    if (!input || typeof input !== 'string') return input as any;
+    let cleaned = input.replace(/\r/g, '').trim();
+
+    // Strip common "Slide X:" prefixes
+    cleaned = cleaned.replace(/^slide\s*\d+\s*[:\-]\s*/i, '').trim();
+
+    // If multiple lines exist, prefer the first meaningful line
+    if (cleaned.includes('\n')) {
+        const firstLine = cleaned.split('\n').find(line => line.trim().length > 0);
+        if (firstLine && firstLine.trim().length <= 120) {
+            cleaned = firstLine.trim();
+        }
+    }
+
+    // Collapse duplicate phrases like "Title Title"
+    const normalized = cleaned.replace(/\s+/g, ' ').trim();
+    const repeatMatch = normalized.match(/^(.{10,120})\s+\1$/i);
+    if (repeatMatch) {
+        cleaned = repeatMatch[1].trim();
+    }
+
+    // Final whitespace normalization
+    cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
+    return cleaned;
+};
+
+const calcTitleSimilarity = (a: string, b: string): number => {
+    const normA = a.toLowerCase().replace(/[^\w\s]/g, '').trim();
+    const normB = b.toLowerCase().replace(/[^\w\s]/g, '').trim();
+    if (!normA || !normB) return 0;
+
+    if (normA === normB) return 1.0;
+    if (normA.includes(normB) || normB.includes(normA)) return 0.9;
+
+    const wordsA = new Set(normA.split(/\s+/).filter(w => w.length > 2));
+    const wordsB = new Set(normB.split(/\s+/).filter(w => w.length > 2));
+    if (wordsA.size === 0 || wordsB.size === 0) return 0;
+    const intersection = [...wordsA].filter(w => wordsB.has(w)).length;
+    const union = new Set([...wordsA, ...wordsB]).size;
+    return union > 0 ? intersection / union : 0;
+};
+
+const shouldRemoveDuplicateTitle = (componentTitle: string, slideTitle: string): boolean => {
+    if (!componentTitle || !slideTitle) return false;
+    const similarity = calcTitleSimilarity(componentTitle, slideTitle);
+    return similarity > 0.6;
+};
+
 /**
  * Pre-sanitize component type string before normalization.
  * Handles malformed types like:
@@ -376,6 +426,17 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
     if (slide.layoutPlan?.title && typeof slide.layoutPlan.title === 'string' && slide.layoutPlan.title.length > 100) {
         slide.layoutPlan.title = slide.layoutPlan.title.slice(0, 80);
         console.warn(`[AUTO-REPAIR] Truncated oversized title`);
+    }
+
+    // Normalize slide and layout titles to avoid outline-style or repeated titles
+    if (slide.title && typeof slide.title === 'string') {
+        slide.title = normalizeTitleText(slide.title);
+    }
+    if (slide.layoutPlan?.title && typeof slide.layoutPlan.title === 'string') {
+        slide.layoutPlan.title = normalizeTitleText(slide.layoutPlan.title);
+    }
+    if (!slide.title && slide.layoutPlan?.title) {
+        slide.title = slide.layoutPlan.title;
     }
     
     // --- LAYER 5: Top-level field normalization (zero-cost rescue) ---
@@ -676,6 +737,27 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
     }
 
     components.forEach((c: any, idx: number) => {
+        // ROOT-CAUSE FIX: Title is already rendered in title zone.
+        // If model emits a title-section component, convert it to subtitle-only bullets
+        // to avoid rendering the slide title twice.
+        if (c?.type === 'title-section') {
+            const subtitleText = typeof c.subtitle === 'string' ? c.subtitle : (typeof c.text === 'string' ? c.text : undefined);
+            c.type = 'text-bullets';
+            c.content = subtitleText ? [subtitleText] : (Array.isArray(c.content) ? c.content : []);
+            delete c.title;
+            delete c.subtitle;
+        }
+
+        // Normalize component titles early and remove duplicates vs slide title
+        if (typeof c?.title === 'string') {
+            c.title = normalizeTitleText(c.title);
+            const slideTitle = slide.title || slide.layoutPlan?.title || '';
+            if (shouldRemoveDuplicateTitle(c.title, slideTitle)) {
+                console.warn(`[AUTO-REPAIR] Removed duplicate component title "${c.title}" (similar to slide title)`);
+                delete c.title;
+            }
+        }
+
         // FIX: Handle undefined, null, or missing type
         if (!c.type || typeof c.type !== 'string') {
             console.warn(`[AUTO-REPAIR] Component ${idx} has undefined/invalid type, defaulting to 'text-bullets'`);
@@ -1024,6 +1106,14 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 c.title = truncateText(c.title, CONTENT_LIMITS.title, 'text-bullets title');
             }
 
+            // TITLE DE-DUPLICATION: Remove component title if it's too similar to slide title
+            // This prevents the same title appearing twice (once in title zone, once in component)
+            const slideTitle = slide.title || slide.layoutPlan?.title || '';
+            if (c.title && slideTitle && shouldRemoveDuplicateTitle(c.title, slideTitle)) {
+                console.warn(`[AUTO-REPAIR] Removed duplicate component title "${c.title}" (similar to slide title)`);
+                delete c.title;
+            }
+
             // Semantic similarity helper for deduplication
             const calcSimilarity = (a: string, b: string): number => {
                 const wordsA = new Set(a.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/).filter(w => w.length > 2));
@@ -1138,9 +1228,10 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             
             // Also check for missing/placeholder title
             if (!c.title || c.title.toLowerCase() === 'untitled' || c.title.length < 3) {
-                // Try to infer title from slide context
-                c.title = slide.title || slide.layoutPlan?.title || 'Data Analysis';
-                addWarning(`Inferred chart title: "${c.title}"`);
+                // Use a generic chart title instead of slide title to avoid duplication
+                // The slide title is already rendered in the title zone
+                c.title = 'Data Analysis';
+                addWarning(`Assigned default chart title: "${c.title}"`);
             }
             
             // Normalize chart data
@@ -1218,8 +1309,9 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                     // Ultimate fallback - convert to text-bullets instead of breaking
                     console.warn(`[AUTO-REPAIR] Cannot infer diagram type from "${combined.slice(0, 50)}", converting to text-bullets`);
                     c.type = 'text-bullets';
-                    // Use a descriptive title based on slide context, not generic "Key Concepts"
-                    c.title = c.title || c.centralTheme || (slide.layoutPlan?.title ? `${slide.layoutPlan.title} Overview` : 'Key Insights');
+                    // Use centralTheme for title if available, otherwise a generic title
+                    // Avoid using slide title to prevent duplication
+                    c.title = c.title || c.centralTheme || 'Key Insights';
                     c.content = (c.elements || []).map((e: any) => 
                         e.label || e.title || e.name || e.description || ''
                     ).filter((s: string) => s.length > 3).slice(0, 5);

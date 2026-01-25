@@ -84,6 +84,101 @@ const CARD_STYLES: Record<CardStyle, {
   }
 };
 
+// ============================================================================
+// RESPONSIVE ICON SIZING (Fixed 2026-01-26)
+// ============================================================================
+// PROBLEM: Fixed icon sizes (0.5) looked wrong when zones vary in size.
+// Icons appeared too large in compact zones and too small in hero zones.
+//
+// SOLUTION: Dynamic sizing based on:
+// 1. Base style size (circle/square/etc)
+// 2. Zone dimensions (passed via context)  
+// 3. Content count (more items = smaller icons)
+// 4. Emphasis hints from LLM (_hintIconSize, emphasis field)
+// ============================================================================
+
+const BASE_ICON_CONTAINER_SIZES: Record<IconContainerStyle, {
+  baseSize: number;      // Base container size (slide units) - scaled by context
+  iconScale: number;     // Icon size relative to container
+  radius: number;        // Border radius (0 = square, 1 = circle)
+}> = {
+  'circle': { baseSize: 0.5, iconScale: 0.6, radius: 1 },
+  'rounded-square': { baseSize: 0.5, iconScale: 0.6, radius: 0.2 },
+  'square': { baseSize: 0.5, iconScale: 0.6, radius: 0 },
+  'none': { baseSize: 0, iconScale: 1, radius: 0 }
+};
+
+/**
+ * Get dynamic icon container size based on context
+ * 
+ * @param style - Icon container style (circle, square, etc)
+ * @param options - Context for sizing: zoneHeight, itemCount, emphasis, _hintIconSize
+ * @returns Adjusted size configuration
+ */
+export function getIconContainerSize(
+  style: IconContainerStyle,
+  options?: {
+    zoneHeight?: number;    // Height of containing zone (0-1 slide units)
+    itemCount?: number;     // Number of icons being rendered
+    emphasis?: string;      // 'primary' | 'secondary' | 'muted'
+    _hintIconSize?: number; // LLM hint for icon size override (0.3-0.8)
+  }
+): { size: number; iconScale: number; radius: number } {
+  const base = BASE_ICON_CONTAINER_SIZES[style] || BASE_ICON_CONTAINER_SIZES['circle'];
+  
+  // If LLM provided explicit hint, respect it (within bounds)
+  if (options?._hintIconSize && options._hintIconSize >= 0.2 && options._hintIconSize <= 0.9) {
+    return {
+      size: options._hintIconSize,
+      iconScale: base.iconScale,
+      radius: base.radius
+    };
+  }
+  
+  let scaleFactor = 1.0;
+  
+  // FACTOR 1: Zone height adjustment
+  // Smaller zones need smaller icons to fit
+  if (options?.zoneHeight !== undefined) {
+    if (options.zoneHeight < 0.25) {
+      scaleFactor *= 0.7;  // Compact zone
+    } else if (options.zoneHeight < 0.4) {
+      scaleFactor *= 0.85; // Medium zone
+    } else if (options.zoneHeight > 0.6) {
+      scaleFactor *= 1.15; // Large zone - slightly bigger icons
+    }
+  }
+  
+  // FACTOR 2: Item count adjustment
+  // More items = smaller icons to prevent crowding
+  if (options?.itemCount !== undefined) {
+    if (options.itemCount >= 6) {
+      scaleFactor *= 0.7;
+    } else if (options.itemCount >= 4) {
+      scaleFactor *= 0.85;
+    } else if (options.itemCount <= 2) {
+      scaleFactor *= 1.1; // Few items can be larger
+    }
+  }
+  
+  // FACTOR 3: Emphasis adjustment
+  if (options?.emphasis === 'primary') {
+    scaleFactor *= 1.05;
+  } else if (options?.emphasis === 'muted') {
+    scaleFactor *= 0.9;
+  }
+  
+  // Clamp final size to reasonable bounds
+  const finalSize = Math.max(0.25, Math.min(0.75, base.baseSize * scaleFactor));
+  
+  return {
+    size: finalSize,
+    iconScale: base.iconScale,
+    radius: base.radius
+  };
+}
+
+// Legacy constant for backward compatibility (will be removed)
 const ICON_CONTAINER_SIZES: Record<IconContainerStyle, {
   size: number;      // Container size (slide units)
   iconScale: number; // Icon size relative to container

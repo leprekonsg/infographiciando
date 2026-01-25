@@ -640,15 +640,36 @@ export class SpatialLayoutEngine {
     // Scale fonts based on zone purpose (Hierarchy)
     const scale = zone.purpose === 'hero' ? 1.2 : (zone.purpose === 'accent' ? 0.85 : 1.0);
 
-    // Apply line height hint if present (affects text vertical spacing)
-    const lineHeightMultiplier = typeof compAny._hintLineHeight === 'number'
-      ? compAny._hintLineHeight
-      : 1.0;
-
-    // Apply item spacing hint if present (affects spacing between list items)
-    const itemSpacingMultiplier = typeof compAny._hintItemSpacing === 'number'
-      ? compAny._hintItemSpacing
-      : 1.0;
+    // ============================================================================
+    // VISUAL REPAIR HINTS (from visualCortex.ts applyRepairsToSlide)
+    // ============================================================================
+    // CRITICAL FIX: The _hint* values from Visual Architect are LINE-HEIGHT FACTORS.
+    // - _hintLineHeight > 1.0 means "increase spacing for readability"
+    // - _hintLineHeight < 1.0 means "compress spacing to fit more content"
+    // 
+    // PREVIOUS BUG: We were using these as multipliers in fit calculation:
+    //   lineHeightFactor = 0.5 * lineHeightMultiplier
+    // This meant higher hints = MORE required height = WORSE overflow!
+    // 
+    // FIX: Interpret hints as VISUAL spacing, not fit calculation multipliers.
+    // For FIT CALCULATION: Use 1.0 (default) to get accurate fit estimation.
+    // For RENDERING: The visual output will honor the hint for actual display.
+    // ============================================================================
+    
+    // Read hints for logging/debugging, but DON'T use them to increase fit requirements
+    const rawLineHeightHint = typeof compAny._hintLineHeight === 'number' ? compAny._hintLineHeight : 1.0;
+    const rawItemSpacingHint = typeof compAny._hintItemSpacing === 'number' ? compAny._hintItemSpacing : 1.0;
+    
+    // For fit calculation: hints > 1.0 should NOT increase required height
+    // (that would make overflow worse). Instead, treat them as visual styling only.
+    // Hints < 1.0 (compression) CAN be applied to fit calculation.
+    const lineHeightMultiplier = rawLineHeightHint < 1.0 ? rawLineHeightHint : 1.0;
+    const itemSpacingMultiplier = rawItemSpacingHint < 1.0 ? rawItemSpacingHint : 1.0;
+    
+    // Log when hints are present (helps trace visual repair effectiveness)
+    if (rawLineHeightHint !== 1.0 || rawItemSpacingHint !== 1.0) {
+      console.log(`[SPATIAL RENDERER] Component ${comp.type} has hints: lineHeight=${rawLineHeightHint.toFixed(2)}, itemSpacing=${rawItemSpacingHint.toFixed(2)} (fit calc uses: ${lineHeightMultiplier.toFixed(2)}, ${itemSpacingMultiplier.toFixed(2)})`);
+    }
 
     if (comp.type === 'text-bullets') {
       let contentScale = scale;
@@ -680,8 +701,14 @@ export class SpatialLayoutEngine {
       const estimatedWrappedLines = this.estimateWrappedLineCount(lines, zone.w, 14 * scale);
 
       // Calculate required height WITH wrapping
+      // IMPORTANT: incorporate line-height and item-spacing hints when present
+      // Default multipliers (1.0) preserve legacy behavior
       const titleHeightFactor = hasTitle ? 0.7 : 0;
-      const wrappedLinesHeightFactor = estimatedWrappedLines > 0 ? ((estimatedWrappedLines - 1) * 0.6) + 0.5 : 0;
+      const lineHeightFactor = 0.5 * lineHeightMultiplier;
+      const lineGapFactor = 0.1 * itemSpacingMultiplier;
+      const wrappedLinesHeightFactor = estimatedWrappedLines > 0
+        ? (estimatedWrappedLines * lineHeightFactor) + (Math.max(0, estimatedWrappedLines - 1) * lineGapFactor)
+        : 0;
       const requiredFactor = titleHeightFactor + wrappedLinesHeightFactor;
       const requiredH = requiredFactor * scale;
 
@@ -704,12 +731,15 @@ export class SpatialLayoutEngine {
             });
             // Recalculate with shorter lines
             const newWrapped = this.estimateWrappedLineCount(lines, zone.w, 14 * scale);
-            const newRequired = (titleHeightFactor + (newWrapped > 0 ? ((newWrapped - 1) * 0.6) + 0.5 : 0)) * scale;
+            const newWrappedHeightFactor = newWrapped > 0
+              ? (newWrapped * lineHeightFactor) + (Math.max(0, newWrapped - 1) * lineGapFactor)
+              : 0;
+            const newRequired = (titleHeightFactor + newWrappedHeightFactor) * scale;
             if (newRequired <= h) {
               contentScale = scale; // No scaling needed after truncation
             } else {
               // Still need some scaling
-              contentScale = Math.max(minScale, h / ((titleHeightFactor + (newWrapped > 0 ? ((newWrapped - 1) * 0.6) + 0.5 : 0))));
+              contentScale = Math.max(minScale, h / (titleHeightFactor + newWrappedHeightFactor));
             }
           } else {
             // STRATEGY 2: Heavy overflow - use minimum scale and will drop lines if needed
@@ -907,14 +937,40 @@ export class SpatialLayoutEngine {
       const itemW = (w / cols) - spacing.md;
       const itemH = (h / rows) - spacing.md;
 
-      const baseIconScale = count <= 3 ? 0.38 : 0.32;
-      const getEmphasisScale = (item: any, index: number) => {
+      // ============================================================================
+      // DYNAMIC ICON SIZING (Fixed 2026-01-26)
+      // ============================================================================
+      // Use zone dimensions and item count to determine appropriate icon size.
+      // Respects LLM hints (_hintIconSize) and emphasis fields.
+      // ============================================================================
+      const getIconSize = (item: any, index: number): number => {
+        // Check for LLM hint first
+        const hintSize = (comp as any)._hintIconSize || item?._hintIconSize;
+        if (hintSize && hintSize >= 0.2 && hintSize <= 0.9) {
+          return Math.min(itemW, itemH) * hintSize;
+        }
+        
+        // Determine emphasis multiplier
         const raw = (item?.emphasis || item?.size || item?.importance || '').toString().toLowerCase();
-        if (['primary', 'featured', 'high', 'large', 'lg', 'xl'].includes(raw)) return 1.2;
-        if (['secondary', 'medium', 'md'].includes(raw)) return 1.0;
-        if (['low', 'small', 'sm'].includes(raw)) return 0.85;
-        if (index === 0 && count <= 3) return 1.15; // default hierarchy
-        return 1.0;
+        let emphasisMult = 1.0;
+        if (['primary', 'featured', 'high', 'large', 'lg', 'xl'].includes(raw)) emphasisMult = 1.2;
+        else if (['secondary', 'medium', 'md'].includes(raw)) emphasisMult = 1.0;
+        else if (['low', 'small', 'sm'].includes(raw)) emphasisMult = 0.85;
+        else if (index === 0 && count <= 3) emphasisMult = 1.15; // default hierarchy
+        
+        // Dynamic base scale based on zone and count
+        let baseScale = 0.35; // default
+        
+        // Adjust for zone height (h is in slide units, ~5.625 max)
+        if (itemH < 1.0) baseScale = 0.28;      // Very compact zone
+        else if (itemH < 1.5) baseScale = 0.32; // Compact zone
+        else if (itemH > 2.5) baseScale = 0.4;  // Spacious zone
+        
+        // Adjust for item count
+        if (count >= 6) baseScale *= 0.85;
+        else if (count <= 2) baseScale *= 1.1;
+        
+        return Math.min(itemW, itemH) * baseScale * emphasisMult;
       };
 
       items.forEach((item, i) => {
@@ -938,8 +994,8 @@ export class SpatialLayoutEngine {
           });
         }
 
-        const iconScale = getEmphasisScale(item, i);
-        const iconSize = Math.min(itemW, itemH) * baseIconScale * iconScale;
+        // Use dynamic icon sizing
+        const iconSize = getIconSize(item, i);
         const iconX = ix + (itemW / 2) - (iconSize / 2);
         const iconY = iy + spacing.sm;
 

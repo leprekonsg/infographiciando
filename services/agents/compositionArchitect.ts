@@ -474,14 +474,17 @@ export async function runCompositionArchitect(
   );
 
   try {
+    // FIX: Increased maxOutputTokens from 2048 to 3072 to prevent mid-JSON truncation
+    // Truncation was causing repeated JSON repair overhead and belief anchor failures
+    // See: https://www.philschmid.de/building-agents - "tools are belief anchors"
     const result = await createJsonInteraction<CompositionPlan>(
       COMPOSITION_ARCHITECT_MODEL,
       taskPrompt,
       COMPOSITION_PLAN_SCHEMA,
       {
         systemInstruction: COMPOSITION_ARCHITECT_ROLE,
-        temperature: 0.4, // Moderate temperature for some variation
-        maxOutputTokens: 2048
+        temperature: 0.3, // Reduced from 0.4 for more deterministic output
+        maxOutputTokens: 3072
       },
       tracker
     );
