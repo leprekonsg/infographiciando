@@ -88,8 +88,6 @@ MODEL_REASONING = gemini-3-pro-preview      ($2.00/$12.00 per 1M tokens - rarely
 - Classification/JSON structuring: `MODEL_SIMPLE`
 - Never escalate to Pro for slide generation (output truncation risk)
 
-**Cost Per Deck**: ~$0.18 (vs $0.45 naive Pro usage = 60% savings)
-
 ## Key Files & Their Roles
 
 ### Core Pipeline

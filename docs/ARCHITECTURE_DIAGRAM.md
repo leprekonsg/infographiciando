@@ -1,7 +1,7 @@
 ﻿# InfographIQ Architecture (Current)
 
-> **Updated**: 2026-01-24  
-> **Version**: 3.4 (Risk-Based Sampling + Asset Drift Protection + Timing Metrics)
+> **Updated**: 2026-01-28  
+> **Version**: 3.5 (Three-Tier Visual Validation + Qwen3-VL Primary)
 
 ---
 
@@ -11,12 +11,13 @@ InfographIQ is a **client-first, agent-orchestrated** slide generation system. I
 
 Key characteristics:
 - **Adaptive Director orchestration** with non-linear state machine (loop-back on thin content).
+- **Three-tier visual validation** (Logic Gate → Qwen3-VL Spatial → Gemini Code Drone).
 - **Risk-based visual sampling** (high-risk layouts always validated, low-risk skipped).
 - **Asset drift protection** via content IDs (prevents stale image injection).
 - **Back-pressure controlled** parallel asset generation (max 3 concurrent).
 - **Per-phase timing metrics** for latency optimization.
 - **Deterministic spatial rendering** using predefined layout templates + affinity mapping.
-- **System 2 visual critique** with optional Qwen-VL external validation (Node-only).
+- **System 2 visual critique** with Qwen3-VL as primary spatial cortex (Node-only).
 - **Cost-aware model tiering** (Flash-first; Pro reserved only where required).
 
 ---
@@ -46,14 +47,16 @@ Key characteristics:
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                                   SERVICES                                           │
 │  • Spatial Renderer   • Infographic Renderer • Validators                            │
-│  • Visual Design Agent • Visual Cortex (Qwen-VL) • Cost Tracker                       │
-│  • Prompt Registry     • Auto-Repair • Diagram Builder                                │
+│  • Visual Design Agent • Visual Cortex (Qwen3-VL) • Visual Jury                        │
+│  • Prompt Registry     • Auto-Repair • Diagram Builder • Diagram Orchestrator          │
+│  • Visual Sensor       • Cost Tracker                                                 │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                            EXTERNAL MODELS & TOOLS                                    │
-│  • Gemini Interactions API  • Gemini Image Gen  • Qwen3-VL (optional)                  │
+│  • Gemini Interactions API  • Gemini Image Gen  • Qwen3-VL (primary)                   │
+│  • Gemini Code Execution (Tier 3 diagram-only)                                         │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -69,7 +72,8 @@ Key characteristics:
 
 **Node-only (Guarded):**
 - SVG rasterization via `@resvg/resvg-js`
-- Qwen-VL visual critique (requires rasterized PNG)
+- Qwen3-VL visual critique (primary spatial cortex; requires rasterized PNG)
+- Gemini Code Execution (diagram-only, Tier 3)
 
 **Guardrails (enforced at runtime):**
 - `visualCortex.ts` dynamically imports `visualRasterizer.ts` and throws in browser.
@@ -165,27 +169,35 @@ Each layout has different content expectations:
 - `MAX_PRUNE_ATTEMPTS`: 2 (prevents over-condensation)
 - `MAX_TOTAL_ATTEMPTS`: 4 (safety valve per slide)
 
-### 4.4) Two-Tier Validation (IFR + VFR) with Risk-Based Sampling
+### 4.4) Three-Tier Validation (Logic + Qwen3-VL Spatial + Gemini Code)
 
-The Director uses **two validation tiers** for comprehensive quality control:
+The Director uses a **three-tier validation stack** for quality control and cost efficiency:
 
 **Tier 1: Logic Gate (Fast - Always On)**
 - Character counts + layout-specific limits
 - `evaluateContentQuality()` with bidirectional checks
 - Instant, deterministic, no external calls
 
-**Tier 2: Visual Gate (Risk-Based Sampling)**
-- `quickFitCheck()` from VisualSensor
+**Tier 2: Qwen3-VL Spatial Gate (Risk-Based Sampling)**
+- `runVisualGateQwen3VL()` / spatial critique in VisualSensor
+- Primary visual cortex for overlap, zoning, and OCR issues
 - Catches overflow issues that character counts miss
-- Example: "Configuration" fits 13 chars but wraps in narrow columns
 
-**Risk-Based Sampling** (replaces flat 30%):
+**Tier 3: Gemini Code Drone (Diagram-Only)**
+- Code execution for custom diagrams and complex visuals
+- Triggered only when diagram complexity requires code generation
+- Not used for general layout validation
+
+**Risk-Based Sampling** (Tier 2 entry):
 
 | Layout Risk | Layouts | Validation Rate |
 |-------------|---------|-----------------|
 | **HIGH** | `bento-grid`, `dashboard-tiles`, `metrics-rail`, `asymmetric-grid` | 100% (always) |
 | **MEDIUM** | `split-left-text`, `split-right-text`, `standard-vertical`, `timeline-horizontal` | 30% + first/last |
 | **LOW** | `hero-centered` | 0% unless title > 40 chars |
+
+**Swarm Mode (Optional):**
+- `Visual Jury` runs parallel Qwen3-VL critiques for batch consistency checks
 
 **Structured Failure Codes** (for analytics/auto-remediation):
 - `TITLE_OVERFLOW`: Title text exceeds zone width
@@ -205,17 +217,20 @@ EVALUATE (Logic Gate)
        ▼
   [risk-based sample?]
        │
-       ├── HIGH RISK ──► Always validate
+       ├── HIGH RISK ──► Tier 2 always
        │
-       ├── MEDIUM RISK ──► Sample 30%
+       ├── MEDIUM RISK ──► Tier 2 sampled
        │
-       └── LOW RISK ──► Skip (unless long title)
-       │
-       ▼
-VISUAL GATE (quickFitCheck)
+       └── LOW RISK ──► Skip unless long title
        │
        ▼
-  [fits?] ──No──► PRUNE/SUMMARIZE (+ log failure code)
+TIER 2: QWEN3-VL SPATIAL
+       │
+       ▼
+  [issues?] ──Yes──► repair/reflow
+       │
+       ▼
+  [diagram complexity?] ──Yes──► TIER 3 (Gemini Code Drone)
 ```
        │
       Yes
@@ -333,11 +348,15 @@ This is the **Manus-level capability** that makes the Director non-linear.
 
 ## 5) System 2 Visual Critique (Current)
 
-**Vision-First Interior Designer (Qwen-VL Architect):**
+**Vision-First Interior Designer (Qwen3-VL Architect):**
 - `runQwenVisualArchitectLoop()` → Multi-turn visual optimization (Node-only)
-- SVG Proxy → PNG (resvg) → Qwen-VL → `RepairAction[]`
+- SVG Proxy → PNG (resvg) → Qwen3-VL → `RepairAction[]`
 - `applyRepairsToSlide()` → Normalizes repairs and injects layout hints (`_hintY`, `_hintPadding`, etc.)
 - Bounded recursion (MAX_ROUNDS=3) with improvement-delta tracking
+
+**Visual Jury (Swarm Mode, Optional):**
+- `runVisualJuryConsensus()` → Parallel Qwen3-VL critiques for deck consistency
+- Used for batch QA in premium/serendipity modes
 
 **Internal QA Guard (always available):**
 - `runVisualCritique()` → Lightweight semantic/layout critique (MODEL_SIMPLE)
@@ -388,10 +407,10 @@ SlideDeckBuilder (pptxgenjs)
 
 ---
 
-## 7) Visual Cortex (Qwen-VL)
+## 7) Visual Cortex (Qwen3-VL)
 
 ```
-SVG Proxy → (Node-only) Rasterizer → PNG → Qwen-VL → Critique JSON
+SVG Proxy → (Node-only) Rasterizer → PNG → Qwen3-VL → Critique JSON
                 ▲                 ▲
                 │                 └── visualRasterizer.ts (@resvg/resvg-js)
                 └── visualCortex.ts (dynamic import + runtime guard)
@@ -430,7 +449,7 @@ Cost tracking is centralized in `CostTracker`:
 - Per-call token tracking
 - Per-model cost breakdown
 - Savings vs Pro baseline
-- Qwen-VL costs tracked explicitly
+- Qwen3-VL costs tracked explicitly
 
 ---
 
@@ -444,10 +463,14 @@ Cost tracking is centralized in `CostTracker`:
 | [services/visualDesignAgent.ts](../services/visualDesignAgent.ts) | Visual Designer + Critique + Repair |
 | [services/spatialRenderer.ts](../services/spatialRenderer.ts) | Layout templates + zone allocation |
 | [services/infographicRenderer.ts](../services/infographicRenderer.ts) | Slide compilation + color normalization |
+| [services/VisualSensor.ts](../services/VisualSensor.ts) | Three-tier visual validation facade |
 | [services/cardRenderer.ts](../services/cardRenderer.ts) | Glass card rendering logic |
 | [services/decorativeRenderer.ts](../services/decorativeRenderer.ts) | Badges, dividers, and accent shapes rendering |
-| [services/visualCortex.ts](../services/visualCortex.ts) | Qwen-VL integration (Node-only) |
+| [services/visualCortex.ts](../services/visualCortex.ts) | Qwen3-VL integration (Node-only) |
+| [services/visual/visualJury.ts](../services/visual/visualJury.ts) | Swarm-mode visual consensus |
 | [services/visualRasterizer.ts](../services/visualRasterizer.ts) | resvg-based SVG → PNG rasterization |
+| [services/diagram/diagramOrchestrator.ts](../services/diagram/diagramOrchestrator.ts) | Tier selection for diagrams + validation |
+| [services/diagram/geminiCodeDrone.ts](../services/diagram/geminiCodeDrone.ts) | Tier 3 code-execution diagram engine |
 | [services/image/imageGeneration.ts](../services/image/imageGeneration.ts) | Gemini Image generation (Flash → Pro fallback) |
 | [types/slideTypes.ts](../types/slideTypes.ts) | Zod schemas + shared types |
 | [types/serendipityTypes.ts](../types/serendipityTypes.ts) | Serendipity engine types & schemas |
@@ -466,7 +489,8 @@ Cost tracking is centralized in `CostTracker`:
 | Visual Designer | gemini-3-flash-preview | low | Visual composition |
 | Generator | gemini-3-flash-preview | none | Final slide assembly |
 | Image Gen | gemini-2.5-flash-image → gemini-3-pro-image-preview | - | Background-only images |
-| Qwen-VL | qwen3-vl-plus-2025-12-19 | - | Optional visual critique |
+| Qwen3-VL | qwen3-vl-plus-2025-12-19 | - | Primary visual critique (Tier 2) |
+| Gemini Code Drone | gemini-2.5-flash-preview-05-20 | - | Diagram-only code execution (Tier 3) |
 
 ---
 

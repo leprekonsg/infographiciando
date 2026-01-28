@@ -890,6 +890,273 @@ export async function getStyleAwareRepairsFromSvg(
     }
 }
 
+// ============================================================================
+// TIER 2: QWEN3-VL SPATIAL ANALYSIS (Primary Visual Cortex)
+// ============================================================================
+
+/**
+ * Qwen3-VL Spatial Analysis Result for Tier 2 Visual Gate
+ * 
+ * ARCHITECTURAL ROLE:
+ * Qwen3-VL-Plus is the PRIMARY visual cortex (state-of-the-art in spatial understanding).
+ * This function implements the Tier 2 spatial analysis using native 0-1000 coordinate system.
+ * 
+ * Used for:
+ * - Bounding box detection with precise coordinates
+ * - Text overflow verification via OCR
+ * - Spatial density analysis
+ * - Zone-based crowding detection
+ */
+export interface Qwen3VLSpatialAnalysisResult {
+    overall_score: number;           // 0-100 aesthetic evaluation
+    spatial_analysis: {
+        text_regions: Array<{
+            text: string;
+            bbox: [number, number, number, number]; // [x0, y0, x1, y1] normalized 0-1
+            font_size?: number;
+            overflow_risk: 'none' | 'low' | 'high' | 'critical';
+        }>;
+        overcrowded_zones: Array<{
+            region: 'title' | 'body' | 'footer';
+            density_score: number;       // 0-1 density metric
+            recommendation: string;
+        }>;
+    };
+    repair_actions: Array<{
+        target: string;                // Component ID or "title"
+        action: 'resize' | 'reposition' | 'reflow' | 'reduce_font';
+        parameters: Record<string, number>;
+        confidence: number;            // 0-1
+    }>;
+    verdict: 'accept' | 'flag_for_review' | 'requires_repair';
+    latency_ms?: number;
+}
+
+/**
+ * Layout context for spatial analysis
+ */
+export interface LayoutAnalysisContext {
+    layoutId: string;
+    elementCount: number;
+    expectedTextZones: string[];
+    deckPosition?: 'opening' | 'middle' | 'closing';
+    styleMode?: 'corporate' | 'professional' | 'serendipitous';
+}
+
+/**
+ * Analyze slide layout using Qwen3-VL spatial grounding
+ * 
+ * TIER 2 in the Three-Tier Visual Validation Stack:
+ * - Model: qwen3-vl-plus-2025-12-19
+ * - Task: Bounding box detection, overflow verification, OCR
+ * - Input: Slide PNG (1920x1080) + Structured prompt
+ * - Output: Normalized coordinates (0-1000 → 0-1), severity scores
+ * - Latency: ~800ms-1.5s
+ * - Cost: ~$0.002/image
+ * 
+ * @param pngBase64 - PNG image base64
+ * @param context - Layout context for analysis
+ * @param costTracker - Cost tracker
+ */
+export async function analyzeSlideLayoutSpatial(
+    pngBase64: string,
+    context: LayoutAnalysisContext,
+    costTracker?: CostTracker
+): Promise<Qwen3VLSpatialAnalysisResult | null> {
+    if (!qwenVLClient.isAvailable()) {
+        if (!QWEN_VL_PROXY_URL) {
+            console.warn('[QWEN3-VL SPATIAL] API not configured');
+            return null;
+        }
+    }
+
+    const startTime = Date.now();
+    console.log(`[QWEN3-VL SPATIAL] Analyzing layout: ${context.layoutId} (${context.elementCount} elements)`);
+
+    try {
+        // Build spatial analysis prompt with DeepStack-native coordinate system
+        const prompt = buildSpatialAnalysisPrompt(context);
+        
+        // Build message with Visual Architect persona
+        const messages = buildQwenMessage(
+            QWEN_PERSONAS.VISUAL_ARCHITECT,
+            `${getThinkingMode('critique')}\n\n${prompt}`,
+            pngBase64
+        );
+
+        const requestConfig = getQwenRequestConfig('critique');
+
+        const response = await fetch(`${QWEN_API_BASE}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${qwenVLClient['apiKey']}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                ...requestConfig,
+                messages
+            })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Qwen3-VL API error (${response.status}): ${errorText}`);
+        }
+
+        const data = await response.json();
+
+        // Track costs
+        if (costTracker && data.usage) {
+            const inputTokens = data.usage.prompt_tokens || 0;
+            const outputTokens = data.usage.completion_tokens || 0;
+            costTracker.addQwenVLCost(inputTokens, outputTokens);
+        }
+
+        const latency = Date.now() - startTime;
+        const responseText = data.choices?.[0]?.message?.content || '';
+
+        // Parse and normalize coordinates
+        const parsed = qwenVLClient['parseJsonResponse'](responseText);
+        const normalized = normalizeSpatialResponse(parsed);
+
+        console.log(`[QWEN3-VL SPATIAL] Analysis complete: score=${normalized.overall_score}, verdict=${normalized.verdict}, latency=${latency}ms`);
+
+        return {
+            ...normalized,
+            latency_ms: latency
+        };
+
+    } catch (error: any) {
+        console.error('[QWEN3-VL SPATIAL] Analysis failed:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Build spatial analysis prompt optimized for Qwen3-VL
+ */
+function buildSpatialAnalysisPrompt(context: LayoutAnalysisContext): string {
+    return `You are a Visual Architect analyzing slide layouts for spatial quality.
+
+TASK: Detect text overflow, measure bounding boxes, and assess visual balance.
+
+COORDINATE SYSTEM: Use 0-1000 scale where (0,0) is top-left and (1000,1000) is bottom-right.
+When outputting coordinates, normalize them to 0-1 scale (divide by 1000).
+
+LAYOUT TYPE: ${context.layoutId}
+ELEMENT COUNT: ${context.elementCount}
+EXPECTED ZONES: ${context.expectedTextZones.join(', ')}
+
+ANALYZE:
+1. TITLE ZONE: Locate title text, provide bbox [x0,y0,x1,y1], assess if text exceeds container width
+2. BODY ZONES: Identify all text blocks, measure their bounding boxes
+3. OVERLAP DETECTION: Check if any text regions overlap
+4. DENSITY ANALYSIS: Calculate elements per zone (0-1 scale where 1 = overcrowded)
+
+OVERFLOW RISK CLASSIFICATION:
+- "none": Text fits well within container with margins
+- "low": Text fits but margins are tight
+- "high": Text approaches container bounds
+- "critical": Text clearly exceeds container or overlaps other elements
+
+OUTPUT FORMAT (strict JSON):
+\`\`\`json
+{
+  "overall_score": <0-100>,
+  "spatial_analysis": {
+    "text_regions": [
+      {
+        "text": "First few words...",
+        "bbox": [<x0>, <y0>, <x1>, <y1>],
+        "overflow_risk": "none" | "low" | "high" | "critical"
+      }
+    ],
+    "overcrowded_zones": [
+      {
+        "region": "title" | "body" | "footer",
+        "density_score": <0-1>,
+        "recommendation": "string"
+      }
+    ]
+  },
+  "repair_actions": [
+    {
+      "target": "title" | "component-id",
+      "action": "resize" | "reposition" | "reflow" | "reduce_font",
+      "parameters": { "key": <number> },
+      "confidence": <0-1>
+    }
+  ],
+  "verdict": "accept" | "flag_for_review" | "requires_repair"
+}
+\`\`\`
+
+CRITICAL RULES:
+- All coordinates normalized to 0-1 (NOT 0-1000 in output)
+- If no issues found, return empty arrays for repair_actions
+- Do NOT hallucinate problems - absence of issues is valid
+- Focus on SPATIAL issues, not aesthetic preferences
+- Ignore compression artifacts from rasterization`;
+}
+
+/**
+ * Normalize spatial analysis response from Qwen3-VL
+ * Converts 0-1000 coordinates to 0-1 and validates structure
+ */
+function normalizeSpatialResponse(parsed: any): Qwen3VLSpatialAnalysisResult {
+    // Default structure
+    const result: Qwen3VLSpatialAnalysisResult = {
+        overall_score: parsed.overall_score || 50,
+        spatial_analysis: {
+            text_regions: [],
+            overcrowded_zones: []
+        },
+        repair_actions: [],
+        verdict: parsed.verdict || 'flag_for_review'
+    };
+
+    // Normalize text regions
+    if (parsed.spatial_analysis?.text_regions) {
+        result.spatial_analysis.text_regions = parsed.spatial_analysis.text_regions.map((region: any) => {
+            let bbox = region.bbox || [0, 0, 1, 1];
+            
+            // Detect and normalize 0-1000 coordinates to 0-1
+            // If any coordinate > 1, assume it's in 0-1000 space
+            if (bbox.some((v: number) => v > 1)) {
+                bbox = bbox.map((v: number) => v / 1000);
+            }
+            
+            return {
+                text: region.text || '',
+                bbox: bbox as [number, number, number, number],
+                font_size: region.font_size,
+                overflow_risk: region.overflow_risk || 'none'
+            };
+        });
+    }
+
+    // Normalize overcrowded zones
+    if (parsed.spatial_analysis?.overcrowded_zones) {
+        result.spatial_analysis.overcrowded_zones = parsed.spatial_analysis.overcrowded_zones.map((zone: any) => ({
+            region: zone.region || 'body',
+            density_score: Math.min(1, Math.max(0, zone.density_score || 0)),
+            recommendation: zone.recommendation || ''
+        }));
+    }
+
+    // Normalize repair actions
+    if (parsed.repair_actions) {
+        result.repair_actions = parsed.repair_actions.map((action: any) => ({
+            target: action.target || 'unknown',
+            action: action.action || 'resize',
+            parameters: action.parameters || {},
+            confidence: Math.min(1, Math.max(0, action.confidence || 0.5))
+        }));
+    }
+
+    return result;
+}
+
 /**
  * Check if Qwen-VL visual cortex is available
  */
@@ -1315,6 +1582,28 @@ function applyRepairsToSlide(
     const updatedSlide = JSON.parse(JSON.stringify(slide)); // Deep clone
     let appliedCount = 0;
     const components = updatedSlide.layoutPlan?.components || [];
+    
+    // ============================================================================
+    // COORDINATE SCALING (Fixed 2026-01-28)
+    // ============================================================================
+    // Qwen-VL returns normalized coordinates (0-1 range)
+    // Spatial renderer uses slide coordinates:
+    //   X: 0-10 (width)
+    //   Y: 0-5.625 (height, 16:9 aspect ratio)
+    //
+    // IMPORTANT: Raw repairs like y=0.12 mean "12% from top"
+    // Must multiply by 5.625 to get actual slide coordinate: 0.12 * 5.625 = 0.675
+    // ============================================================================
+    const SLIDE_WIDTH = 10;
+    const SLIDE_HEIGHT = 5.625;
+    
+    const scaleCoordinate = (normalized: number, axis: 'x' | 'y'): number => {
+        const scale = axis === 'x' ? SLIDE_WIDTH : SLIDE_HEIGHT;
+        const scaled = normalized * scale;
+        // Clamp to valid bounds with small margin
+        const max = axis === 'x' ? SLIDE_WIDTH - 0.5 : SLIDE_HEIGHT - 0.5;
+        return Math.max(0.3, Math.min(scaled, max));
+    };
 
     for (const repair of repairs) {
         const { component_id, action, params, reason } = repair;
@@ -1332,8 +1621,10 @@ function applyRepairsToSlide(
         if (parsedId.isTitle) {
             // Title repairs affect the slide title styling
             if (action === 'reposition' && params?.y !== undefined) {
-                console.log(`[REPAIR] Setting title top margin hint: ${params.y} (${reason})`);
-                updatedSlide.layoutPlan._titleMarginTop = params.y;
+                // Scale normalized coordinate (0-1) to slide coordinate (0-5.625)
+                const scaledY = scaleCoordinate(params.y, 'y');
+                console.log(`[REPAIR] Setting title top margin hint: ${params.y} → scaled: ${scaledY.toFixed(2)} (${reason})`);
+                updatedSlide.layoutPlan._titleMarginTop = scaledY;
                 appliedCount++;
             } else if (action === 'adjust_spacing') {
                 console.log(`[REPAIR] Setting title spacing hint (${reason})`);
@@ -1359,8 +1650,10 @@ function applyRepairsToSlide(
         if (parsedId.isDivider || parsedId.isLine) {
             // Divider/line repairs - store all as hints since these are rendered separately
             if (action === 'reposition' && params?.y !== undefined) {
-                console.log(`[REPAIR] Setting divider position hint: y=${params.y} (${reason})`);
-                updatedSlide.layoutPlan._dividerY = params.y;
+                // Scale normalized coordinate (0-1) to slide coordinate (0-5.625)
+                const scaledY = scaleCoordinate(params.y, 'y');
+                console.log(`[REPAIR] Setting divider position hint: y=${params.y} → scaled: ${scaledY.toFixed(2)} (${reason})`);
+                updatedSlide.layoutPlan._dividerY = scaledY;
                 appliedCount++;
             } else if (action === 'resize') {
                 // Divider resize - width and height hints
@@ -1399,10 +1692,13 @@ function applyRepairsToSlide(
                 break;
 
             case 'reposition':
-                console.log(`[REPAIR] Repositioning ${component_id}: (${params?.x}, ${params?.y}) (${reason})`);
-                // Add position hints for spatial renderer
-                if (params?.x !== undefined) (component as any)._hintX = params.x;
-                if (params?.y !== undefined) (component as any)._hintY = params.y;
+                // Scale normalized coordinates (0-1) to slide coordinates
+                const scaledX = params?.x !== undefined ? scaleCoordinate(params.x, 'x') : undefined;
+                const scaledY = params?.y !== undefined ? scaleCoordinate(params.y, 'y') : undefined;
+                console.log(`[REPAIR] Repositioning ${component_id}: (${params?.x}, ${params?.y}) → scaled: (${scaledX?.toFixed(2)}, ${scaledY?.toFixed(2)}) (${reason})`);
+                // Add position hints for spatial renderer (using scaled coordinates)
+                if (scaledX !== undefined) (component as any)._hintX = scaledX;
+                if (scaledY !== undefined) (component as any)._hintY = scaledY;
                 appliedCount++;
                 break;
 

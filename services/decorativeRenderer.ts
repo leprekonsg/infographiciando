@@ -25,6 +25,29 @@ import { VisualElement } from '../types/slideTypes';
 import { normalizeColor } from './infographicRenderer';
 import { z } from 'zod';
 
+// ============================================================================
+// COLOR CONTRAST UTILITIES
+// ============================================================================
+
+const getYiq = (hex: string): number => {
+  const clean = hex.replace('#', '').trim();
+  if (clean.length !== 6) return 0;
+  const r = parseInt(clean.substring(0, 2), 16);
+  const g = parseInt(clean.substring(2, 4), 16);
+  const b = parseInt(clean.substring(4, 6), 16);
+  return ((r * 299) + (g * 587) + (b * 114)) / 1000;
+};
+
+const resolveReadableTextColor = (backgroundHex: string, fallbackTextHex: string): string => {
+  const yiq = getYiq(backgroundHex);
+  // Prefer dark text on light backgrounds, light text on dark backgrounds
+  const preferred = yiq > 180 ? '0F172A' : 'F8FAFC';
+  // If fallback already provides good contrast, keep it
+  const fallbackYiq = getYiq(fallbackTextHex);
+  const hasContrast = Math.abs(yiq - fallbackYiq) >= 80;
+  return hasContrast ? fallbackTextHex : preferred;
+};
+
 type BadgeElement = z.infer<typeof BadgeElementSchema>;
 type DividerElement = z.infer<typeof DividerElementSchema>;
 type AccentShapeElement = z.infer<typeof AccentShapeElementSchema>;
@@ -196,6 +219,7 @@ export function renderBadge(
   const elements: VisualElement[] = [];
   const style = badge.style || 'pill';
   const color = badge.color || context.palette.primary;
+  const textColor = resolveReadableTextColor(context.palette.background, context.palette.text);
   
   // Safely calculate badge dimensions with guards for empty content
   const contentText = String(badge.content || '').trim();
@@ -284,7 +308,7 @@ export function renderBadge(
     w: textWidth + 0.1,
     h: height - 0.14,
     fontSize: BADGE_TYPOGRAPHY.fontSize,
-    color: normalizeColor(color),
+    color: normalizeColor(textColor),
     bold: true,
     align: 'left',
     zIndex: context.baseZIndex + 2,

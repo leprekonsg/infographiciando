@@ -512,7 +512,16 @@ export class SpatialLayoutEngine {
       } else if (allocated.type === 'component-full' || allocated.type === 'component-part') {
         // CRITICAL: Pass componentIdx to renderComponentInZone for SVG ID mapping
         const componentIdx = allocated.componentIdx ?? -1;
-        const els = this.renderComponentInZone(allocated.component, effectiveZone, effectiveStyleGuide, themeTokens, getIconUrl, getDiagramUrl, componentIdx);
+        const els = this.renderComponentInZone(
+          allocated.component,
+          effectiveZone,
+          effectiveStyleGuide,
+          themeTokens,
+          getIconUrl,
+          getDiagramUrl,
+          componentIdx,
+          slide.title
+        );
         elements.push(...els);
       }
     });
@@ -574,7 +583,8 @@ export class SpatialLayoutEngine {
     themeTokens: typeof DEFAULT_THEME_TOKENS,
     getIconUrl: (name: string) => string | undefined,
     getDiagramUrl?: (comp: any) => string | undefined,
-    componentIdx: number = -1  // CRITICAL: Component index for SVG ID mapping
+    componentIdx: number = -1,  // CRITICAL: Component index for SVG ID mapping
+    slideTitle?: string
   ): VisualElement[] {
     const p = {
       text: normalizeColor(styleGuide.colorPalette.text),
@@ -758,7 +768,29 @@ export class SpatialLayoutEngine {
       let curY = y;
       const maxY = y + h;
 
-      if (comp.title) {
+      // ============================================================================
+      // TITLE DUPLICATION FIX (2026-01-28)
+      // ============================================================================
+      // PROBLEM: text-bullets components have a `title` field that gets rendered as
+      // a subtitle within the component zone. When the LLM sets comp.title to the
+      // slide title (or a similar value), it creates a duplicate title appearance.
+      //
+      // SOLUTION: Skip rendering component title when:
+      // 1. The zone is explicitly for content (not a title zone)
+      // 2. The component title matches the slide title (redundant)
+      // 3. The component is in a content zone like 'content-top', 'content-area', etc.
+      // ============================================================================
+      const isContentZone = /content|text-main|main|panel|grid/i.test(zone.id);
+      const titleEqualsSlide = slideTitle && comp.title && comp.title.trim().toLowerCase() === slideTitle.trim().toLowerCase();
+      const shouldSkipComponentTitle = isContentZone && (
+        titleEqualsSlide ||
+        !comp.title || // No title provided
+        comp.title === 'Key Insights' || // Default placeholder
+        comp.title === 'Title' || // Generic placeholder
+        comp.title.length < 3 // Too short to be meaningful
+      );
+
+      if (comp.title && !shouldSkipComponentTitle) {
         const titleH = 0.6 * contentScale;
         // REDUCED PADDING: Was 0.7 * contentScale, now 0.65 to fit tighter zones
         const nextY = curY + (0.65 * contentScale);
@@ -1545,29 +1577,33 @@ export function renderWithLayeredComposition(
     elements.push(...decorativeRenderers.renderDecorativeLayer(decorativeElements, decorativeContext));
   }
 
-  // --- SLIDE TITLE (z-index 15 - between decorative and content) ---
-  // Always render the slide title in layer-based mode
-  const titleElement: VisualElement = {
-    type: 'text',
-    content: slide.title || 'Untitled',
-    x: 0.5,
-    y: 0.5,
-    w: 9,
-    h: 0.9,
-    fontSize: DEFAULT_THEME_TOKENS.typography.scale.title,
-    color: palette.text,
-    bold: true,
-    align: 'left',
-    zIndex: 15,
-    letterSpacing: DEFAULT_THEME_TOKENS.typography.letterSpacing.title,
-    fontWeight: DEFAULT_THEME_TOKENS.typography.weights.title
-  };
-  elements.push(titleElement);
-
   // --- LAYER 2: CONTENT (z-index 20-59) ---
   // For now, delegate to standard component rendering
   // In full implementation, would use cardRenderers for card-based layouts
   const contentStructure = compositionPlan.layerPlan.contentStructure;
+
+  // --- SLIDE TITLE (z-index 15 - between decorative and content) ---
+  // Only render title here when using card-based rendering; standard renderer already
+  // includes the title and would cause duplication (especially in single-hero pattern).
+  const shouldRenderLayerTitle = contentStructure.pattern === 'card-row' || contentStructure.pattern === 'narrative-flow';
+  if (shouldRenderLayerTitle) {
+    const titleElement: VisualElement = {
+      type: 'text',
+      content: slide.title || 'Untitled',
+      x: 0.5,
+      y: 0.5,
+      w: 9,
+      h: 0.9,
+      fontSize: DEFAULT_THEME_TOKENS.typography.scale.title,
+      color: palette.text,
+      bold: true,
+      align: 'left',
+      zIndex: 15,
+      letterSpacing: DEFAULT_THEME_TOKENS.typography.letterSpacing.title,
+      fontWeight: DEFAULT_THEME_TOKENS.typography.weights.title
+    };
+    elements.push(titleElement);
+  }
 
   if (contentStructure.pattern === 'card-row' || contentStructure.pattern === 'narrative-flow') {
     // Use card-based rendering if available

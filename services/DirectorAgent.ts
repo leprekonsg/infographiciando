@@ -49,12 +49,46 @@
 
 import { z } from 'zod';
 import { CostTracker, MODEL_SIMPLE } from './interactionsClient';
-import type { ResearchFact } from '../types/slideTypes';
-import { quickFitCheck } from './VisualSensor';
+import type { ResearchFact, StyleMode } from '../types/slideTypes';
+import { 
+    quickFitCheck, 
+    runThreeTierValidation,
+    runVisualGateQwen3VL,
+    type VisualValidationResult,
+    type VisualGateFailure as SensorVisualGateFailure,
+    type VisualGateFailureCode as SensorVisualGateFailureCode
+} from './VisualSensor';
+import { 
+    selectVisualValidationEngine,
+    getLayoutRiskLevel as getOrchestratorLayoutRiskLevel,
+    MODE_COST_PROFILES
+} from './diagram/diagramOrchestrator';
 
 // =============================================================================
 // DIRECTOR CONFIGURATION
 // =============================================================================
+
+// =============================================================================
+// THREE-TIER VISUAL VALIDATION STACK (2026-01 Revision)
+// =============================================================================
+// 
+// ARCHITECTURE INSIGHT:
+// Qwen3-VL-Plus is the PRIMARY visual cortex (state-of-the-art in spatial understanding).
+// Gemini 3.0 is reserved for code-execution workflows only.
+//
+// TIER 1: LOGIC GATE (Deterministic)
+//   • quickFitCheck (character counting, layout heuristics)
+//   • Latency: <1ms | Cost: $0 | Coverage: 100% of slides
+//
+// TIER 2: QWEN3-VL VISUAL GATE (Spatial)
+//   • Model: qwen3-vl-plus-2025-12-19
+//   • Task: Bounding box detection, overflow verification, OCR
+//   • Latency: ~800ms-1.5s | Cost: ~$0.002/image
+//   • Coverage: High-risk layouts (100%), Medium-risk (30% sampling)
+//
+// TIER 3: GEMINI 3.0 AGENTIC (Code Execution)
+//   • Reserved for "Graph Drone" custom viz (serendipitous mode only)
+//   • Latency: 3-8s | Cost: ~$0.005
 
 // =============================================================================
 // VISUAL GATE FAILURE CODES (Structured Logging)
@@ -66,7 +100,8 @@ export type VisualGateFailureCode =
     | 'BULLET_TOO_LONG'        // Individual bullet exceeds char limit
     | 'TOTAL_CHARS_OVERFLOW'   // Total content chars exceed layout limit
     | 'ELEMENT_DENSITY_HIGH'   // Too many visual elements in zone
-    | 'VISUAL_FIT_FAILED';     // Generic quickFitCheck failure
+    | 'VISUAL_FIT_FAILED'      // Generic quickFitCheck failure
+    | 'QWEN3VL_SPATIAL_FAIL';  // Qwen3-VL detected spatial issue
 
 export interface VisualGateFailure {
     code: VisualGateFailureCode;
@@ -74,6 +109,10 @@ export interface VisualGateFailure {
     layoutId: string;
     details: string;
     action: 'prune' | 'summarize' | 'change_layout';
+    /** Confidence from Qwen3-VL (0-1) */
+    confidence?: number;
+    /** Tier that detected this failure */
+    detectedBy?: 'logic-gate' | 'qwen3vl-spatial';
 }
 
 // =============================================================================
@@ -85,19 +124,19 @@ export interface VisualGateFailure {
 type LayoutRiskLevel = 'high' | 'medium' | 'low';
 
 const LAYOUT_RISK_PROFILES: Record<string, LayoutRiskLevel> = {
-    // HIGH RISK: Complex, tight constraints - ALWAYS validate
+    // HIGH RISK: Complex, tight constraints - ALWAYS validate with Tier 2
     'bento-grid': 'high',
     'dashboard-tiles': 'high',
     'metrics-rail': 'high',
     'asymmetric-grid': 'high',
     
-    // MEDIUM RISK: Moderate density - use sampling rate
+    // MEDIUM RISK: Moderate density - use sampling rate for Tier 2
     'split-left-text': 'medium',
     'split-right-text': 'medium',
     'standard-vertical': 'medium',
     'timeline-horizontal': 'medium',
     
-    // LOW RISK: Simple layouts - skip unless title is very long
+    // LOW RISK: Simple layouts - Tier 1 only unless title is very long
     'hero-centered': 'low'
 };
 
@@ -106,10 +145,9 @@ const getLayoutRiskLevel = (layoutId: string): LayoutRiskLevel => {
 };
 
 // =============================================================================
-// DIRECTOR MODE PRESETS
+// DIRECTOR MODE PRESETS (Updated for Three-Tier Stack)
 // =============================================================================
-// Pre-configured modes to avoid combinatorial config explosion.
-// Users pick a mode; advanced users can override raw flags.
+// Pre-configured modes with tier activation settings.
 
 export type DirectorMode = 'fast' | 'balanced' | 'premium';
 
@@ -121,6 +159,12 @@ export interface DirectorConfig {
     enableEarlyAssetExtraction: boolean; // Extract image prompts early
     assetGenerationTimeout: number;   // Max wait time for assets at ASSEMBLE (ms)
     maxConcurrentImages: number;      // Back-pressure control for image generation
+    /** Enable Tier 2 Qwen3-VL spatial analysis */
+    enableTier2Qwen3VL: boolean;
+    /** Enable Tier 3 Gemini code execution (Graph Drone) */
+    enableTier3GeminiCode: boolean;
+    /** Enable Visual Jury swarm mode for deck-wide consensus */
+    enableVisualJury: boolean;
 }
 
 const MODE_PRESETS: Record<DirectorMode, Omit<DirectorConfig, 'mode'>> = {
@@ -130,7 +174,10 @@ const MODE_PRESETS: Record<DirectorMode, Omit<DirectorConfig, 'mode'>> = {
         enableParallelPlanning: false,
         enableEarlyAssetExtraction: true,
         assetGenerationTimeout: 5000,    // 5s max wait
-        maxConcurrentImages: 5           // Higher concurrency for speed
+        maxConcurrentImages: 5,          // Higher concurrency for speed
+        enableTier2Qwen3VL: false,       // Tier 1 only
+        enableTier3GeminiCode: false,
+        enableVisualJury: false
     },
     balanced: {
         enableVisualValidation: true,
@@ -138,7 +185,10 @@ const MODE_PRESETS: Record<DirectorMode, Omit<DirectorConfig, 'mode'>> = {
         enableParallelPlanning: false,
         enableEarlyAssetExtraction: true,
         assetGenerationTimeout: 15000,   // 15s reasonable wait
-        maxConcurrentImages: 3           // Conservative
+        maxConcurrentImages: 3,          // Conservative
+        enableTier2Qwen3VL: true,        // Tier 2 with sampling
+        enableTier3GeminiCode: false,    // No code execution
+        enableVisualJury: false          // Sequential validation
     },
     premium: {
         enableVisualValidation: true,
@@ -146,7 +196,10 @@ const MODE_PRESETS: Record<DirectorMode, Omit<DirectorConfig, 'mode'>> = {
         enableParallelPlanning: false,   // Still experimental
         enableEarlyAssetExtraction: true,
         assetGenerationTimeout: 30000,   // Wait longer for quality
-        maxConcurrentImages: 2           // Very conservative
+        maxConcurrentImages: 2,          // Very conservative
+        enableTier2Qwen3VL: true,        // Full Tier 2
+        enableTier3GeminiCode: true,     // Enable Graph Drone
+        enableVisualJury: true           // Swarm consensus
     }
 };
 
@@ -608,33 +661,42 @@ async function summarizeContent(
 }
 
 // =============================================================================
-// VISUAL VALIDATION (The "Eyes" - Visual Sensor Integration)
+// VISUAL VALIDATION (Three-Tier Stack Integration)
 // =============================================================================
 
-interface VisualValidationResult {
+interface LocalVisualValidationResult {
     fits: boolean;
     action?: 'prune' | 'summarize' | 'change_layout' | 'pass';
     reason?: string;
-    failureCode?: VisualGateFailureCode;  // NEW: Structured failure code
+    failureCode?: VisualGateFailureCode;
+    /** Tier that performed validation */
+    validatedBy?: 'logic-gate' | 'qwen3vl-spatial';
+    /** Qwen3-VL spatial metadata (if Tier 2 was used) */
+    qwen3vlMetadata?: {
+        overall_score: number;
+        processing_time: number;
+    };
 }
 
 /**
- * Visual Gate: Fast heuristic check using VisualSensor.quickFitCheck
+ * Visual Gate: Tier 1 - Fast heuristic check using quickFitCheck
  * 
  * This is the "Instrument Flight Rules" (IFR) check that catches
  * overflow issues that pure character counts might miss.
  * 
- * Returns structured failure codes for analytics and auto-remediation.
+ * TIER 1 in the Three-Tier Stack:
+ * - Latency: <1ms
+ * - Cost: $0
+ * - Coverage: 100% of slides
  * 
- * Example: "Configuration Management" might fit 25 chars but
- * "Configuration" wraps to a second line in narrow columns.
+ * Returns structured failure codes for analytics and auto-remediation.
  */
-function runVisualGate(
+function runVisualGateTier1(
     contentPlan: any,
     layoutId: string,
     slideTitle: string,
     profile: LayoutQualityProfile
-): VisualValidationResult {
+): LocalVisualValidationResult {
     const keyPoints = contentPlan?.keyPoints || [];
     
     // Check title overflow first (common issue)
@@ -643,12 +705,13 @@ function runVisualGate(
             fits: false,
             action: 'summarize',
             reason: `Title too long: ${slideTitle.length} chars (limit ~${profile.maxCharsPerPoint + 20})`,
-            failureCode: 'TITLE_OVERFLOW'
+            failureCode: 'TITLE_OVERFLOW',
+            validatedBy: 'logic-gate'
         };
     }
     
     if (keyPoints.length === 0) {
-        return { fits: true, action: 'pass' };
+        return { fits: true, action: 'pass', validatedBy: 'logic-gate' };
     }
 
     // Use VisualSensor's quickFitCheck for fast validation
@@ -671,15 +734,198 @@ function runVisualGate(
             action = 'prune';
         }
         
-        console.log(`[DIRECTOR] Visual Gate FAILED: ${failureCode} - ${reason}`);
-        return { fits: false, action, reason, failureCode };
+        console.log(`[DIRECTOR] Tier 1 FAILED: ${failureCode} - ${reason}`);
+        return { fits: false, action, reason, failureCode, validatedBy: 'logic-gate' };
     }
 
-    return { fits: true, action: 'pass' };
+    return { fits: true, action: 'pass', validatedBy: 'logic-gate' };
+}
+
+/**
+ * Legacy wrapper for backward compatibility
+ * @deprecated Use runVisualGateTier1 for Tier 1 or runThreeTierValidation for full stack
+ */
+function runVisualGate(
+    contentPlan: any,
+    layoutId: string,
+    slideTitle: string,
+    profile: LayoutQualityProfile
+): LocalVisualValidationResult {
+    return runVisualGateTier1(contentPlan, layoutId, slideTitle, profile);
+}
+
+/**
+ * Run Three-Tier Visual Validation
+ * 
+ * Orchestrates the complete validation stack:
+ * - Tier 1: Logic Gate (always, <1ms, $0)
+ * - Tier 2: Qwen3-VL Spatial (risk-based, ~1s, ~$0.002)
+ * - Tier 3: Gemini Code (reserved for Graph Drone)
+ * 
+ * @param contentPlan - Content plan to validate
+ * @param layoutId - Layout template ID
+ * @param slideTitle - Slide title
+ * @param slideIndex - Current slide index
+ * @param totalSlides - Total slides in deck
+ * @param profile - Layout quality profile
+ * @param styleMode - Style mode for threshold adjustments
+ * @param config - Director config with tier settings
+ * @param slideImage - PNG base64 for Tier 2 (optional)
+ * @param costTracker - Cost tracker
+ */
+async function runThreeTierVisualGate(
+    contentPlan: any,
+    layoutId: string,
+    slideTitle: string,
+    slideIndex: number,
+    totalSlides: number,
+    profile: LayoutQualityProfile,
+    styleMode: StyleMode | undefined,
+    config: DirectorConfig,
+    slideImage: string | null,
+    costTracker?: CostTracker
+): Promise<LocalVisualValidationResult> {
+    // =========================================================================
+    // TIER 1: Logic Gate (Always runs)
+    // =========================================================================
+    const tier1Result = runVisualGateTier1(contentPlan, layoutId, slideTitle, profile);
+    
+    if (!tier1Result.fits) {
+        // Tier 1 failed - no need for expensive Tier 2
+        return tier1Result;
+    }
+    
+    // =========================================================================
+    // TIER 2: Qwen3-VL Spatial (Risk-based)
+    // =========================================================================
+    if (!config.enableTier2Qwen3VL || !slideImage) {
+        // Tier 2 disabled or no image available
+        return tier1Result;
+    }
+    
+    // Determine if we should run Tier 2 based on risk level
+    const shouldRunTier2 = shouldValidateWithTier2(
+        slideIndex,
+        totalSlides,
+        layoutId,
+        slideTitle,
+        styleMode || 'professional',
+        config
+    );
+    
+    if (!shouldRunTier2) {
+        return tier1Result;
+    }
+    
+    console.log(`[DIRECTOR] Running Tier 2 Qwen3-VL validation for slide ${slideIndex}`);
+    
+    try {
+        const keyPoints = contentPlan?.keyPoints || [];
+        const tier2Result = await runThreeTierValidation(
+            slideImage,
+            keyPoints,
+            layoutId,
+            slideIndex,
+            totalSlides,
+            slideTitle,
+            styleMode || 'professional',
+            costTracker
+        );
+        
+        if (!tier2Result.fits) {
+            // Convert VisualValidationResult to LocalVisualValidationResult
+            const primaryFailure = tier2Result.failures[0];
+            return {
+                fits: false,
+                action: primaryFailure?.action || 'prune',
+                reason: primaryFailure?.details || 'Qwen3-VL detected spatial issues',
+                failureCode: (primaryFailure?.code as VisualGateFailureCode) || 'QWEN3VL_SPATIAL_FAIL',
+                validatedBy: 'qwen3vl-spatial',
+                qwen3vlMetadata: tier2Result.qwen3vl_metadata ? {
+                    overall_score: tier2Result.qwen3vl_metadata.overall_score,
+                    processing_time: tier2Result.qwen3vl_metadata.processing_time
+                } : undefined
+            };
+        }
+        
+        return {
+            fits: true,
+            action: 'pass',
+            validatedBy: 'qwen3vl-spatial',
+            qwen3vlMetadata: tier2Result.qwen3vl_metadata ? {
+                overall_score: tier2Result.qwen3vl_metadata.overall_score,
+                processing_time: tier2Result.qwen3vl_metadata.processing_time
+            } : undefined
+        };
+        
+    } catch (err: any) {
+        console.warn(`[DIRECTOR] Tier 2 validation failed: ${err.message}`);
+        // Graceful fallback to Tier 1 result
+        return tier1Result;
+    }
+}
+
+/**
+ * Determine if Tier 2 Qwen3-VL validation should run
+ * 
+ * RISK-BASED SAMPLING:
+ * - HIGH RISK layouts: ALWAYS (100%)
+ * - MEDIUM RISK layouts: Use sampling rate
+ * - LOW RISK layouts: Only for long titles
+ * - First/last slides: ALWAYS
+ * - Serendipitous mode: ALWAYS
+ */
+function shouldValidateWithTier2(
+    slideIndex: number,
+    totalSlides: number,
+    layoutId: string,
+    slideTitle: string,
+    styleMode: StyleMode,
+    config: DirectorConfig
+): boolean {
+    const riskLevel = getLayoutRiskLevel(layoutId);
+    
+    // Serendipitous mode: always validate for premium quality
+    if (styleMode === 'serendipitous') {
+        console.log(`[DIRECTOR] Tier 2: YES (serendipitous mode)`);
+        return true;
+    }
+    
+    // HIGH RISK: Always validate (100%)
+    if (riskLevel === 'high') {
+        console.log(`[DIRECTOR] Tier 2: YES (high-risk layout: ${layoutId})`);
+        return true;
+    }
+    
+    // First and last slides: Always validate
+    if (slideIndex === 0 || slideIndex === totalSlides - 1) {
+        console.log(`[DIRECTOR] Tier 2: YES (first/last slide)`);
+        return true;
+    }
+    
+    // LOW RISK: Only for long titles
+    if (riskLevel === 'low') {
+        if (slideTitle.length > 40) {
+            console.log(`[DIRECTOR] Tier 2: YES (low-risk but long title: ${slideTitle.length} chars)`);
+            return true;
+        }
+        console.log(`[DIRECTOR] Tier 2: SKIP (low-risk layout: ${layoutId})`);
+        return false;
+    }
+    
+    // MEDIUM RISK: Use sampling rate
+    if (config.visualValidationSampling >= 1.0) return true;
+    if (config.visualValidationSampling <= 0) return false;
+    
+    const sampleEvery = Math.ceil(1 / config.visualValidationSampling);
+    const shouldValidate = slideIndex % sampleEvery === 0;
+    console.log(`[DIRECTOR] Tier 2: ${shouldValidate ? 'YES' : 'SKIP'} (medium-risk, sampling 1/${sampleEvery})`);
+    return shouldValidate;
 }
 
 /**
  * Determine if this slide should be visually validated.
+ * @deprecated Use shouldValidateWithTier2 for tier-aware validation
  * 
  * RISK-BASED SAMPLING (fixes the "sampling gamble"):
  * - HIGH RISK layouts (bento-grid, dashboard-tiles): ALWAYS validate (100%)

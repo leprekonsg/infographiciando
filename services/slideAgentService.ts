@@ -1152,25 +1152,33 @@ async function runGenerator(
                 }).join(',');
                 metricExample = `metric-cards: {"type":"metric-cards","metrics":[${metricsJson}]}`;
             } else {
-                // No valid dataPoints - steer towards text-bullets
-                metricExample = `text-bullets: {"type":"text-bullets","title":"Key Insights","content":["First insight","Second insight"]}`;
+                // No valid dataPoints - steer towards text-bullets (NO title field to avoid duplication)
+                metricExample = `text-bullets: {"type":"text-bullets","content":["First insight","Second insight"]}`;
             }
 
-            // SIMPLIFIED EXAMPLES for fallback model - no diagram-svg, no spatial zones terminology
+            // ============================================================================
+            // COMPONENT EXAMPLES (Updated 2026-01-28)
+            // ============================================================================
+            // IMPORTANT: text-bullets should NOT include a "title" field because:
+            // 1. The slide already has a title zone rendered separately
+            // 2. Component titles create visual duplication and overlap
+            // 3. Content zones should contain only content, not redundant headers
+            // ============================================================================
             const componentExamples = usingFallbackModel
                 ? `COMPONENT TYPES (pick 1-2):
-text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
+text-bullets: {"type":"text-bullets","content":["Line 1","Line 2"]}
 ${metricExample}
 process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
 icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}`
                 : `COMPONENT EXAMPLES (${minComponents}-${maxComponents} for ${layoutVariant}):
-text-bullets: {"type":"text-bullets","title":"Title","content":["Line 1","Line 2"]}
+text-bullets: {"type":"text-bullets","content":["Line 1","Line 2"]}
 ${metricExample}
 process-flow: {"type":"process-flow","steps":[{"title":"Step 1","description":"Details","icon":"ArrowRight"}]}
 icon-grid: {"type":"icon-grid","items":[{"label":"Feature","icon":"Activity"}]}
 chart-frame: {"type":"chart-frame","title":"Chart","chartType":"bar","data":[{"label":"Q1","value":100}]}
 
-CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with value, label, and icon. Empty metrics:[] will fail validation. If you lack dataPoints, DO NOT use metric-cards. Use text-bullets instead.`;
+CRITICAL: If using metric-cards, the metrics array MUST have 2-3 items with value, label, and icon. Empty metrics:[] will fail validation. If you lack dataPoints, DO NOT use metric-cards. Use text-bullets instead.
+NOTE: Do NOT add a "title" field to text-bullets - the slide already has a title zone. Component titles cause visual duplication.`;
 
             // CONTEXT COMPRESSION: Only pass essential fields to prevent "constraint too tall" errors
             // Problem: Full routerConfig + visualDesignSpec can exceed Gemini's FST constraint (5888 height)

@@ -868,7 +868,8 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         const textComponents = componentList.filter(c => c.type === 'text-bullets');
         if (textComponents.length <= 1) return componentList;
 
-        const maxTextComponents = ['standard-vertical', 'dashboard-tiles', 'asymmetric-grid'].includes(layoutVariant) ? 2 : 1;
+        const requiresTwo = ['split-left-text', 'split-right-text'].includes(layoutVariant);
+        const maxTextComponents = ['standard-vertical', 'dashboard-tiles', 'asymmetric-grid', 'split-left-text', 'split-right-text'].includes(layoutVariant) ? 2 : 1;
         const hasDuplicates = textComponents.some((a: any, idx: number) => {
             const aKey = `${String(a.title || '').trim().toLowerCase()}|${(a.content || []).map((s: any) => String(s).trim().toLowerCase()).join('||')}`;
             return textComponents.slice(idx + 1).some((b: any) => {
@@ -878,22 +879,6 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         });
 
         if (textComponents.length <= maxTextComponents && !hasDuplicates) return componentList;
-
-        const merged = textComponents[0];
-        const mergedContent: string[] = [];
-        const seen = new Set<string>();
-
-        textComponents.forEach((comp: any) => {
-            const items = Array.isArray(comp.content) ? comp.content : [];
-            items.forEach((item: any) => {
-                const norm = String(item).trim();
-                const key = norm.toLowerCase();
-                if (norm && !seen.has(key)) {
-                    seen.add(key);
-                    mergedContent.push(norm);
-                }
-            });
-        });
 
         const layoutBulletCaps: Record<string, number> = {
             'split-left-text': 2,
@@ -917,6 +902,63 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             'timeline-horizontal': 55,
             'standard-vertical': 70
         };
+
+        if (requiresTwo) {
+            const mergedContent: string[] = [];
+            const seen = new Set<string>();
+
+            textComponents.forEach((comp: any) => {
+                const items = Array.isArray(comp.content) ? comp.content : [];
+                items.forEach((item: any) => {
+                    const norm = String(item).trim();
+                    const key = norm.toLowerCase();
+                    if (norm && !seen.has(key)) {
+                        seen.add(key);
+                        mergedContent.push(norm);
+                    }
+                });
+            });
+
+            const layoutCap = layoutBulletCaps[layoutVariant] ?? LIST_LIMITS.textBullets;
+            const baseCharCap = layoutBulletCharCaps[layoutVariant] ?? 70;
+            const splitIndex = Math.max(1, Math.ceil(mergedContent.length / 2));
+            const first = mergedContent.slice(0, splitIndex);
+            const second = mergedContent.slice(splitIndex);
+
+            // Ensure both components have at least one item
+            if (second.length === 0 && first.length > 1) {
+                second.push(first.pop() as string);
+            }
+
+            const firstCharCap = computeBulletCharCap(baseCharCap, first.length, slide.routerConfig?.densityBudget);
+            const secondCharCap = computeBulletCharCap(baseCharCap, second.length, slide.routerConfig?.densityBudget);
+
+            const compA = { ...textComponents[0], content: capList(first.map(t => truncateText(t, firstCharCap, 'bullet text')), layoutCap, 'bullet items') };
+            const compB = { ...textComponents[1] || textComponents[0], content: capList(second.map(t => truncateText(t, secondCharCap, 'bullet text')), layoutCap, 'bullet items') };
+            if (!compB.content || compB.content.length === 0) {
+                compB.content = ['Secondary point'];
+            }
+
+            addWarning(`Auto-split ${textComponents.length} text-bullets components into 2 for ${layoutVariant}`);
+            return componentList.filter(c => c.type !== 'text-bullets').concat([compA, compB]);
+        }
+
+        const merged = textComponents[0];
+        const mergedContent: string[] = [];
+        const seen = new Set<string>();
+
+        textComponents.forEach((comp: any) => {
+            const items = Array.isArray(comp.content) ? comp.content : [];
+            items.forEach((item: any) => {
+                const norm = String(item).trim();
+                const key = norm.toLowerCase();
+                if (norm && !seen.has(key)) {
+                    seen.add(key);
+                    mergedContent.push(norm);
+                }
+            });
+        });
+
         const layoutCap = layoutBulletCaps[layoutVariant] ?? LIST_LIMITS.textBullets;
         const baseCharCap = layoutBulletCharCaps[layoutVariant] ?? 70;
         merged.title = merged.title || 'Key Points';
@@ -1421,6 +1463,16 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
 
     if (['split-left-text', 'split-right-text'].includes(finalVariant) && componentCount < 2) {
         enforceFinalFallback(`${finalVariant} requires 2 components`);
+    }
+
+    // STEP 4: Data-viz downgrade if no chart or metric remains after repairs
+    const hasChartFrame = finalTypes.includes('chart-frame');
+    const hasMetricCards = finalTypes.includes('metric-cards');
+    const hasChartSpec = !!(slide as any).chartSpec;
+    if ((slide as any).type === 'data-viz' && !hasChartFrame && !hasMetricCards && !hasChartSpec) {
+        console.warn('[AUTO-REPAIR] Downgrading slide type: data-viz → content-main (no chart/metrics)');
+        (slide as any).type = 'content-main';
+        addWarning('Downgraded slide type to content-main: no chart or metrics available');
     }
 
     return slide;
