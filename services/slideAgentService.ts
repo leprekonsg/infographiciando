@@ -1899,6 +1899,26 @@ Expected structure:
                 };
             }
 
+            // Hard reroute when critical overflow remains after final attempt.
+            const hasCriticalOverflow = envSnapshot.zones.some((z: any) => z.is_critical_overflow) ||
+                (candidate.warnings || []).some(w => /truncated|hidden|overflow|unplaced component|title dropped/i.test(String(w)));
+            if (hasCriticalOverflow && attempt === MAX_RETRIES) {
+                console.warn(`[CIRCUIT BREAKER] Critical overflow detected after retries. Signaling reroute.`);
+                return {
+                    slide: candidate,
+                    needsReroute: true,
+                    rerouteReason: 'Critical overflow or truncation persists',
+                    rerouteReasonType: GeneratorFailureReason.LowFitScore,
+                    avoidLayoutVariants: [routerConfig.layoutVariant],
+                    visualCritiqueRan,
+                    visualRepairAttempted,
+                    visualRepairSucceeded,
+                    system2Cost,
+                    system2InputTokens,
+                    system2OutputTokens
+                };
+            }
+
             // Check if reroute is needed based on fit score
             if (envSnapshot.fit_score < SCORE_THRESHOLD.ACCEPTABLE && attempt === MAX_RETRIES) {
                 console.warn(`[CIRCUIT BREAKER] Fit score ${envSnapshot.fit_score.toFixed(2)} < threshold ${SCORE_THRESHOLD.ACCEPTABLE}. Signaling reroute.`);

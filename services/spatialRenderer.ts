@@ -555,23 +555,25 @@ export class SpatialLayoutEngine {
   ): number {
     // Font-aware character width estimation
     // PowerPoint uses inches internally, 1 unit ≈ 1 inch
-    // At 14pt, typical character widths:
-    // - Proportional (Inter, Arial): ~0.08 inches per char → ~12.5 chars/inch → 12.5 chars/unit
-    // - Monospace (Fira Code, Courier): ~0.12 inches per char → ~8.3 chars/inch → 8.3 chars/unit
+    // Use conservative wrapping assumptions to avoid underestimating line count.
+    // Underestimation causes text overlap in PPTX where wrapping is stricter.
+    // At 14pt:
+    // - Proportional: ~9.8 chars/unit (conservative)
+    // - Monospace: ~7.0 chars/unit
 
     const isMonospace = fontFamily && /mono|code|courier|consolas|fira.*code|source.*code/i.test(fontFamily);
-    const baseCharsPerUnit = isMonospace ? 8.3 : 12.5; // chars per unit at 14pt
+    const baseCharsPerUnit = isMonospace ? 7.0 : 9.8;
 
     // Scale by font size (smaller font = more chars per unit)
     const effectiveCharsPerUnit = baseCharsPerUnit * (14 / fontSizePoints);
 
-    // Account for zone padding (typically 5% on each side)
-    const usableWidth = zoneWidthUnits * 0.9;
-    const maxCharsPerLine = Math.max(10, Math.floor(usableWidth * effectiveCharsPerUnit));
+    // Reserve wider safety padding for bullets and PPT default text margins.
+    const usableWidth = zoneWidthUnits * 0.82;
+    const maxCharsPerLine = Math.max(8, Math.floor(usableWidth * effectiveCharsPerUnit));
 
     return lines.reduce((wrappedCount, line) => {
       const visibleText = line.replace(/^•\s*/, ''); // Remove bullet
-      const wrappedLines = Math.ceil(visibleText.length / maxCharsPerLine);
+      const wrappedLines = Math.ceil((visibleText.length + 2) / maxCharsPerLine);
       return wrappedCount + Math.max(1, wrappedLines);
     }, 0);
   }
@@ -686,20 +688,15 @@ export class SpatialLayoutEngine {
       let lines = comp.content || [];
       const hasTitle = !!comp.title;
 
-      // PRE-EMPTIVE DENSITY CHECK: If zone is very small, reduce content BEFORE calculating fit
-      // This prevents truncation mid-render which looks worse than fewer, complete bullets
-      const zoneArea = zone.w * zone.h;
-      const MAX_LINES_FOR_SMALL_ZONE = 2;
-      const MAX_LINES_FOR_MEDIUM_ZONE = 3;
-      
-      if (zoneArea < 0.3 && lines.length > MAX_LINES_FOR_SMALL_ZONE) {
-        // Very small zone (e.g., split layout secondary area) - limit to 2 bullets max
-        lines = lines.slice(0, MAX_LINES_FOR_SMALL_ZONE);
-        this.addWarning(`Zone '${zone.id}' is small (${zoneArea.toFixed(2)} area), limited to ${MAX_LINES_FOR_SMALL_ZONE} bullets`);
-      } else if (zoneArea < 0.5 && lines.length > MAX_LINES_FOR_MEDIUM_ZONE) {
-        // Medium zone - limit to 3 bullets
-        lines = lines.slice(0, MAX_LINES_FOR_MEDIUM_ZONE);
-        this.addWarning(`Zone '${zone.id}' is medium (${zoneArea.toFixed(2)} area), limited to ${MAX_LINES_FOR_MEDIUM_ZONE} bullets`);
+      // PRE-EMPTIVE DENSITY CHECK: use zone dimensions (not absolute area) to cap bullets.
+      // The old area thresholds were too small for the 16:9 coordinate system and never triggered.
+      const compactZone = h < 1.9 || w < 3.0;
+      const mediumZone = h < 2.6 || w < 4.2;
+      const maxBulletsForZone = compactZone ? 2 : (mediumZone ? 3 : 4);
+
+      if (lines.length > maxBulletsForZone) {
+        lines = lines.slice(0, maxBulletsForZone);
+        this.addWarning(`Zone '${zone.id}' density capped to ${maxBulletsForZone} bullets (w:${w.toFixed(2)}, h:${h.toFixed(2)})`);
       }
 
       // ENHANCED OVERFLOW PREVENTION: If we have too many lines for the zone, try these in order:
@@ -714,8 +711,8 @@ export class SpatialLayoutEngine {
       // IMPORTANT: incorporate line-height and item-spacing hints when present
       // Default multipliers (1.0) preserve legacy behavior
       const titleHeightFactor = hasTitle ? 0.7 : 0;
-      const lineHeightFactor = 0.5 * lineHeightMultiplier;
-      const lineGapFactor = 0.1 * itemSpacingMultiplier;
+      const lineHeightFactor = 0.56 * lineHeightMultiplier;
+      const lineGapFactor = 0.12 * itemSpacingMultiplier;
       const wrappedLinesHeightFactor = estimatedWrappedLines > 0
         ? (estimatedWrappedLines * lineHeightFactor) + (Math.max(0, estimatedWrappedLines - 1) * lineGapFactor)
         : 0;
@@ -842,11 +839,11 @@ export class SpatialLayoutEngine {
         const wrappedLinesCount = Math.ceil(visibleText.length / maxCharsPerLine);
         const vLines = Math.max(1, wrappedLinesCount);
 
-        const lineH = 0.5 * contentScale * lineHeightMultiplier;
+        const lineH = 0.56 * contentScale * lineHeightMultiplier;
         const totalVisualH = vLines * lineH;
 
-        // Advance: 0.6 basis + extra height for wrapped lines (apply item spacing multiplier)
-        const advance = Math.max(0.6 * contentScale * itemSpacingMultiplier, totalVisualH + (0.1 * contentScale));
+        // Advance: conservative baseline + wrapped-line safety gap
+        const advance = Math.max(0.66 * contentScale * itemSpacingMultiplier, totalVisualH + (0.12 * contentScale));
 
         if (curY + totalVisualH > maxY) {
           if (i < lines.length) {
@@ -1345,7 +1342,8 @@ function calculateTextDensity(components: TemplateComponent[]): number {
 function calculateFitScore(
   warningsCount: number,
   avgUtilization: number,
-  textDensity: number
+  textDensity: number,
+  criticalWarningCount: number
 ): number {
   // Start with perfect score
   let score = 1.0;
@@ -1354,6 +1352,12 @@ function calculateFitScore(
   // We want to differentiate between "ugly" (warnings) and "broken" (errors)
   if (warningsCount > 0) {
     score -= warningsCount * 0.05; // -5% per warning (was -15%)
+  }
+
+  // Critical warnings (overflow/truncation/unplaced) should force reroute pressure.
+  if (criticalWarningCount > 0) {
+    score -= criticalWarningCount * 0.2;
+    score = Math.min(score, 0.58);
   }
 
   // Penalize for high utilization (RELAXED: >0.95 is risky, was 0.9)
@@ -1408,9 +1412,17 @@ export function createEnvironmentSnapshot(
     : 0;
 
   const textDensity = calculateTextDensity(slide.layoutPlan?.components || []);
+  const criticalWarningCount = warnings.filter(w =>
+    /truncated|hidden|overflow|title dropped|unplaced component/i.test(String(w))
+  ).length;
 
   // Calculate fit score
-  const fit_score = calculateFitScore(warnings.length, avgUtilization, textDensity);
+  const fit_score = calculateFitScore(
+    warnings.length,
+    avgUtilization,
+    textDensity,
+    criticalWarningCount
+  );
 
   // Determine health level
   let health_level: EnvironmentState['health_level'];
@@ -1427,7 +1439,7 @@ export function createEnvironmentSnapshot(
   // Determine if reroute is needed
   const needs_reroute = fit_score < 0.6;
   const reroute_reason = needs_reroute
-    ? `Fit score ${fit_score.toFixed(2)} below threshold (0.6). ${warnings.length} warning(s).`
+    ? `Fit score ${fit_score.toFixed(2)} below threshold (0.6). ${warnings.length} warning(s), ${criticalWarningCount} critical.`
     : undefined;
 
   // Suggest action

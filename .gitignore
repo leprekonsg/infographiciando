@@ -23,3 +23,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+agent-arch-critique.md
+AGENTS.md
+.github/copilot-instructions.md

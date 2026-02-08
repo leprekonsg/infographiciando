@@ -281,19 +281,24 @@ export function renderCard(
   }
 
   // 6. Header Text (overline + title + subtitle)
+  let headerBottomY = card.position.y + (card.position.h * 0.48);
   if (card.header) {
-    const headerElements = renderCardHeader(
+    const headerResult = renderCardHeader(
       card,
       context,
       zIndex
     );
-    elements.push(...headerElements);
-    zIndex += headerElements.length;
+    elements.push(...headerResult.elements);
+    zIndex += headerResult.elements.length;
+    headerBottomY = headerResult.endY;
   }
 
   // 7. Body Text
   if (card.body) {
-    elements.push(renderCardBody(card, context, zIndex++));
+    const bodyElement = renderCardBody(card, context, zIndex++, headerBottomY);
+    if (bodyElement) {
+      elements.push(bodyElement);
+    }
   }
 
   // 8. Optional Glow Effect (external glow, behind card)
@@ -554,7 +559,7 @@ function renderCardHeader(
   card: CardElement,
   context: CardRenderContext,
   baseZIndex: number
-): VisualElement[] {
+): { elements: VisualElement[]; endY: number } {
   const elements: VisualElement[] = [];
   const header = card.header!;
 
@@ -571,19 +576,28 @@ function renderCardHeader(
   }
 
   const textX = card.position.x + padding;
-  const textW = card.position.w - (padding * 2);
+  const textW = Math.max(0.4, card.position.w - (padding * 2));
+  const headerBottomLimit = card.position.y + (card.position.h * 0.54);
 
   let zIndex = baseZIndex;
 
   // 1. Overline (small caps text above title) - PREMIUM TYPOGRAPHY
   if (header.overline) {
+    const overlineHeight = ptToUnits(CARD_PREMIUM_TYPOGRAPHY.overline.size, CARD_PREMIUM_TYPOGRAPHY.overline.lineHeight);
+    const overlineFit = fitTextForBox(
+      header.overline.toUpperCase(),
+      textW,
+      CARD_PREMIUM_TYPOGRAPHY.overline.size,
+      1
+    );
+
     elements.push({
       type: 'text',
-      content: header.overline.toUpperCase(),
+      content: overlineFit.content,
       x: textX,
       y: textY,
       w: textW,
-      h: 0.25,
+      h: overlineHeight,
       fontSize: CARD_PREMIUM_TYPOGRAPHY.overline.size,
       color: normalizeColor(context.palette.textMuted),
       bold: true,
@@ -593,17 +607,31 @@ function renderCardHeader(
       fontWeight: CARD_PREMIUM_TYPOGRAPHY.overline.fontWeight,
       textTransform: 'uppercase'
     });
-    textY += 0.26; // Slightly more space after overline
+    textY += overlineHeight + 0.04;
   }
 
   // 2. Title - PREMIUM TYPOGRAPHY
+  const titleLineHeight = ptToUnits(CARD_PREMIUM_TYPOGRAPHY.title.size, CARD_PREMIUM_TYPOGRAPHY.title.lineHeight);
+  const subtitleReserve = header.subtitle
+    ? ptToUnits(CARD_PREMIUM_TYPOGRAPHY.subtitle.size, CARD_PREMIUM_TYPOGRAPHY.subtitle.lineHeight) + 0.05
+    : 0;
+  const maxTitleLines = Math.max(
+    1,
+    Math.min(
+      3,
+      Math.floor(Math.max(titleLineHeight, headerBottomLimit - textY - subtitleReserve) / titleLineHeight)
+    )
+  );
+  const fittedTitle = fitTextForBox(header.title, textW, CARD_PREMIUM_TYPOGRAPHY.title.size, maxTitleLines);
+  const titleHeight = Math.max(titleLineHeight, titleLineHeight * fittedTitle.lines);
+
   elements.push({
     type: 'text',
-    content: header.title,
+    content: fittedTitle.content,
     x: textX,
     y: textY,
     w: textW,
-    h: 0.4, // Taller for larger title
+    h: titleHeight,
     fontSize: CARD_PREMIUM_TYPOGRAPHY.title.size,
     color: normalizeColor(context.palette.text),
     bold: true,
@@ -613,17 +641,29 @@ function renderCardHeader(
     fontWeight: CARD_PREMIUM_TYPOGRAPHY.title.fontWeight,
     lineHeight: CARD_PREMIUM_TYPOGRAPHY.title.lineHeight
   });
-  textY += 0.4;
+  textY += titleHeight + 0.04;
 
   // 3. Subtitle (optional) - PREMIUM TYPOGRAPHY
   if (header.subtitle) {
+    const subtitleLineHeight = ptToUnits(CARD_PREMIUM_TYPOGRAPHY.subtitle.size, CARD_PREMIUM_TYPOGRAPHY.subtitle.lineHeight);
+    const maxSubtitleLines = Math.max(
+      1,
+      Math.min(2, Math.floor(Math.max(subtitleLineHeight, headerBottomLimit - textY) / subtitleLineHeight))
+    );
+    const fittedSubtitle = fitTextForBox(
+      header.subtitle,
+      textW,
+      CARD_PREMIUM_TYPOGRAPHY.subtitle.size,
+      maxSubtitleLines
+    );
+
     elements.push({
       type: 'text',
-      content: header.subtitle,
+      content: fittedSubtitle.content,
       x: textX,
       y: textY,
       w: textW,
-      h: 0.3,
+      h: subtitleLineHeight * fittedSubtitle.lines,
       fontSize: CARD_PREMIUM_TYPOGRAPHY.subtitle.size,
       color: normalizeColor(context.palette.textMuted),
       bold: false,
@@ -633,9 +673,13 @@ function renderCardHeader(
       fontWeight: CARD_PREMIUM_TYPOGRAPHY.subtitle.fontWeight,
       lineHeight: CARD_PREMIUM_TYPOGRAPHY.subtitle.lineHeight
     });
+    textY += (subtitleLineHeight * fittedSubtitle.lines) + 0.03;
   }
 
-  return elements;
+  return {
+    elements,
+    endY: Math.min(headerBottomLimit, textY)
+  };
 }
 
 // ============================================================================
@@ -653,21 +697,34 @@ const CARD_BODY_TYPOGRAPHY = {
 function renderCardBody(
   card: CardElement,
   context: CardRenderContext,
-  zIndex: number
-): VisualElement {
+  zIndex: number,
+  headerBottomY: number
+): VisualElement | null {
   const padding = 0.18; // Consistent premium padding
 
-  // Calculate body position (after header)
-  // This is a simplified calculation; real implementation would measure header height
-  const bodyY = card.position.y + card.position.h * 0.55;
+  // Calculate body position from measured header bounds to prevent overlap.
+  const minBodyStart = card.position.y + (card.position.h * 0.42);
+  const bodyY = Math.max(minBodyStart, headerBottomY + 0.08);
+  const bodyBottom = card.position.y + card.position.h - padding;
+  const availableHeight = bodyBottom - bodyY;
+
+  if (!card.body || availableHeight < 0.16) {
+    return null;
+  }
+
+  const bodyWidth = Math.max(0.4, card.position.w - (padding * 2));
+  const bodyLineHeight = ptToUnits(CARD_BODY_TYPOGRAPHY.size, CARD_BODY_TYPOGRAPHY.lineHeight);
+  const maxBodyLines = Math.max(1, Math.floor(availableHeight / bodyLineHeight));
+  const fittedBody = fitTextForBox(card.body, bodyWidth, CARD_BODY_TYPOGRAPHY.size, maxBodyLines);
+  const bodyHeight = Math.max(bodyLineHeight, Math.min(availableHeight, fittedBody.lines * bodyLineHeight));
 
   return {
     type: 'text',
-    content: card.body || '',
+    content: fittedBody.content,
     x: card.position.x + padding,
     y: bodyY,
-    w: card.position.w - (padding * 2),
-    h: card.position.h * 0.35,
+    w: bodyWidth,
+    h: bodyHeight,
     fontSize: CARD_BODY_TYPOGRAPHY.size,
     color: normalizeColor(context.palette.textMuted),
     bold: false,
@@ -675,6 +732,54 @@ function renderCardBody(
     zIndex,
     lineHeight: CARD_BODY_TYPOGRAPHY.lineHeight,
     fontWeight: CARD_BODY_TYPOGRAPHY.fontWeight
+  };
+}
+
+type FittedText = {
+  content: string;
+  lines: number;
+  truncated: boolean;
+};
+
+function ptToUnits(fontSizePt: number, lineHeight: number): number {
+  return (fontSizePt / 72) * lineHeight;
+}
+
+function estimateCharsPerLine(widthUnits: number, fontSizePt: number): number {
+  // Conservative estimate for PPT text wrapping in 16:9 slides.
+  const baseCharsPerUnit = 9.2;
+  const scale = 14 / Math.max(8, fontSizePt);
+  return Math.max(8, Math.floor(widthUnits * baseCharsPerUnit * scale));
+}
+
+function fitTextForBox(
+  text: string,
+  widthUnits: number,
+  fontSizePt: number,
+  maxLines: number
+): FittedText {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return { content: '', lines: 0, truncated: false };
+
+  const charsPerLine = estimateCharsPerLine(widthUnits, fontSizePt);
+  const maxChars = Math.max(charsPerLine, charsPerLine * Math.max(1, maxLines));
+
+  if (normalized.length <= maxChars) {
+    return {
+      content: normalized,
+      lines: Math.max(1, Math.ceil(normalized.length / charsPerLine)),
+      truncated: false
+    };
+  }
+
+  const target = normalized.slice(0, Math.max(0, maxChars - 1));
+  const lastSpace = target.lastIndexOf(' ');
+  const clipped = (lastSpace > maxChars * 0.6 ? target.slice(0, lastSpace) : target).trimEnd();
+
+  return {
+    content: `${clipped}…`,
+    lines: Math.max(1, maxLines),
+    truncated: true
   };
 }
 
