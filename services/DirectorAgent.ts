@@ -63,6 +63,8 @@ import {
     getLayoutRiskLevel as getOrchestratorLayoutRiskLevel,
     MODE_COST_PROFILES
 } from './diagram/diagramOrchestrator';
+import { runAgentLoop } from './agentLoopKernel';
+import type { LoopIssue, LoopRunTrace } from '../types/agentLoopTypes';
 
 // =============================================================================
 // DIRECTOR CONFIGURATION
@@ -250,8 +252,13 @@ export const DeckBlueprintSchema = z.object({
     researchSummary: z.string().optional(),
     metrics: z.object({
         totalEnrichments: z.number(),
-        slidesEnriched: z.number()
-    }).optional()
+        slidesEnriched: z.number(),
+        loopRuns: z.number().optional(),
+        loopAcceptWithWarnings: z.number().optional(),
+        loopReroutes: z.number().optional(),
+        avgLoopIterations: z.number().optional()
+    }).optional(),
+    loopTraces: z.array(z.any()).optional()
 });
 
 export type DeckBlueprint = z.infer<typeof DeckBlueprintSchema>;
@@ -1250,7 +1257,27 @@ interface DirectorMetrics {
     enrichmentDetails: Array<{ slideIndex: number; reason: string; attempt: number }>;
     pruneDetails: Array<{ slideIndex: number; reason: string; attempt: number }>;
     slidePaths: Array<{ slideIndex: number; path: 'PASS' | 'ENRICH' | 'PRUNE' | 'SUMMARIZE' }>; // NEW: Path per slide
+    loopRuns: number;
+    loopAcceptWithWarnings: number;
+    loopReroutes: number;
+    totalLoopIterations: number;
+    loopTraces: LoopRunTrace[];
     timings: PhaseTimings;                    // NEW: Per-phase breakdown
+}
+
+interface DirectorLoopState {
+    contentPlan: any;
+    qualityResult: ContentQualityResult;
+    enrichmentAttempts: number;
+    pruneAttempts: number;
+    lastAction?: 'enrich' | 'prune' | 'summarize' | 'none';
+    actionApplied: boolean;
+    facts: ResearchFact[];
+}
+
+interface DirectorLoopEnv {
+    contentPlan: any;
+    qualityResult: ContentQualityResult;
 }
 
 /**
@@ -1301,6 +1328,11 @@ export async function runDirector(
         enrichmentDetails: [],
         pruneDetails: [],
         slidePaths: [],
+        loopRuns: 0,
+        loopAcceptWithWarnings: 0,
+        loopReroutes: 0,
+        totalLoopIterations: 0,
+        loopTraces: [],
         timings
     };
 
@@ -1428,148 +1460,243 @@ export async function runDirector(
                 avoidBullets: styleMode === 'serendipitous' && isHeroSlide
             } : undefined;
 
-            // BIDIRECTIONAL LOOP: Keep adjusting until quality passes or limits hit
-            let totalAttempts = 0;
-            const MAX_TOTAL_ATTEMPTS = 4; // Safety valve
+            // BIDIRECTIONAL LOOP via shared Observe -> Diagnose -> Act -> Verify kernel
+            const MAX_TOTAL_ATTEMPTS = 4;
+            const loopResult = await runAgentLoop<DirectorLoopState, DirectorLoopEnv>({
+                slideId: `${i + 1}:${slideTitle}`,
+                pipeline: 'director',
+                initialState: {
+                    contentPlan,
+                    qualityResult,
+                    enrichmentAttempts,
+                    pruneAttempts,
+                    lastAction: 'none',
+                    actionApplied: false,
+                    facts
+                },
+                policy: {
+                    maxIterations: MAX_TOTAL_ATTEMPTS,
+                    maxTimeMs: 25000,
+                    stagnationWindow: 2,
+                    minImprovementDelta: 1,
+                    allowSoftAccept: true
+                },
+                observe: async ({ state }) => {
+                    let plannedContent = state.contentPlan;
 
-            while (totalAttempts < MAX_TOTAL_ATTEMPTS) {
-                totalAttempts++;
-
-                // PLAN: Generate content (only on first attempt or after enrichment)
-                if (!contentPlan || qualityResult.suggestedAction === 'enrich') {
-                    try {
-                        contentPlan = await runContentPlanner(
-                            slideMeta,
-                            factsToContext(facts, slideMeta),
-                            costTracker,
-                            [],
-                            { maxBullets: constraints.maxBullets, maxCharsPerBullet: constraints.maxCharsPerBullet },
-                            styleAwareHint  // Pass style-aware hint
-                        );
-                    } catch (planErr: any) {
-                        console.warn(`[DIRECTOR] ContentPlanner failed for slide ${i + 1}:`, planErr.message);
-                        contentPlan = { keyPoints: [slideMeta?.purpose || 'Content'] };
-                    }
-                }
-
-                // EVALUATE: Check content quality (bidirectional)
-                qualityResult = evaluateContentQuality(contentPlan, slideMeta, layoutId, isHeroSlide);
-
-                // VISUAL GATE: Risk-based visual validation
-                // HIGH RISK layouts always validated; MEDIUM uses sampling; LOW skipped unless long title
-                if (qualityResult.passes && shouldValidateVisually(i, totalSlides, layoutId, slideTitle, config)) {
-                    metrics.visualValidations++;
-                    const visualResult = runVisualGate(contentPlan, layoutId, slideTitle, profile);
-                    
-                    if (!visualResult.fits) {
-                        console.log(`[DIRECTOR] Slide ${i + 1} FAILED Visual Gate: ${visualResult.failureCode} - ${visualResult.reason}`);
-                        metrics.visualFailures++;
-                        
-                        // Record structured failure for analytics
-                        if (visualResult.failureCode) {
-                            // Map 'pass' to 'summarize' for the action field (should never happen but type safety)
-                            const actionForLog = visualResult.action === 'pass' ? 'summarize' : (visualResult.action || 'summarize');
-                            metrics.visualGateFailures.push({
-                                code: visualResult.failureCode,
-                                slideIndex: i + 1,
-                                layoutId,
-                                details: visualResult.reason || 'Unknown',
-                                action: actionForLog as 'prune' | 'summarize' | 'change_layout'
-                            });
+                    if (!plannedContent || state.qualityResult.suggestedAction === 'enrich') {
+                        try {
+                            plannedContent = await runContentPlanner(
+                                slideMeta,
+                                factsToContext(state.facts, slideMeta),
+                                costTracker,
+                                [],
+                                { maxBullets: constraints.maxBullets, maxCharsPerBullet: constraints.maxCharsPerBullet },
+                                styleAwareHint
+                            );
+                        } catch (planErr: any) {
+                            console.warn(`[DIRECTOR] ContentPlanner failed for slide ${i + 1}:`, planErr.message);
+                            plannedContent = { keyPoints: [slideMeta?.purpose || 'Content'] };
                         }
-                        
-                        // Map visual action to quality action (change_layout → prune)
-                        const mappedAction = visualResult.action === 'change_layout' ? 'prune' : visualResult.action;
-                        
-                        // Override quality result with visual failure
-                        qualityResult = {
-                            passes: false,
-                            reason: 'overflow',
-                            details: `Visual Gate: ${visualResult.reason}`,
-                            suggestedAction: mappedAction || 'summarize'
-                        };
-                    } else {
-                        console.log(`[DIRECTOR] Slide ${i + 1} PASSES Visual Gate`);
                     }
-                }
 
-                if (qualityResult.passes) {
-                    console.log(`[DIRECTOR] Slide ${i + 1} content PASSES all quality gates`);
-                    break; // Exit loop - content is good
-                }
+                    let evaluated = evaluateContentQuality(plannedContent, slideMeta, layoutId, isHeroSlide);
 
-                // Handle based on suggested action
-                const action = qualityResult.suggestedAction;
-                
-                // -------------------------------------------------------------
-                // PATH A: ENRICH (Content too thin)
-                // -------------------------------------------------------------
-                if (action === 'enrich' && enrichmentAttempts < QUALITY_THRESHOLDS.MAX_ENRICHMENT_ATTEMPTS) {
-                    console.log(`[DIRECTOR] Slide ${i + 1} content THIN: ${qualityResult.details}`);
-                    console.log(`[DIRECTOR] State: ENRICH (attempt ${enrichmentAttempts + 1})`);
-                    
-                    const newFacts = await targetedResearch(
-                        qualityResult.suggestedQuery || slideTitle,
-                        facts,
-                        costTracker
-                    );
-                    
-                    if (newFacts.length > 0) {
-                        facts = [...facts, ...newFacts];
-                        metrics.totalEnrichments++;
-                        metrics.enrichmentDetails.push({
-                            slideIndex: i + 1,
-                            reason: qualityResult.reason || 'unknown',
-                            attempt: enrichmentAttempts + 1
-                        });
-                        enrichmentAttempts++;
-                        continue; // Re-plan with enriched facts
-                    } else {
+                    if (evaluated.passes && shouldValidateVisually(i, totalSlides, layoutId, slideTitle, config)) {
+                        metrics.visualValidations++;
+                        const visualResult = runVisualGate(plannedContent, layoutId, slideTitle, profile);
+
+                        if (!visualResult.fits) {
+                            console.log(`[DIRECTOR] Slide ${i + 1} FAILED Visual Gate: ${visualResult.failureCode} - ${visualResult.reason}`);
+                            metrics.visualFailures++;
+
+                            if (visualResult.failureCode) {
+                                const actionForLog = visualResult.action === 'pass' ? 'summarize' : (visualResult.action || 'summarize');
+                                metrics.visualGateFailures.push({
+                                    code: visualResult.failureCode,
+                                    slideIndex: i + 1,
+                                    layoutId,
+                                    details: visualResult.reason || 'Unknown',
+                                    action: actionForLog as 'prune' | 'summarize' | 'change_layout'
+                                });
+                            }
+
+                            const mappedAction = visualResult.action === 'change_layout' ? 'prune' : visualResult.action;
+                            evaluated = {
+                                passes: false,
+                                reason: 'overflow',
+                                details: `Visual Gate: ${visualResult.reason}`,
+                                suggestedAction: mappedAction || 'summarize'
+                            };
+                        } else {
+                            console.log(`[DIRECTOR] Slide ${i + 1} PASSES Visual Gate`);
+                        }
+                    }
+
+                    return {
+                        contentPlan: plannedContent,
+                        qualityResult: evaluated
+                    };
+                },
+                diagnose: ({ env }) => {
+                    if (!env || env.qualityResult.passes) return [];
+                    const issue: LoopIssue = {
+                        code: `director_${env.qualityResult.reason || 'quality'}`,
+                        severity: env.qualityResult.reason === 'overflow' ? 'critical' : 'major',
+                        category: env.qualityResult.reason === 'overflow' ? 'layout' : 'content',
+                        message: env.qualityResult.details || 'Quality gate failed',
+                        target: slideTitle,
+                        evidence: { suggestedAction: env.qualityResult.suggestedAction }
+                    };
+                    return [issue];
+                },
+                act: async ({ state, env }) => {
+                    if (!env) {
+                        return { state: { ...state, actionApplied: false } };
+                    }
+
+                    const action = env.qualityResult.suggestedAction;
+
+                    if (action === 'enrich' && state.enrichmentAttempts < QUALITY_THRESHOLDS.MAX_ENRICHMENT_ATTEMPTS) {
+                        console.log(`[DIRECTOR] Slide ${i + 1} content THIN: ${env.qualityResult.details}`);
+                        console.log(`[DIRECTOR] State: ENRICH (attempt ${state.enrichmentAttempts + 1})`);
+
+                        const newFacts = await targetedResearch(
+                            env.qualityResult.suggestedQuery || slideTitle,
+                            state.facts,
+                            costTracker
+                        );
+
+                        if (newFacts.length > 0) {
+                            metrics.totalEnrichments++;
+                            metrics.enrichmentDetails.push({
+                                slideIndex: i + 1,
+                                reason: env.qualityResult.reason || 'unknown',
+                                attempt: state.enrichmentAttempts + 1
+                            });
+                            return {
+                                state: {
+                                    ...state,
+                                    contentPlan: env.contentPlan,
+                                    qualityResult: env.qualityResult,
+                                    enrichmentAttempts: state.enrichmentAttempts + 1,
+                                    facts: [...state.facts, ...newFacts],
+                                    lastAction: 'enrich',
+                                    actionApplied: true
+                                },
+                                actions: [{ kind: 'enrich', source: 'deterministic', expectedEffect: 'add_facts_for_thin_content' }]
+                            };
+                        }
+
                         console.log(`[DIRECTOR] No new facts found, accepting current content`);
-                        break;
+                        return {
+                            state: {
+                                ...state,
+                                contentPlan: env.contentPlan,
+                                qualityResult: env.qualityResult,
+                                lastAction: 'none',
+                                actionApplied: false
+                            },
+                            actions: [{ kind: 'enrich_skipped', source: 'policy', expectedEffect: 'none' }]
+                        };
+                    }
+
+                    if (action === 'prune' && state.pruneAttempts < QUALITY_THRESHOLDS.MAX_PRUNE_ATTEMPTS) {
+                        console.log(`[DIRECTOR] Slide ${i + 1} content FAT: ${env.qualityResult.details}`);
+                        console.log(`[DIRECTOR] State: PRUNE (attempt ${state.pruneAttempts + 1})`);
+                        metrics.totalPrunes++;
+                        metrics.pruneDetails.push({
+                            slideIndex: i + 1,
+                            reason: env.qualityResult.reason || 'unknown',
+                            attempt: state.pruneAttempts + 1
+                        });
+                        return {
+                            state: {
+                                ...state,
+                                contentPlan: pruneContent(env.contentPlan, profile.maxBullets, slideMeta),
+                                qualityResult: env.qualityResult,
+                                pruneAttempts: state.pruneAttempts + 1,
+                                lastAction: 'prune',
+                                actionApplied: true
+                            },
+                            actions: [{ kind: 'prune', source: 'deterministic', expectedEffect: 'reduce_points' }]
+                        };
+                    }
+
+                    if (action === 'summarize' && state.pruneAttempts < QUALITY_THRESHOLDS.MAX_PRUNE_ATTEMPTS) {
+                        console.log(`[DIRECTOR] Slide ${i + 1} content VERBOSE: ${env.qualityResult.details}`);
+                        console.log(`[DIRECTOR] State: SUMMARIZE (attempt ${state.pruneAttempts + 1})`);
+                        metrics.totalPrunes++;
+                        metrics.pruneDetails.push({
+                            slideIndex: i + 1,
+                            reason: env.qualityResult.reason || 'unknown',
+                            attempt: state.pruneAttempts + 1
+                        });
+                        return {
+                            state: {
+                                ...state,
+                                contentPlan: await summarizeContent(env.contentPlan, profile, costTracker),
+                                qualityResult: env.qualityResult,
+                                pruneAttempts: state.pruneAttempts + 1,
+                                lastAction: 'summarize',
+                                actionApplied: true
+                            },
+                            actions: [{ kind: 'summarize', source: 'deterministic', expectedEffect: 'compress_text' }]
+                        };
+                    }
+
+                    return {
+                        state: {
+                            ...state,
+                            contentPlan: env.contentPlan,
+                            qualityResult: env.qualityResult,
+                            lastAction: 'none',
+                            actionApplied: false
+                        },
+                        actions: [{ kind: 'noop', source: 'policy', expectedEffect: 'none' }]
+                    };
+                },
+                verify: ({ state, env }) => {
+                    if (!env) {
+                        return { verdict: 'retry', score: 50, effectScore: 0 };
+                    }
+                    if (env.qualityResult.passes) {
+                        console.log(`[DIRECTOR] Slide ${i + 1} content PASSES all quality gates`);
+                        return { verdict: 'accept', score: 100, effectScore: 100 };
+                    }
+                    if (state.actionApplied) {
+                        return { verdict: 'retry', score: 70, effectScore: 60 };
+                    }
+                    console.log(`[DIRECTOR] Slide ${i + 1} reached action limits, accepting content with warnings`);
+                    return {
+                        verdict: 'accept_with_warnings',
+                        score: 60,
+                        warning: `director_action_limit:${env.qualityResult.reason || 'unknown'}`,
+                        effectScore: 35
+                    };
+                },
+                onTrace: (entry) => {
+                    if (entry.phase === 'verify') {
+                        const verdict = entry.verify?.verdictHint;
+                        if (verdict) {
+                            onProgress?.(`[LOOP] Director ${i + 1}/${totalSlides}: ${verdict} (iter ${entry.iteration})`, progressPct);
+                        }
                     }
                 }
+            });
 
-                // -------------------------------------------------------------
-                // PATH B: PRUNE (Too many points)
-                // -------------------------------------------------------------
-                if (action === 'prune' && pruneAttempts < QUALITY_THRESHOLDS.MAX_PRUNE_ATTEMPTS) {
-                    console.log(`[DIRECTOR] Slide ${i + 1} content FAT: ${qualityResult.details}`);
-                    console.log(`[DIRECTOR] State: PRUNE (attempt ${pruneAttempts + 1})`);
-                    
-                    contentPlan = pruneContent(contentPlan, profile.maxBullets, slideMeta);
-                    metrics.totalPrunes++;
-                    metrics.pruneDetails.push({
-                        slideIndex: i + 1,
-                        reason: qualityResult.reason || 'unknown',
-                        attempt: pruneAttempts + 1
-                    });
-                    pruneAttempts++;
-                    continue; // Re-evaluate after pruning
-                }
+            metrics.loopRuns++;
+            metrics.totalLoopIterations += loopResult.trace.iterations.length;
+            metrics.loopTraces.push(loopResult.trace);
+            if (loopResult.verdict === 'accept_with_warnings') metrics.loopAcceptWithWarnings++;
+            if (loopResult.verdict === 'retry') metrics.loopAcceptWithWarnings++;
+            if (loopResult.verdict === 'reroute') metrics.loopReroutes++;
 
-                // -------------------------------------------------------------
-                // PATH C: SUMMARIZE (Text too long)
-                // -------------------------------------------------------------
-                if (action === 'summarize' && pruneAttempts < QUALITY_THRESHOLDS.MAX_PRUNE_ATTEMPTS) {
-                    console.log(`[DIRECTOR] Slide ${i + 1} content VERBOSE: ${qualityResult.details}`);
-                    console.log(`[DIRECTOR] State: SUMMARIZE (attempt ${pruneAttempts + 1})`);
-                    
-                    contentPlan = await summarizeContent(contentPlan, profile, costTracker);
-                    metrics.totalPrunes++;
-                    metrics.pruneDetails.push({
-                        slideIndex: i + 1,
-                        reason: qualityResult.reason || 'unknown',
-                        attempt: pruneAttempts + 1
-                    });
-                    pruneAttempts++;
-                    continue; // Re-evaluate after summarizing
-                }
-
-                // No more actions available, accept current content
-                console.log(`[DIRECTOR] Slide ${i + 1} reached action limits, accepting content`);
-                break;
-            }
+            contentPlan = loopResult.state.contentPlan;
+            qualityResult = loopResult.state.qualityResult;
+            enrichmentAttempts = loopResult.state.enrichmentAttempts;
+            pruneAttempts = loopResult.state.pruneAttempts;
+            facts = loopResult.state.facts;
 
             // Track if this slide was enriched or pruned
             if (enrichmentAttempts > 0 && metrics.enrichmentDetails.some(d => d.slideIndex === i + 1)) {
@@ -1682,6 +1809,8 @@ export async function runDirector(
         console.log(`  - Visual validations: ${metrics.visualValidations} (${metrics.visualFailures} failures)`);
         console.log(`  - Visual gate failures: ${metrics.visualGateFailures.map(f => f.code).join(', ') || 'none'}`);
         console.log(`  - Slide paths: ${metrics.slidePaths.map(s => `${s.slideIndex}:${s.path}`).join(', ')}`);
+        console.log(`  - Loop runs: ${metrics.loopRuns} (accept_with_warnings: ${metrics.loopAcceptWithWarnings}, reroutes: ${metrics.loopReroutes})`);
+        console.log(`  - Avg loop iterations: ${metrics.loopRuns > 0 ? (metrics.totalLoopIterations / metrics.loopRuns).toFixed(2) : '0.00'}`);
         console.log(`[DIRECTOR] Asset Summary:`);
         console.log(`  - Generated: ${metrics.assetsGenerated}`);
         console.log(`  - Used: ${metrics.assetsUsed}`);
@@ -1704,8 +1833,13 @@ export async function runDirector(
             researchSummary: `Facts: ${facts.length}. Loops: ${metrics.totalEnrichments} enrichments, ${metrics.totalPrunes} prunes. Visual checks: ${metrics.visualValidations} (${metrics.visualFailures} failures). Assets: ${metrics.assetsUsed}/${metrics.assetsGenerated} used (${metrics.assetsStale} stale). Total: ${timings.total}ms.`,
             metrics: {
                 totalEnrichments: metrics.totalEnrichments,
-                slidesEnriched: metrics.slidesEnriched
-            }
+                slidesEnriched: metrics.slidesEnriched,
+                loopRuns: metrics.loopRuns,
+                loopAcceptWithWarnings: metrics.loopAcceptWithWarnings,
+                loopReroutes: metrics.loopReroutes,
+                avgLoopIterations: metrics.loopRuns > 0 ? metrics.totalLoopIterations / metrics.loopRuns : 0
+            },
+            loopTraces: metrics.loopTraces
         };
 
         // Validate blueprint

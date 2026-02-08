@@ -1,6 +1,7 @@
 
 import { z } from "zod";
 import { CompositionPlanSchema } from "./serendipityTypes";
+import type { LoopRunTrace, LoopVerdict } from "./agentLoopTypes";
 
 export const SLIDE_TYPES = {
   TITLE: 'title-slide',
@@ -958,6 +959,9 @@ export interface GeneratorResult {
   rerouteReason?: string;
   rerouteReasonType?: GeneratorFailureReason;
   avoidLayoutVariants?: string[];
+  loopTraceId?: string;
+  loopVerdict?: LoopVerdict;
+  loopTrace?: LoopRunTrace;
   // System 2 tracking
   visualCritiqueRan?: boolean;
   visualRepairAttempted?: boolean;
@@ -994,6 +998,12 @@ export interface DeckMetrics {
   coherenceIssues?: number;
   // Visual Architect Metrics
   visualArchitectMetrics?: VisualArchitectMetrics;
+  // Unified loop kernel metrics
+  loopRuns?: number;
+  loopAcceptWithWarnings?: number;
+  loopReroutes?: number;
+  avgLoopIterations?: number;
+  loopTraces?: LoopRunTrace[];
 }
 
 export type EditableSlideDeck = {

@@ -78,7 +78,7 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
                     if (percent !== undefined) setProgressVal(percent);
 
                     let type: ActivityLogItem['type'] = 'agent';
-                    if (status.includes('RLM Loop')) type = 'validation';
+                    if (status.includes('RLM Loop') || status.includes('[LOOP]')) type = 'validation';
 
                     setActivityLog(prev => [
                         ...prev,
@@ -322,6 +322,9 @@ const SlideDeckBuilder: React.FC<SlideDeckBuilderProps> = ({ onBack }) => {
                         <div className="flex gap-4 text-slate-400 text-xs mt-1 font-medium">
                             <span className="flex items-center gap-1.5"><Clock className="w-3.5 h-3.5" /> {(deck.metrics.totalDurationMs / 1000).toFixed(1)}s</span>
                             <span className="flex items-center gap-1.5"><ShieldCheck className="w-3.5 h-3.5 text-emerald-500" /> QA Score: {activeSlide.validation?.score || 100}</span>
+                            {deck.metrics.loopRuns !== undefined && (
+                                <span className="flex items-center gap-1.5 text-cyan-400">Loops: {deck.metrics.loopRuns}</span>
+                            )}
                             {deck.metrics.totalCost !== undefined && (
                                 <span className="flex items-center gap-1.5 text-amber-500"><DollarSign className="w-3.5 h-3.5" /> Cost: ${deck.metrics.totalCost.toFixed(4)}</span>
                             )}

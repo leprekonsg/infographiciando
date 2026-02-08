@@ -45,6 +45,8 @@ import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
 import { runContentPlanner, ContentDensityHint, ContentPlanResult, StyleAwareContentHint } from "./agents/contentPlanner";
 import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
+import { runAgentLoop } from "./agentLoopKernel";
+import type { LoopIssue, LoopRunTrace, LoopVerdict } from "../types/agentLoopTypes";
 import {
     runCompositionArchitect,
     trackUsedSurprises,
@@ -992,6 +994,218 @@ async function runRecursiveVisualCritique(
  * @param costTracker - Cost tracking
  * @param recentHistory - Phase 1: Recent narrative history for context folding
  */
+interface GeneratorLoopDecisionState {
+    verdict: LoopVerdict;
+    reason?: string;
+    reasonType?: GeneratorFailureReason;
+}
+
+interface GeneratorLoopDecisionInput {
+    candidate: SlideNode;
+    validation: ValidationResult;
+    envSnapshot: any;
+    attempt: number;
+    maxRetries: number;
+    routerConfig: RouterDecision;
+    qwenQaScore: number | null;
+    qwenQaVerdict: string | null;
+    criticalErrors: Array<{ code: string; message: string }>;
+    visualFocusError?: { message: string };
+    onProgress?: (status: string, percent?: number) => void;
+}
+
+async function evaluateGeneratorLoopDecision(
+    input: GeneratorLoopDecisionInput
+): Promise<GeneratorLoopDecisionState & { trace: LoopRunTrace }> {
+    const decision = await runAgentLoop<GeneratorLoopDecisionState, GeneratorLoopDecisionInput>({
+        slideId: input.candidate.title || `slide-${input.candidate.order}`,
+        pipeline: 'generator',
+        initialState: {
+            verdict: 'retry'
+        },
+        policy: {
+            maxIterations: 1,
+            maxTimeMs: 1500,
+            allowSoftAccept: true
+        },
+        observe: () => input,
+        diagnose: ({ env }) => {
+            if (!env) return [];
+            const issues: LoopIssue[] = [];
+            const fitScore = env.envSnapshot?.fit_score ?? 0;
+            const hasCriticalOverflow = (env.envSnapshot?.zones || []).some((z: any) => z.is_critical_overflow) ||
+                (env.candidate.warnings || []).some(w => /truncated|hidden|overflow|unplaced component|title dropped/i.test(String(w)));
+
+            if (env.qwenQaVerdict === 'requires_repair') {
+                issues.push({
+                    code: 'generator_qwen_requires_repair',
+                    severity: 'critical',
+                    category: 'visual',
+                    message: `Qwen QA requires repair (score: ${env.qwenQaScore ?? 'n/a'})`
+                });
+            }
+
+            if (env.visualFocusError) {
+                issues.push({
+                    code: 'generator_visual_focus_missing',
+                    severity: 'major',
+                    category: 'content',
+                    message: env.visualFocusError.message
+                });
+            }
+
+            if (hasCriticalOverflow) {
+                issues.push({
+                    code: 'generator_critical_overflow',
+                    severity: 'critical',
+                    category: 'layout',
+                    message: 'Critical overflow or truncation detected',
+                    evidence: { fitScore }
+                });
+            }
+
+            if (fitScore < 0.75) {
+                issues.push({
+                    code: 'generator_low_fit_score',
+                    severity: fitScore < 0.5 ? 'critical' : 'major',
+                    category: 'layout',
+                    message: `Fit score ${fitScore.toFixed(2)} below threshold 0.75`
+                });
+            }
+
+            if (!env.validation.passed) {
+                issues.push(...env.criticalErrors.map((err) => ({
+                    code: `generator_${err.code}`,
+                    severity: 'critical' as const,
+                    category: 'quality' as const,
+                    message: err.message || err.code
+                })));
+            }
+
+            return issues;
+        },
+        act: ({ env }) => {
+            if (!env) {
+                return {
+                    state: {
+                        verdict: 'retry'
+                    }
+                };
+            }
+
+            const fitScore = env.envSnapshot?.fit_score ?? 0;
+            const hasCriticalOverflow = (env.envSnapshot?.zones || []).some((z: any) => z.is_critical_overflow) ||
+                (env.candidate.warnings || []).some(w => /truncated|hidden|overflow|unplaced component|title dropped/i.test(String(w)));
+            const atMaxRetry = env.attempt === env.maxRetries;
+
+            let state: GeneratorLoopDecisionState = { verdict: 'retry' };
+
+            if (env.qwenQaVerdict === 'requires_repair') {
+                state = {
+                    verdict: 'reroute',
+                    reason: `Qwen QA requires repair (score: ${env.qwenQaScore ?? 'n/a'})`,
+                    reasonType: GeneratorFailureReason.QwenQaFailed
+                };
+            } else if (env.visualFocusError && atMaxRetry) {
+                state = {
+                    verdict: 'reroute',
+                    reason: env.visualFocusError.message,
+                    reasonType: GeneratorFailureReason.VisualFocusMissing
+                };
+            } else if (env.criticalErrors.length > 0 && atMaxRetry) {
+                state = {
+                    verdict: 'reroute',
+                    reason: env.criticalErrors[0].code,
+                    reasonType: GeneratorFailureReason.CriticalValidation
+                };
+            } else if (hasCriticalOverflow && atMaxRetry && fitScore < 0.5) {
+                state = {
+                    verdict: 'reroute',
+                    reason: 'Critical overflow or truncation persists',
+                    reasonType: GeneratorFailureReason.LowFitScore
+                };
+            } else if (fitScore < 0.75 && atMaxRetry) {
+                state = {
+                    verdict: 'accept_with_warnings',
+                    reason: env.envSnapshot?.reroute_reason || `Low fit score accepted with warnings: ${fitScore.toFixed(2)}`,
+                    reasonType: GeneratorFailureReason.LowFitScore
+                };
+            } else if (env.validation.passed) {
+                state = {
+                    verdict: 'accept'
+                };
+            } else if (env.attempt < env.maxRetries) {
+                state = {
+                    verdict: 'retry'
+                };
+            } else {
+                state = {
+                    verdict: 'accept_with_warnings',
+                    reason: 'Validation failed after retries; accepted with warnings'
+                };
+            }
+
+            return {
+                state,
+                actions: [{
+                    kind: `generator_${state.verdict}`,
+                    source: 'policy',
+                    expectedEffect: 'resolve_or_escalate'
+                }]
+            };
+        },
+        verify: ({ state, issues }) => {
+            const unresolved = issues.map(i => i.code);
+            if (state.verdict === 'accept') {
+                return {
+                    verdict: 'accept',
+                    score: 100,
+                    effectScore: 100
+                };
+            }
+
+            if (state.verdict === 'retry') {
+                return {
+                    verdict: 'retry',
+                    score: 65,
+                    effectScore: 40
+                };
+            }
+
+            if (state.verdict === 'reroute') {
+                return {
+                    verdict: 'reroute',
+                    score: 40,
+                    warning: state.reason,
+                    effectScore: Math.max(0, 50 - unresolved.length * 5)
+                };
+            }
+
+            return {
+                verdict: 'accept_with_warnings',
+                score: 55,
+                warning: state.reason,
+                effectScore: Math.max(0, 60 - unresolved.length * 3)
+            };
+        },
+        onTrace: (entry) => {
+            if (entry.phase === 'verify' && input.onProgress) {
+                const verdict = entry.verify?.verdictHint;
+                if (verdict) {
+                    input.onProgress(`[LOOP] Generator: ${verdict} (iter ${entry.iteration})`);
+                }
+            }
+        }
+    });
+
+    return {
+        verdict: decision.state.verdict,
+        reason: decision.state.reason,
+        reasonType: decision.state.reasonType,
+        trace: decision.trace
+    };
+}
+
 async function runGenerator(
     meta: any,
     routerConfig: RouterDecision,
@@ -1873,113 +2087,6 @@ Expected structure:
 
             console.log(`[CIRCUIT BREAKER] Slide "${candidate.title}": fit_score=${envSnapshot.fit_score.toFixed(2)}, health=${envSnapshot.health_level}, needs_reroute=${envSnapshot.needs_reroute}`);
 
-            // Score thresholds for circuit breaker
-            const SCORE_THRESHOLD = {
-                PERFECT: 0.85,
-                ACCEPTABLE: 0.75,
-                TIGHT: 0.60,
-                CRITICAL: 0.50
-            };
-
-            // Immediate reroute on Qwen QA requires_repair
-            if (qwenQaVerdict === 'requires_repair') {
-                console.warn(`[CIRCUIT BREAKER] Qwen QA verdict requires repair. Signaling reroute.`);
-                return {
-                    slide: candidate,
-                    needsReroute: true,
-                    rerouteReason: `Qwen QA requires repair (score: ${qwenQaScore ?? 'n/a'})`,
-                    rerouteReasonType: GeneratorFailureReason.QwenQaFailed,
-                    avoidLayoutVariants: [routerConfig.layoutVariant],
-                    visualCritiqueRan,
-                    visualRepairAttempted,
-                    visualRepairSucceeded,
-                    system2Cost,
-                    system2InputTokens,
-                    system2OutputTokens
-                };
-            }
-
-            // Hard reroute when critical overflow remains after final attempt.
-            const hasCriticalOverflow = envSnapshot.zones.some((z: any) => z.is_critical_overflow) ||
-                (candidate.warnings || []).some(w => /truncated|hidden|overflow|unplaced component|title dropped/i.test(String(w)));
-            if (hasCriticalOverflow && attempt === MAX_RETRIES) {
-                console.warn(`[CIRCUIT BREAKER] Critical overflow detected after retries. Signaling reroute.`);
-                return {
-                    slide: candidate,
-                    needsReroute: true,
-                    rerouteReason: 'Critical overflow or truncation persists',
-                    rerouteReasonType: GeneratorFailureReason.LowFitScore,
-                    avoidLayoutVariants: [routerConfig.layoutVariant],
-                    visualCritiqueRan,
-                    visualRepairAttempted,
-                    visualRepairSucceeded,
-                    system2Cost,
-                    system2InputTokens,
-                    system2OutputTokens
-                };
-            }
-
-            // Check if reroute is needed based on fit score
-            if (envSnapshot.fit_score < SCORE_THRESHOLD.ACCEPTABLE && attempt === MAX_RETRIES) {
-                console.warn(`[CIRCUIT BREAKER] Fit score ${envSnapshot.fit_score.toFixed(2)} < threshold ${SCORE_THRESHOLD.ACCEPTABLE}. Signaling reroute.`);
-                return {
-                    slide: candidate,
-                    needsReroute: true,
-                    rerouteReason: envSnapshot.reroute_reason || `Low fit score: ${envSnapshot.fit_score.toFixed(2)}`,
-                    rerouteReasonType: GeneratorFailureReason.LowFitScore,
-                    avoidLayoutVariants: [routerConfig.layoutVariant],
-                    visualCritiqueRan,
-                    visualRepairAttempted,
-                    visualRepairSucceeded,
-                    system2Cost,
-                    system2InputTokens,
-                    system2OutputTokens
-                };
-            }
-
-            // Qwen QA-weighted reroute (high priority)
-            if (attempt === MAX_RETRIES && qwenQaScore !== null) {
-                const QWEN_MIN_SCORE = 70;
-                const qwenSoftFail = qwenQaVerdict === 'requires_repair' || qwenQaScore < QWEN_MIN_SCORE;
-                const qwenReviewFail = qwenQaVerdict === 'flag_for_review' && envSnapshot.fit_score < 0.7;
-                if (qwenSoftFail || qwenReviewFail) {
-                    console.warn(`[CIRCUIT BREAKER] Qwen QA score ${qwenQaScore} below ${QWEN_MIN_SCORE} or requires repair. Signaling reroute.`);
-                    return {
-                        slide: candidate,
-                        needsReroute: true,
-                        rerouteReason: `Qwen QA score ${qwenQaScore}`,
-                        rerouteReasonType: GeneratorFailureReason.QwenQaFailed,
-                        avoidLayoutVariants: [routerConfig.layoutVariant],
-                        visualCritiqueRan,
-                        visualRepairAttempted,
-                        visualRepairSucceeded,
-                        system2Cost,
-                        system2InputTokens,
-                        system2OutputTokens
-                    };
-                }
-            }
-
-            if (validation.passed) {
-                candidate.validation = validation;
-                // Add environment snapshot to slide for observability
-                (candidate as any).environmentSnapshot = envSnapshot;
-
-                // Phase 3: Return GeneratorResult with successful slide
-                return {
-                    slide: candidate,
-                    needsReroute: false,
-                    visualCritiqueRan,
-                    visualRepairAttempted,
-                    visualRepairSucceeded,
-                    system2Cost,
-                    system2InputTokens,
-                    system2OutputTokens
-                };
-            }
-
-            // Phase 3: Check for critical errors that warrant rerouting
-            // GAP 1: Include compliance errors as reroute triggers
             const criticalErrors = validation.errors.filter(e =>
                 e.code === 'ERR_TEXT_OVERFLOW_CRITICAL' ||
                 e.code === 'ERR_MISSING_VISUALS_CRITICAL' ||
@@ -1991,15 +2098,31 @@ Expected structure:
             );
 
             const visualFocusError = validation.errors.find(e => e.code === 'VISUAL_FOCUS_MISSING');
+            const loopDecision = await evaluateGeneratorLoopDecision({
+                candidate,
+                validation,
+                envSnapshot,
+                attempt,
+                maxRetries: MAX_RETRIES,
+                routerConfig,
+                qwenQaScore,
+                qwenQaVerdict,
+                criticalErrors,
+                visualFocusError: visualFocusError ? { message: visualFocusError.message } : undefined,
+                onProgress: progress?.onProgress
+            });
 
-            if (visualFocusError && attempt === MAX_RETRIES) {
-                console.warn(`[GENERATOR] Visual focus missing, signaling reroute.`);
+            if (loopDecision.verdict === 'reroute') {
+                console.warn(`[GENERATOR] Loop decision => reroute (${loopDecision.reason || 'unspecified'})`);
                 return {
                     slide: candidate,
                     needsReroute: true,
-                    rerouteReason: visualFocusError.message,
-                    rerouteReasonType: GeneratorFailureReason.VisualFocusMissing,
+                    rerouteReason: loopDecision.reason || 'Loop requested reroute',
+                    rerouteReasonType: loopDecision.reasonType || GeneratorFailureReason.Unknown,
                     avoidLayoutVariants: [routerConfig.layoutVariant],
+                    loopTraceId: loopDecision.trace.loopId,
+                    loopVerdict: loopDecision.verdict,
+                    loopTrace: loopDecision.trace,
                     visualCritiqueRan,
                     visualRepairAttempted,
                     visualRepairSucceeded,
@@ -2009,15 +2132,23 @@ Expected structure:
                 };
             }
 
-            if (criticalErrors.length > 0 && attempt === MAX_RETRIES) {
-                // Instead of falling back immediately, signal reroute opportunity
-                console.warn(`[GENERATOR] Critical errors detected, signaling reroute: ${criticalErrors.map(e => e.code).join(', ')}`);
+            if (loopDecision.verdict === 'accept' || loopDecision.verdict === 'accept_with_warnings') {
+                candidate.validation = validation;
+                (candidate as any).environmentSnapshot = envSnapshot;
+
+                if (loopDecision.verdict === 'accept_with_warnings' && loopDecision.reason) {
+                    candidate.warnings = [
+                        ...(candidate.warnings || []),
+                        `Loop acceptance warning: ${loopDecision.reason}`
+                    ];
+                }
+
                 return {
                     slide: candidate,
-                    needsReroute: true,
-                    rerouteReason: criticalErrors[0].code,
-                    rerouteReasonType: GeneratorFailureReason.CriticalValidation,
-                    avoidLayoutVariants: [routerConfig.layoutVariant],
+                    needsReroute: false,
+                    loopTraceId: loopDecision.trace.loopId,
+                    loopVerdict: loopDecision.verdict,
+                    loopTrace: loopDecision.trace,
                     visualCritiqueRan,
                     visualRepairAttempted,
                     visualRepairSucceeded,
@@ -2073,6 +2204,7 @@ Expected structure:
     return {
         slide: fallbackSlide,
         needsReroute: false,
+        loopVerdict: 'accept_with_warnings',
         visualCritiqueRan: false,
         visualRepairAttempted: false,
         visualRepairSucceeded: false,
@@ -2142,7 +2274,12 @@ function blueprintToEditableDeck(
         system2TokensInput: 0,
         system2TokensOutput: 0,
         coherenceScore: 80,
-        coherenceIssues: 0
+        coherenceIssues: 0,
+        loopRuns: (blueprint as any).metrics?.loopRuns,
+        loopAcceptWithWarnings: (blueprint as any).metrics?.loopAcceptWithWarnings,
+        loopReroutes: (blueprint as any).metrics?.loopReroutes,
+        avgLoopIterations: (blueprint as any).metrics?.avgLoopIterations,
+        loopTraces: (blueprint as any).loopTraces
     };
 
     return {
@@ -2318,6 +2455,12 @@ export const generateAgenticDeck = async (
     let system2TotalCost = 0;
     let system2TotalInputTokens = 0;
     let system2TotalOutputTokens = 0;
+    // Unified loop kernel metrics
+    let loopRuns = 0;
+    let loopAcceptWithWarnings = 0;
+    let loopReroutes = 0;
+    let totalLoopIterations = 0;
+    const loopTraces: LoopRunTrace[] = [];
 
     // 1. RESEARCH PHASE
     onProgress("Agent 1/5: Deep Research (Interactions API)...", 10);
@@ -2601,6 +2744,18 @@ export const generateAgenticDeck = async (
                         styleMode // Pass styleMode to Generator
                     }
                 );
+
+                if (generatorResult.loopTrace) {
+                    loopRuns++;
+                    totalLoopIterations += generatorResult.loopTrace.iterations.length;
+                    loopTraces.push(generatorResult.loopTrace);
+                }
+                if (generatorResult.loopVerdict === 'accept_with_warnings') {
+                    loopAcceptWithWarnings++;
+                }
+                if (generatorResult.loopVerdict === 'reroute') {
+                    loopReroutes++;
+                }
 
                 // Track System 2 metrics
                 if (generatorResult.visualCritiqueRan) visualCritiqueAttempts++;
@@ -2901,6 +3056,8 @@ export const generateAgenticDeck = async (
     console.log(`[ORCHESTRATOR] Tokens: ${costSummary.totalInputTokens} in, ${costSummary.totalOutputTokens} out`);
     console.log(`[ORCHESTRATOR] Tokens (reported total): ${costSummary.totalTokensReported}`);
     console.log(`[ORCHESTRATOR] Model Breakdown:`, costSummary.modelBreakdown);
+    console.log(`[ORCHESTRATOR] [LOOP] Runs: ${loopRuns}, accept_with_warnings: ${loopAcceptWithWarnings}, reroute verdicts: ${loopReroutes}`);
+    console.log(`[ORCHESTRATOR] [LOOP] Avg iterations: ${loopRuns > 0 ? (totalLoopIterations / loopRuns).toFixed(2) : '0.00'}`);
     console.log(`[ORCHESTRATOR] 📊 RELIABILITY METRICS:`);
     console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ≤1/deck`);
     console.log(`[ORCHESTRATOR]   - Visual First-Pass Success: ${visualAlignmentFirstPassSuccess}/${totalVisualDesignAttempts} (${visualFirstPassRate}%) - Target: ≥80%`);
@@ -2932,7 +3089,12 @@ export const generateAgenticDeck = async (
         system2TokensInput: system2TotalInputTokens,
         system2TokensOutput: system2TotalOutputTokens,
         coherenceScore: coherenceReport.coherenceScore,
-        coherenceIssues: coherenceReport.issues.length
+        coherenceIssues: coherenceReport.issues.length,
+        loopRuns,
+        loopAcceptWithWarnings,
+        loopReroutes,
+        avgLoopIterations: loopRuns > 0 ? totalLoopIterations / loopRuns : 0,
+        loopTraces
     };
 
     return {
@@ -3019,4 +3181,5 @@ export const regenerateSingleSlide = async (
     }
     return newSlide;
 };
+
 
