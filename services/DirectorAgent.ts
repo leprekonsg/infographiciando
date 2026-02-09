@@ -554,11 +554,11 @@ async function targetedResearch(
 ): Promise<ResearchFact[]> {
     console.log(`[DIRECTOR] Targeted re-research: "${query}"`);
     
-    const { runResearcher } = await import('./agents/researcher');
+    const { runFocusedResearch } = await import('./agents/researcher');
     
     try {
         // Run focused research on the specific query
-        const newFacts = await runResearcher(query, costTracker);
+        const newFacts = await runFocusedResearch(query, costTracker, { maxFacts: 6 });
         
         // Merge with existing facts, avoiding duplicates
         const existingClaims = new Set(existingFacts.map(f => f.claim?.toLowerCase()));

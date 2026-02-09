@@ -207,6 +207,50 @@ const normalizeTitleText = (input: string): string => {
         cleaned = repeatMatch[1].trim();
     }
 
+    // Collapse redundant colon segments, e.g. "Advanced Retrieval: Retrieval: GraphRAG"
+    const splitByColon = cleaned.split(':').map(part => part.trim()).filter(Boolean);
+    if (splitByColon.length > 1) {
+        const tokenSimilarity = (a: string, b: string): number => {
+            const tokensA = new Set(a.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(t => t.length > 2));
+            const tokensB = new Set(b.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(t => t.length > 2));
+            if (tokensA.size === 0 || tokensB.size === 0) return 0;
+            const intersection = [...tokensA].filter(t => tokensB.has(t)).length;
+            const union = new Set([...tokensA, ...tokensB]).size;
+            return union > 0 ? intersection / union : 0;
+        };
+
+        const mergedParts: string[] = [];
+        splitByColon.forEach(part => {
+            if (mergedParts.length === 0) {
+                mergedParts.push(part);
+                return;
+            }
+            const prev = mergedParts[mergedParts.length - 1];
+            const overlap = tokenSimilarity(prev, part);
+            const prevNorm = prev.toLowerCase();
+            const partNorm = part.toLowerCase();
+            if (overlap >= 0.45 || prevNorm.includes(partNorm) || partNorm.includes(prevNorm)) {
+                return;
+            }
+            mergedParts.push(part);
+        });
+        cleaned = mergedParts.join(': ');
+    }
+
+    // Collapse repeated adjacent words, e.g. "GraphRAG GraphRAG and Accuracy"
+    const words = cleaned.split(/\s+/).filter(Boolean);
+    if (words.length > 1) {
+        const dedupedWords: string[] = [];
+        words.forEach(word => {
+            const normalizedWord = word.toLowerCase().replace(/[^\w]/g, '');
+            const previous = dedupedWords[dedupedWords.length - 1];
+            const previousNorm = previous ? previous.toLowerCase().replace(/[^\w]/g, '') : '';
+            if (normalizedWord && normalizedWord === previousNorm) return;
+            dedupedWords.push(word);
+        });
+        cleaned = dedupedWords.join(' ');
+    }
+
     // Final whitespace normalization
     cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
     return cleaned;
@@ -586,11 +630,14 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         const placeholderExact = [
             'n/a', 'na', 'tbd', 'unknown', 'none', 'null', 'nil', 'not available',
             '-', '—', '...', 'n.a.', 'no data available', 'no data', 'data visualization',
-            'key points', 'placeholder', 'coming soon', 'to be determined'
+            'key points', 'placeholder', 'coming soon', 'to be determined',
+            'generated slide.', 'generated slide', 'generated from extracted content.',
+            'generated from extracted content', 'recovered from degenerated model output.'
         ];
         if (placeholderExact.includes(raw)) return true;
         // Pattern-based detection
         if (/^(data\s*viz|key\s*points?)$/i.test(raw)) return true;
+        if (/^(generated|auto-generated|recovered)\b/i.test(raw)) return true;
         if (/^\[.*\]$/.test(raw)) return true; // [Insert text] style
         return false;
     };
@@ -600,6 +647,7 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         const add = (text?: string) => {
             if (!text || typeof text !== 'string') return;
             const clean = text.replace(/^slide:\s*/i, '').trim();
+            if (isPlaceholderValue(clean)) return;
             if (clean.length >= 6) bullets.push(clean);
         };
 
@@ -639,7 +687,16 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             : ['Key focus areas', 'Operational priorities', 'Expected outcomes'];
 
         component.type = 'text-bullets';
-        component.title = component.title || 'Key Points';
+        if (typeof component.title === 'string') {
+            const cleanedTitle = normalizeTitleText(component.title);
+            if (!isPlaceholderValue(cleanedTitle) && cleanedTitle.length >= 3) {
+                component.title = truncateText(cleanedTitle, CONTENT_LIMITS.title, 'text-bullets title');
+            } else {
+                delete component.title;
+            }
+        } else {
+            delete component.title;
+        }
         component.content = safeBullets;
         delete component.metrics;
         delete component.items;
@@ -654,7 +711,16 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             : ['Core capability', 'Primary benefit', 'Key outcome'];
 
         component.type = 'text-bullets';
-        component.title = component.title || 'Key Points';
+        if (typeof component.title === 'string') {
+            const cleanedTitle = normalizeTitleText(component.title);
+            if (!isPlaceholderValue(cleanedTitle) && cleanedTitle.length >= 3) {
+                component.title = truncateText(cleanedTitle, CONTENT_LIMITS.title, 'text-bullets title');
+            } else {
+                delete component.title;
+            }
+        } else {
+            delete component.title;
+        }
         component.content = safeBullets;
         delete component.items;
         delete component.icons;
@@ -668,8 +734,25 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             ? fallback
             : ['Key data signal', 'Supporting evidence', 'Impact highlight'];
 
+        const slideTitle = normalizeTitleText(String(slide.layoutPlan?.title || slide.title || ''));
+        const rawComponentTitle = typeof component.title === 'string'
+            ? normalizeTitleText(component.title)
+            : '';
+        const titleSimilarity = slideTitle && rawComponentTitle
+            ? calcTitleSimilarity(slideTitle, rawComponentTitle)
+            : 0;
+        const looksNoisy = /(\b[\w-]{3,}\b)\s+\1\b/i.test(rawComponentTitle) || rawComponentTitle.split(':').length > 2;
+        const shouldDropTitle = !rawComponentTitle ||
+            rawComponentTitle.length > 48 ||
+            titleSimilarity > 0.45 ||
+            looksNoisy;
+
         component.type = 'text-bullets';
-        component.title = component.title || 'Key Points';
+        if (shouldDropTitle || isPlaceholderValue(rawComponentTitle)) {
+            delete component.title;
+        } else {
+            component.title = truncateText(rawComponentTitle, CONTENT_LIMITS.title, 'text-bullets title');
+        }
         component.content = safeBullets;
         delete component.data;
         addWarning(`Converted chart-frame to text-bullets: ${reason}`);
@@ -820,16 +903,66 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
 
     if (layoutVariantCandidate === 'bento-grid') {
         const hasGridType = componentTypes.some(t => t === 'metric-cards' || t === 'icon-grid');
+        let fallbackReason: string | undefined;
         if (!hasGridType) {
-            enforceLayoutFallback('bento-grid requires metric-cards or icon-grid');
+            fallbackReason = 'bento-grid requires metric-cards or icon-grid';
+        } else if (components.length < 2) {
+            fallbackReason = 'bento-grid requires at least 2 components';
+        } else if (typeof densityMaxItems === 'number' && densityMaxItems < 2) {
+            fallbackReason = 'bento-grid incompatible with maxItems < 2';
         }
-        if (components.length < 2) {
-            enforceLayoutFallback('bento-grid requires at least 2 components');
-        }
-        if (typeof densityMaxItems === 'number' && densityMaxItems < 2) {
-            enforceLayoutFallback('bento-grid incompatible with maxItems < 2');
+        if (fallbackReason) {
+            enforceLayoutFallback(fallbackReason);
         }
     }
+
+    const extractComponentBullets = (component: any): string[] => {
+        if (!component || typeof component !== 'object') return [];
+        const pushIfValid = (bucket: string[], text: any) => {
+            if (typeof text !== 'string') return;
+            const clean = text.trim();
+            if (!clean || clean.length < 4) return;
+            if (isPlaceholderValue(clean)) return;
+            bucket.push(clean);
+        };
+
+        const extracted: string[] = [];
+        if (component.type === 'text-bullets') {
+            (component.content || []).forEach((item: any) => pushIfValid(extracted, item));
+        } else if (component.type === 'metric-cards') {
+            (component.metrics || component.items || []).forEach((metric: any) => {
+                const label = typeof metric?.label === 'string' ? metric.label.trim() : '';
+                const value = typeof metric?.value === 'string' ? metric.value.trim() : String(metric?.value || '').trim();
+                if (!label && !value) return;
+                pushIfValid(extracted, label && value ? `${label}: ${value}` : (label || value));
+            });
+        } else if (component.type === 'icon-grid') {
+            (component.items || component.icons || []).forEach((item: any) => {
+                const label = typeof item?.label === 'string' ? item.label : '';
+                const description = typeof item?.description === 'string' ? item.description : '';
+                pushIfValid(extracted, description ? `${label}: ${description}` : label);
+            });
+        } else if (component.type === 'process-flow') {
+            (component.steps || []).forEach((step: any) => {
+                const title = typeof step?.title === 'string' ? step.title : '';
+                const description = typeof step?.description === 'string' ? step.description : '';
+                pushIfValid(extracted, description ? `${title}: ${description}` : title);
+            });
+        } else if (component.type === 'chart-frame') {
+            (component.data || []).forEach((point: any) => {
+                const label = typeof point?.label === 'string' ? point.label : '';
+                const value = point?.value !== undefined && point?.value !== null ? String(point.value) : '';
+                pushIfValid(extracted, label && value ? `${label}: ${value}` : (label || value));
+            });
+        } else if (component.type === 'diagram-svg') {
+            (component.elements || []).forEach((el: any) => {
+                const label = typeof el?.label === 'string' ? el.label : '';
+                const description = typeof el?.description === 'string' ? el.description : '';
+                pushIfValid(extracted, description ? `${label}: ${description}` : label);
+            });
+        }
+        return extracted;
+    };
 
     const capComponentsToLayout = (layoutVariant: string, componentList: any[]) => {
         const layoutComponentCaps: Record<string, number> = {
@@ -854,9 +987,38 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 return idx >= 0 ? idx : priorityOrder.length + 1;
             };
 
-            const trimmed = [...componentList]
-                .sort((a: any, b: any) => priorityRank(a.type) - priorityRank(b.type))
-                .slice(0, maxComponents);
+            const sorted = [...componentList]
+                .sort((a: any, b: any) => priorityRank(a.type) - priorityRank(b.type));
+            const trimmed = sorted.slice(0, maxComponents);
+            const dropped = sorted.slice(maxComponents);
+
+            const overflowBullets = Array.from(new Set(
+                dropped.flatMap(extractComponentBullets).map((line: string) => line.trim()).filter(Boolean)
+            ));
+
+            if (overflowBullets.length > 0) {
+                const textTarget = trimmed.find((c: any) => c.type === 'text-bullets');
+                if (textTarget) {
+                    const existing = Array.isArray(textTarget.content) ? textTarget.content : [];
+                    const seen = new Set(existing.map((line: any) => String(line).trim().toLowerCase()));
+                    const merged = [...existing];
+                    overflowBullets.forEach(line => {
+                        const key = line.toLowerCase();
+                        if (!seen.has(key)) {
+                            seen.add(key);
+                            merged.push(truncateText(line, 90, 'bullet text'));
+                        }
+                    });
+                    textTarget.content = capList(merged, 8, 'bullet items');
+                    addWarning(`Preserved ${overflowBullets.length} overflow points by merging into retained text component`);
+                } else {
+                    const notePrefix = `Preserved overflow points (${layoutVariant} trim):`;
+                    const existingNotes = Array.isArray(slide.speakerNotesLines) ? slide.speakerNotesLines : [];
+                    const mergedNotes = [notePrefix, ...overflowBullets.slice(0, 4), ...existingNotes];
+                    slide.speakerNotesLines = Array.from(new Set(mergedNotes.map(line => String(line).trim()).filter(Boolean))).slice(0, 8);
+                    addWarning(`Preserved ${overflowBullets.length} overflow points in speaker notes after layout trim`);
+                }
+            }
 
             addWarning(`Auto-trimmed components to ${maxComponents} for layout ${layoutVariant}`);
             return trimmed;
@@ -868,8 +1030,15 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         const textComponents = componentList.filter(c => c.type === 'text-bullets');
         if (textComponents.length <= 1) return componentList;
 
-        const requiresTwo = ['split-left-text', 'split-right-text'].includes(layoutVariant);
-        const maxTextComponents = ['standard-vertical', 'dashboard-tiles', 'asymmetric-grid', 'split-left-text', 'split-right-text'].includes(layoutVariant) ? 2 : 1;
+        const maxTextComponentsByLayout: Record<string, number> = {
+            'standard-vertical': 2,
+            'dashboard-tiles': 2,
+            'asymmetric-grid': 2,
+            'split-left-text': 1,
+            'split-right-text': 1
+        };
+        const maxTextComponents = maxTextComponentsByLayout[layoutVariant] ?? 1;
+        const requiresTwo = maxTextComponents > 1;
         const hasDuplicates = textComponents.some((a: any, idx: number) => {
             const aKey = `${String(a.title || '').trim().toLowerCase()}|${(a.content || []).map((s: any) => String(s).trim().toLowerCase()).join('||')}`;
             return textComponents.slice(idx + 1).some((b: any) => {
@@ -881,8 +1050,8 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         if (textComponents.length <= maxTextComponents && !hasDuplicates) return componentList;
 
         const layoutBulletCaps: Record<string, number> = {
-            'split-left-text': 2,
-            'split-right-text': 2,
+            'split-left-text': 3,
+            'split-right-text': 3,
             'asymmetric-grid': 3,
             'bento-grid': 2,
             'metrics-rail': 2,
@@ -936,7 +1105,14 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             const compA = { ...textComponents[0], content: capList(first.map(t => truncateText(t, firstCharCap, 'bullet text')), layoutCap, 'bullet items') };
             const compB = { ...textComponents[1] || textComponents[0], content: capList(second.map(t => truncateText(t, secondCharCap, 'bullet text')), layoutCap, 'bullet items') };
             if (!compB.content || compB.content.length === 0) {
-                compB.content = ['Secondary point'];
+                const fallback = extractFallbackBullets().find(item =>
+                    !compA.content?.some((existing: any) => String(existing).trim().toLowerCase() === String(item).trim().toLowerCase())
+                );
+                if (fallback) {
+                    compB.content = [truncateText(fallback, secondCharCap, 'bullet text')];
+                } else if (Array.isArray(compA.content) && compA.content.length > 1) {
+                    compB.content = [String(compA.content.pop()).trim()];
+                }
             }
 
             addWarning(`Auto-split ${textComponents.length} text-bullets components into 2 for ${layoutVariant}`);
@@ -961,7 +1137,16 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
 
         const layoutCap = layoutBulletCaps[layoutVariant] ?? LIST_LIMITS.textBullets;
         const baseCharCap = layoutBulletCharCaps[layoutVariant] ?? 70;
-        merged.title = merged.title || 'Key Points';
+        if (typeof merged.title === 'string') {
+            const cleanedMergedTitle = normalizeTitleText(merged.title);
+            if (isPlaceholderValue(cleanedMergedTitle) || cleanedMergedTitle.length < 3) {
+                delete merged.title;
+            } else {
+                merged.title = truncateText(cleanedMergedTitle, CONTENT_LIMITS.title, 'text-bullets title');
+            }
+        } else {
+            delete merged.title;
+        }
         const mergedCharCap = computeBulletCharCap(
             baseCharCap,
             mergedContent.length,
@@ -1145,7 +1330,12 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             }
 
             if (c.title && typeof c.title === 'string') {
-                c.title = truncateText(c.title, CONTENT_LIMITS.title, 'text-bullets title');
+                const normalizedTitle = normalizeTitleText(c.title);
+                if (isPlaceholderValue(normalizedTitle) || /^(key\s*points?|summary|overview|content|title)$/i.test(normalizedTitle.trim())) {
+                    delete c.title;
+                } else {
+                    c.title = truncateText(normalizedTitle, CONTENT_LIMITS.title, 'text-bullets title');
+                }
             }
 
             // TITLE DE-DUPLICATION: Remove component title if it's too similar to slide title
@@ -1176,7 +1366,8 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 'key points', 'key insight', 'main point', 'bullet point',
                 'content pending', 'data visualization', 'see notes', 
                 'overview', 'summary', 'content', 'no data available',
-                'placeholder', 'tbd', 'coming soon', 'insert text'
+                'placeholder', 'tbd', 'coming soon', 'insert text',
+                'generated slide', 'generated slide.', 'generated from extracted content'
             ]);
             
             c.content.forEach((s: any) => {
@@ -1196,8 +1387,8 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                 
                 const layoutVariantForText = slide.routerConfig?.layoutVariant || 'standard-vertical';
                 const layoutBulletCaps: Record<string, number> = {
-                    'split-left-text': 2,
-                    'split-right-text': 2,
+                    'split-left-text': 3,
+                    'split-right-text': 3,
                     'asymmetric-grid': 3,
                     'bento-grid': 2,
                     'metrics-rail': 2,
@@ -1244,8 +1435,8 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             });
             const layoutVariantForText = slide.routerConfig?.layoutVariant || 'standard-vertical';
             const layoutBulletCaps: Record<string, number> = {
-                'split-left-text': 2,
-                'split-right-text': 2,
+                'split-left-text': 3,
+                'split-right-text': 3,
                 'asymmetric-grid': 3,
                 'bento-grid': 2,
                 'metrics-rail': 2,
@@ -1256,7 +1447,38 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
             };
             const layoutCap = layoutBulletCaps[layoutVariantForText] ?? LIST_LIMITS.textBullets;
             const maxItems = Math.min(layoutCap, slide.routerConfig?.densityBudget?.maxItems || LIST_LIMITS.textBullets);
+            const preCapContent = [...cleanContent];
             c.content = capList(cleanContent, maxItems, 'bullet items');
+            if (preCapContent.length > (c.content?.length || 0)) {
+                const dropped = preCapContent.slice(c.content.length);
+                if (dropped.length > 0) {
+                    const existingNotes = Array.isArray(slide.speakerNotesLines) ? slide.speakerNotesLines : [];
+                    const preservedNotes = [
+                        `Additional points trimmed for fit (${layoutVariantForText}):`,
+                        ...dropped.slice(0, 3),
+                        ...existingNotes
+                    ];
+                    slide.speakerNotesLines = Array.from(
+                        new Set(preservedNotes.map(item => String(item).trim()).filter(Boolean))
+                    ).slice(0, 8);
+                    addWarning(`Preserved ${dropped.length} trimmed bullets in speaker notes`);
+                }
+            }
+            if (!Array.isArray(c.content) || c.content.length === 0) {
+                const fallbackFromRaw = rawItems
+                    .map(item => typeof item === 'string' ? item.trim() : '')
+                    .filter(item => item.length > 6 && !isPlaceholderValue(item));
+                const fallback = fallbackFromRaw.length > 0 ? fallbackFromRaw : extractFallbackBullets();
+                const uniqueFallback = Array.from(new Set(fallback.map(item => String(item).trim()).filter(Boolean)));
+                if (uniqueFallback.length > 0) {
+                    c.content = capList(
+                        uniqueFallback.map(item => truncateText(item, 90, 'bullet text')),
+                        maxItems,
+                        'bullet items'
+                    );
+                    addWarning('Recovered empty text-bullets content using fallback context');
+                }
+            }
         }
 
         if (c.type === 'chart-frame') {
@@ -1445,11 +1667,14 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
     };
 
     if (['bento-grid', 'dashboard-tiles', 'metrics-rail'].includes(finalVariant)) {
+        let fallbackReason: string | undefined;
         if (!hasGrid) {
-            enforceFinalFallback(`${finalVariant} requires metric-cards or icon-grid`);
+            fallbackReason = `${finalVariant} requires metric-cards or icon-grid`;
+        } else if (componentCount < 2) {
+            fallbackReason = `${finalVariant} requires at least 2 components`;
         }
-        if (componentCount < 2) {
-            enforceFinalFallback(`${finalVariant} requires at least 2 components`);
+        if (fallbackReason) {
+            enforceFinalFallback(fallbackReason);
         }
     }
 

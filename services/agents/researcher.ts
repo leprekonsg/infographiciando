@@ -1,132 +1,280 @@
 import { ResearchFact } from "../../types/slideTypes";
-import { runAgentLoop, CostTracker, Tool, ToolDefinition, ThinkingLevel, MODEL_AGENTIC } from "../interactionsClient";
+import { createInteraction, runAgentLoop, CostTracker, ThinkingLevel, MODEL_AGENTIC } from "../interactionsClient";
 
-// --- TOOL DEFINITIONS (Following Phil Schmid's Ergonomics Guidelines) ---
+interface ResearchPass {
+    id: string;
+    focus: string;
+    objective: string;
+    targetFacts: number;
+}
 
-const webSearchTool: ToolDefinition = {
-    name: "web_search",
-    description: "Search the web for current, verified information about a topic. Use this when you need real-time data, statistics, market trends, or facts that require up-to-date sources. Returns structured search results with URLs and snippets.",
-    parameters: {
-        type: "object",
-        properties: {
-            query: {
-                type: "string",
-                description: "The search query to execute. Be specific and include relevant keywords for better results."
+const RESEARCH_FACT_SCHEMA = {
+    type: 'object',
+    properties: {
+        facts: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string' },
+                    category: { type: 'string' },
+                    claim: { type: 'string' },
+                    value: { type: 'string' },
+                    source: { type: 'string' },
+                    confidence: { type: 'string', enum: ['high', 'medium', 'low'] }
+                },
+                required: ['category', 'claim', 'confidence']
             }
-        },
-        required: ["query"]
-    }
+        }
+    },
+    required: ['facts']
 };
 
-const extractFactsTool: ToolDefinition = {
-    name: "extract_facts",
-    description: "Extract and structure verified facts from search results or provided text. Use this after web_search to organize raw information into validated, citable facts with confidence scores.",
-    parameters: {
-        type: "object",
-        properties: {
-            raw_content: {
-                type: "string",
-                description: "The raw content or search results to extract facts from."
-            },
-            focus_area: {
-                type: "string",
-                description: "The specific domain or topic focus for fact extraction (e.g., 'market statistics', 'technical specifications')."
-            }
-        },
-        required: ["raw_content", "focus_area"]
-    }
+const normalizeConfidence = (raw: any): 'high' | 'medium' | 'low' => {
+    const value = String(raw || '').trim().toLowerCase();
+    if (value === 'high' || value === 'medium' || value === 'low') return value;
+    if (value.includes('high')) return 'high';
+    if (value.includes('low')) return 'low';
+    return 'medium';
 };
 
-// --- AGENT 1: RESEARCHER (with Tool Execution Loop) ---
+const normalizeFact = (raw: any, fallbackId: string): ResearchFact | null => {
+    if (!raw || typeof raw !== 'object') return null;
 
-export async function runResearcher(topic: string, costTracker: CostTracker): Promise<ResearchFact[]> {
-    console.log("[RESEARCHER] Starting research agent with Interactions API...");
+    const claim = String(raw.claim || '').trim();
+    if (claim.length < 16) return null;
 
-    // Define tool implementations
-    const tools: Record<string, Tool> = {
-        web_search: {
-            definition: webSearchTool,
-            execute: async (args: { query: string }) => {
-                // In production, this would call a real search API
-                // For now, we use Google Search grounding in the model call
-                return {
-                    status: "delegated_to_model",
-                    query: args.query,
-                    note: "Search executed via Google Search grounding in model call"
-                };
-            }
+    const category = String(raw.category || 'General').trim() || 'General';
+    const source = String(raw.source || '').trim() || undefined;
+    const value = String(raw.value || '').trim() || undefined;
+
+    return {
+        id: String(raw.id || fallbackId),
+        category,
+        claim,
+        value,
+        source,
+        confidence: normalizeConfidence(raw.confidence)
+    };
+};
+
+const parseFactsFromJson = (rawText: string): ResearchFact[] => {
+    if (!rawText || typeof rawText !== 'string') return [];
+
+    const parseCandidate = (candidate: string): ResearchFact[] => {
+        try {
+            const parsed = JSON.parse(candidate);
+            const rawFacts = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.facts) ? parsed.facts : []);
+            return rawFacts
+                .map((item: any, idx: number) => normalizeFact(item, `fact-${idx + 1}`))
+                .filter((fact: ResearchFact | null): fact is ResearchFact => fact !== null);
+        } catch {
+            return [];
         }
     };
 
-    try {
-        const result = await runAgentLoop(
-            `Perform deep research on "${topic}".
-      
-      RESEARCH OBJECTIVES:
-      1. Find 8-12 verified, high-impact facts and statistics
-      2. Focus on: Market data, technical specifications, trends, and expert insights
-      3. Prioritize recent information (last 2 years) when available
-      
-      OUTPUT REQUIREMENTS:
-      Return a JSON array of research facts with this structure:
-      [
-        {
-          "id": "fact-1",
-          "category": "Market Trend | Technical Spec | Statistic | Expert Opinion",
-          "claim": "The main factual claim",
-          "value": "Specific numeric value if applicable",
-          "source": "Source name or URL",
-          "confidence": "high | medium | low"
+    const direct = parseCandidate(rawText);
+    if (direct.length > 0) return direct;
+
+    const objectMatch = rawText.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+        const extractedObject = parseCandidate(objectMatch[0]);
+        if (extractedObject.length > 0) return extractedObject;
+    }
+
+    const arrayMatch = rawText.match(/\[[\s\S]*\]/);
+    if (arrayMatch) {
+        const extractedArray = parseCandidate(arrayMatch[0]);
+        if (extractedArray.length > 0) return extractedArray;
+    }
+
+    return [];
+};
+
+const scoreFactQuality = (fact: ResearchFact): number => {
+    let score = 0;
+    if (fact.confidence === 'high') score += 3;
+    else if (fact.confidence === 'medium') score += 1;
+    if (fact.source && fact.source.length > 6) score += 2;
+    if (/\d/.test(`${fact.claim} ${fact.value || ''}`)) score += 2;
+    if ((fact.value || '').length > 0) score += 1;
+    if (fact.claim.length > 60) score += 1;
+    return score;
+};
+
+const mergeAndRankFacts = (facts: ResearchFact[], maxFacts = 14): ResearchFact[] => {
+    const deduped = new Map<string, ResearchFact>();
+    for (const fact of facts) {
+        const key = fact.claim
+            .toLowerCase()
+            .replace(/[^\w\s]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!key) continue;
+
+        const existing = deduped.get(key);
+        if (!existing || scoreFactQuality(fact) > scoreFactQuality(existing)) {
+            deduped.set(key, fact);
         }
-      ]
-      
-      CRITICAL: Return ONLY the JSON array. No preamble or markdown.`,
+    }
+
+    return Array.from(deduped.values())
+        .sort((a, b) => scoreFactQuality(b) - scoreFactQuality(a))
+        .slice(0, maxFacts)
+        .map((fact, idx) => ({ ...fact, id: `fact-${idx + 1}` }));
+};
+
+const hasResearchCoverage = (facts: ResearchFact[]): boolean => {
+    if (facts.length < 10) return false;
+    const withSources = facts.filter(f => !!f.source && f.source.trim().length > 6).length;
+    const quantitative = facts.filter(f => /\d/.test(`${f.claim} ${f.value || ''}`)).length;
+    return withSources >= 7 && quantitative >= 4;
+};
+
+async function runGroundedPass(
+    topic: string,
+    pass: ResearchPass,
+    costTracker: CostTracker
+): Promise<ResearchFact[]> {
+    const prompt = `Research topic: "${topic}".
+
+FOCUS AREA: ${pass.focus}
+OBJECTIVE: ${pass.objective}
+
+Requirements:
+1. Return ${Math.max(4, pass.targetFacts - 2)}-${pass.targetFacts} non-duplicative facts.
+2. Prioritize concrete evidence (benchmarks, percentages, timelines, cost/latency/quality metrics) where applicable.
+3. Every fact must include a source identifier (publication or URL).
+4. Keep claims specific and presentation-ready.
+
+Return JSON only in the format:
+{
+  "facts": [
+    {
+      "id": "fact-1",
+      "category": "Market Trend | Technical Spec | Statistic | Expert Opinion | Implementation",
+      "claim": "Specific factual claim",
+      "value": "Optional quantitative value",
+      "source": "Source publication or URL",
+      "confidence": "high | medium | low"
+    }
+  ]
+}`;
+
+    try {
+        const text = await createInteraction(
+            MODEL_AGENTIC,
+            prompt,
             {
-                model: MODEL_AGENTIC,
-                systemInstruction: `You are a Lead Technical Researcher with expertise in finding and validating information.
-        
-        Your research must be:
-        - ACCURATE: Only include verified facts from reliable sources
-        - CURRENT: Prefer recent data when possible
-        - SPECIFIC: Include concrete numbers, not vague claims
-        - ATTRIBUTABLE: Always note the source
-        
-        Use Google Search grounding when you need current information.`,
-                tools: {}, // Using built-in Google Search via grounding instead
-                maxIterations: 5,
+                systemInstruction: `You are a senior technical researcher.
+- Prefer recent and authoritative sources.
+- Avoid generic statements.
+- Do not invent citations.
+- Output strict JSON only.`,
+                responseFormat: RESEARCH_FACT_SCHEMA,
+                responseMimeType: 'application/json',
+                temperature: 0.2,
+                maxOutputTokens: 4096,
                 thinkingLevel: 'low' as ThinkingLevel,
-                temperature: 0.3,
-                onToolCall: (name, args, result) => {
-                    console.log(`[RESEARCHER] Tool called: ${name}`, args);
-                }
+                tools: [{ type: 'google_search' }]
             },
             costTracker
         );
 
-        // Parse the JSON response
-        try {
-            const parsed = JSON.parse(result.text);
-            if (Array.isArray(parsed)) return parsed;
-            if (parsed.facts && Array.isArray(parsed.facts)) return parsed.facts;
-            return [];
-        } catch (parseErr) {
-            console.warn("[RESEARCHER] JSON parse failed, attempting extraction...");
-            // Try to extract JSON from the response
-            const jsonMatch = result.text.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-                try {
-                    return JSON.parse(jsonMatch[0]);
-                } catch {
-                    console.error("[RESEARCHER] Extraction failed");
-                }
-            }
-            return [];
+        const parsedFacts = parseFactsFromJson(text);
+        if (parsedFacts.length > 0) {
+            console.log(`[RESEARCHER] Pass "${pass.id}" collected ${parsedFacts.length} grounded facts`);
+        } else {
+            console.warn(`[RESEARCHER] Pass "${pass.id}" returned no parseable grounded facts`);
         }
-    } catch (e: any) {
-        console.error("[RESEARCHER] Agent failed:", e.message);
+        return parsedFacts;
+    } catch (err: any) {
+        console.warn(`[RESEARCHER] Grounded pass "${pass.id}" failed: ${err.message}`);
         return [];
     }
 }
 
-// Keep export to avoid unused lint for future tooling
-export const _unusedExtractFactsTool = extractFactsTool;
+async function runFallbackSinglePass(topic: string, costTracker: CostTracker): Promise<ResearchFact[]> {
+    try {
+        const result = await runAgentLoop(
+            `Perform research on "${topic}" and return 8-10 verified facts with category, claim, optional value, source, confidence.
+Return JSON only.`,
+            {
+                model: MODEL_AGENTIC,
+                systemInstruction: `You are a technical researcher. Return strict JSON only.`,
+                tools: {},
+                maxIterations: 4,
+                thinkingLevel: 'low' as ThinkingLevel,
+                temperature: 0.2
+            },
+            costTracker
+        );
+        return parseFactsFromJson(result.text);
+    } catch (err: any) {
+        console.warn(`[RESEARCHER] Fallback single-pass failed: ${err.message}`);
+        return [];
+    }
+}
+
+export async function runFocusedResearch(
+    query: string,
+    costTracker: CostTracker,
+    options: { maxFacts?: number } = {}
+): Promise<ResearchFact[]> {
+    const pass: ResearchPass = {
+        id: 'focused',
+        focus: 'slide-specific facts',
+        objective: 'Find concise, relevant facts for one presentation slide',
+        targetFacts: Math.min(8, Math.max(3, options.maxFacts ?? 5))
+    };
+
+    const facts = await runGroundedPass(query, pass, costTracker);
+    return mergeAndRankFacts(facts, pass.targetFacts);
+}
+
+export async function runResearcher(topic: string, costTracker: CostTracker): Promise<ResearchFact[]> {
+    console.log("[RESEARCHER] Starting grounded multi-pass research...");
+
+    const passes: ResearchPass[] = [
+        {
+            id: 'baseline',
+            focus: 'core landscape',
+            objective: 'Establish key concepts, current state, and widely accepted framing',
+            targetFacts: 8
+        },
+        {
+            id: 'quantitative',
+            focus: 'metrics and benchmarks',
+            objective: 'Find quantitative evidence: adoption, performance, costs, ROI, latency, error rates',
+            targetFacts: 8
+        },
+        {
+            id: 'implementation',
+            focus: 'deployment and architecture',
+            objective: 'Find implementation patterns, trade-offs, failure modes, and production lessons',
+            targetFacts: 6
+        }
+    ];
+
+    let collected: ResearchFact[] = [];
+
+    for (const pass of passes) {
+        if (pass.id !== 'baseline' && hasResearchCoverage(collected)) {
+            console.log(`[RESEARCHER] Coverage threshold reached after ${collected.length} facts. Skipping remaining passes.`);
+            break;
+        }
+
+        const passFacts = await runGroundedPass(topic, pass, costTracker);
+        collected = mergeAndRankFacts([...collected, ...passFacts], 16);
+    }
+
+    if (collected.length < 8) {
+        console.warn(`[RESEARCHER] Grounded passes produced ${collected.length} facts. Running fallback research pass.`);
+        const fallbackFacts = await runFallbackSinglePass(topic, costTracker);
+        collected = mergeAndRankFacts([...collected, ...fallbackFacts], 16);
+    }
+
+    const finalFacts = mergeAndRankFacts(collected, 12);
+    console.log(`[RESEARCHER] Final fact set: ${finalFacts.length} facts`);
+    return finalFacts;
+}

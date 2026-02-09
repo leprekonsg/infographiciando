@@ -312,7 +312,12 @@ export const CompositionPlanSchema = z.object({
     decorativeElements: z.array(z.object({
       type: DecorativeTypeSchema,
       placement: z.string(),
-      purpose: z.string()
+      purpose: z.string(),
+      // Optional short label used when decorative element is badge-like.
+      // Must be concrete context, not prose instructions.
+      content: z.string().max(40).optional(),
+      icon: z.string().max(40).optional(),
+      color: z.string().optional()
     })).max(4),
     contentStructure: z.object({
       pattern: z.enum([

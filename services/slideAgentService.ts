@@ -40,7 +40,7 @@ import { SpatialLayoutEngine, createEnvironmentSnapshot } from "./spatialRendere
 import { autoRepairSlide } from "./repair/autoRepair";
 import { generateImageFromPrompt } from "./image/imageGeneration";
 import { generateSvgProxy } from "./visual/svgProxy";
-import { runResearcher } from "./agents/researcher";
+import { runFocusedResearch, runResearcher } from "./agents/researcher";
 import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
 import { runContentPlanner, ContentDensityHint, ContentPlanResult, StyleAwareContentHint } from "./agents/contentPlanner";
@@ -1602,6 +1602,15 @@ Expected structure:
                 // 2. Convert to text-bullets immediately
                 // ============================================================================
                 const hasEnoughDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
+                const sanitizeFallbackTitle = (value: any): string | undefined => {
+                    if (typeof value !== 'string') return undefined;
+                    const clean = value.trim();
+                    if (!clean) return undefined;
+                    if (/^(key\s*points?|features?|process|summary|overview|content|title)$/i.test(clean)) {
+                        return undefined;
+                    }
+                    return clean;
+                };
                 
                 candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
                     // METRIC-CARDS: Check both precondition AND actual array content
@@ -1611,7 +1620,7 @@ Expected structure:
                             console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${c.metrics?.length || 0}) → text-bullets`);
                             return {
                                 type: 'text-bullets',
-                                title: c.title || 'Key Points',
+                                ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
                                 content: safeContentPlan.keyPoints.slice(0, 3)
                             };
                         }
@@ -1624,7 +1633,7 @@ Expected structure:
                             console.warn(`[GENERATOR] Precondition failed: icon-grid without valid items (${c.items?.length || 0}) → text-bullets`);
                             return {
                                 type: 'text-bullets',
-                                title: c.title || 'Features',
+                                ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
                                 content: safeContentPlan.keyPoints.slice(0, 3)
                             };
                         }
@@ -1637,7 +1646,7 @@ Expected structure:
                             console.warn(`[GENERATOR] Precondition failed: process-flow without valid steps (${c.steps?.length || 0}) → text-bullets`);
                             return {
                                 type: 'text-bullets',
-                                title: c.title || 'Process',
+                                ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
                                 content: safeContentPlan.keyPoints.slice(0, 3)
                             };
                         }
@@ -1703,8 +1712,10 @@ Expected structure:
                 // Also check component count for layouts that need 2+ components
                 const LAYOUT_MIN_COMPONENTS: Record<string, number> = {
                     'metrics-rail': 2,
-                    'split-left-text': 2,
-                    'split-right-text': 2
+                    // Split layouts can render acceptably with a single component
+                    // when sparse content is intentionally chosen.
+                    'split-left-text': 1,
+                    'split-right-text': 1
                 };
                 const minRequired = LAYOUT_MIN_COMPONENTS[currentLayout];
                 const hasEnoughComponents = !minRequired || candidate.layoutPlan.components.length >= minRequired;
@@ -2474,6 +2485,8 @@ export const generateAgenticDeck = async (
 
     const slides: SlideNode[] = [];
     const totalSlides = outline.slides.length;
+    let focusedResearchCalls = 0;
+    const maxFocusedResearchCalls = Math.max(1, Math.min(3, Math.ceil(totalSlides / 3)));
 
     // 3. PER-SLIDE GENERATION with Context Folding + Circuit Breaker + Style-Awareness
     for (let i = 0; i < totalSlides; i++) {
@@ -2505,6 +2518,65 @@ export const generateAgenticDeck = async (
                         });
                     }
                 });
+            }
+            if (relevantClusterFacts.length === 0) {
+                const canRunFocusedResearch = focusedResearchCalls < maxFocusedResearchCalls;
+                if (canRunFocusedResearch) {
+                    const focusedQuery = `${slideMeta.title}. ${slideMeta.purpose}. recent evidence, metrics, implementation facts`;
+                    const focusedFacts = await runFocusedResearch(focusedQuery, costTracker, { maxFacts: 5 });
+                    if (focusedFacts.length > 0) {
+                        focusedResearchCalls += 1;
+                        const existingClaimKeys = new Set(
+                            facts.map(f => `${f.claim || ''}`.toLowerCase().replace(/[^\w\s]/g, '').trim())
+                        );
+                        focusedFacts.forEach(f => {
+                            const key = `${f.claim || ''}`.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                            if (!key || existingClaimKeys.has(key)) return;
+                            existingClaimKeys.add(key);
+                            facts.push({
+                                ...f,
+                                id: `fact-${facts.length + 1}`
+                            });
+                            relevantClusterFacts.push(`[fact-${facts.length}] ${f.claim}`);
+                        });
+                        console.log(`[ORCHESTRATOR] Focused slide research added ${focusedFacts.length} facts for "${slideMeta.title}"`);
+                    }
+                }
+            }
+
+            if (relevantClusterFacts.length === 0 && facts.length > 0) {
+                const tokenize = (value: string): string[] =>
+                    value
+                        .toLowerCase()
+                        .replace(/[^\w\s]/g, ' ')
+                        .split(/\s+/)
+                        .map(token => token.trim())
+                        .filter(token => token.length > 2);
+
+                const intentTokens = new Set(tokenize(`${slideMeta.title || ''} ${slideMeta.purpose || ''}`));
+                const scoredFacts = facts
+                    .map(f => {
+                        const factText = `${f.category || ''} ${f.claim || ''} ${f.value || ''}`.toLowerCase();
+                        const factTokens = tokenize(factText);
+                        const overlapScore = factTokens.reduce((score, token) =>
+                            score + (intentTokens.has(token) ? 1 : 0), 0);
+                        const numericBoost = /\d/.test(`${f.claim || ''} ${f.value || ''}`) ? 1 : 0;
+                        return { fact: f, score: overlapScore + numericBoost };
+                    })
+                    .sort((a, b) => b.score - a.score);
+
+                const fallbackFacts = scoredFacts
+                    .filter(item => item.score > 0)
+                    .slice(0, 6)
+                    .map(item => `[${item.fact.id}] ${item.fact.claim}`);
+
+                if (fallbackFacts.length > 0) {
+                    relevantClusterFacts.push(...fallbackFacts);
+                    console.log(`[ORCHESTRATOR] Fallback fact selection: matched ${fallbackFacts.length} facts by semantic overlap`);
+                } else {
+                    relevantClusterFacts.push(...facts.slice(0, 4).map(f => `[${f.id}] ${f.claim}`));
+                    console.log(`[ORCHESTRATOR] Fallback fact selection: no overlap matches, using top ${Math.min(4, facts.length)} global facts`);
+                }
             }
             const factsContext = relevantClusterFacts.join('\n') || "No specific facts found.";
 

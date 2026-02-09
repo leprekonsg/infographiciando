@@ -203,6 +203,8 @@ ${usedSurprises?.length ? `AVOID REPEATING: ${usedSurprises.slice(0, 3).join(', 
 DECISIONS NEEDED:
 1. BACKGROUND: solid/gradient/mesh - must have quiet zones for text
 2. DECORATIVE (0-2): category-badge, icon-glow, accent-underline, gradient-divider
+   - For badge-like elements, include "content" as a concrete 1-4 word context label
+   - Never output prose placeholders like "contextual anchor for the slide's theme"
 3. CONTENT PATTERN (pick ONE):
    - single-hero: Large title, max breathing room
    - card-row: 2-4 horizontal cards with icon+title+body
@@ -243,7 +245,10 @@ const COMPOSITION_PLAN_SCHEMA = {
             properties: {
               type: { type: "string" },
               placement: { type: "string" },
-              purpose: { type: "string" }
+              purpose: { type: "string" },
+              content: { type: "string" },
+              icon: { type: "string" },
+              color: { type: "string" }
             }
           }
         },
@@ -445,9 +450,128 @@ function normalizeCompositionPlan(
     return createFallbackPlan(input);
   }
 
+  const sanitizeDecorativeCopy = (value: any): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const clean = value.replace(/\s+/g, ' ').trim().replace(/[.,;:!?]+$/g, '').trim();
+    if (!clean) return undefined;
+
+    const lower = clean.toLowerCase();
+    const genericPatterns = [
+      'contextual anchor',
+      'slide theme',
+      'slides theme',
+      'what this slide is about',
+      'category badge',
+      'decorative accent',
+      'visual anchor'
+    ];
+    const isGeneric = genericPatterns.some(pattern => lower.includes(pattern));
+    if (isGeneric) return undefined;
+
+    const wordCount = clean.split(/\s+/).length;
+    if (wordCount > 6) return undefined;
+
+    const promptLeakKeywords = [
+      'placement', 'purpose', 'content', 'icon', 'brand', 'color', 'top-left', 'top left', 'corner', 'definition'
+    ];
+    const leakHits = promptLeakKeywords.filter(keyword => lower.includes(keyword)).length;
+    if (leakHits >= 2) return undefined;
+
+    const imperativePrefix = /^(address|analyze|explain|define|describe|highlight|present|summarize)\b/i;
+    if (imperativePrefix.test(clean)) return undefined;
+
+    return clean.slice(0, 40);
+  };
+
+  const normalizeDecorativeType = (value: any): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const cleaned = value
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '-')
+      .replace(/-+/g, '-')
+      .trim();
+    if (!cleaned) return undefined;
+
+    const typeMap: Record<string, string> = {
+      'badge': 'badge',
+      'category-badge': 'badge',
+      'floating-stat': 'badge',
+      'quote-callout': 'badge',
+      'divider': 'divider',
+      'accent-underline': 'divider',
+      'gradient-underline': 'divider',
+      'gradient-divider': 'divider',
+      'accent-shape': 'accent-shape',
+      'asymmetric-emphasis': 'accent-shape',
+      'glow': 'glow',
+      'icon-glow': 'glow',
+      'connector': 'connector',
+      'connector-flow': 'connector',
+      'connector-lines': 'connector',
+      'narrative-flow-pattern': 'connector'
+    };
+
+    if (typeMap[cleaned]) return typeMap[cleaned];
+    for (const [needle, mapped] of Object.entries(typeMap)) {
+      if (cleaned.includes(needle)) return mapped;
+    }
+
+    if (/badge|pill|tag/.test(cleaned)) return 'badge';
+    if (/divider|underline|line/.test(cleaned)) return 'divider';
+    if (/glow|halo/.test(cleaned)) return 'glow';
+    if (/connector|arrow|flow/.test(cleaned)) return 'connector';
+    if (/accent|emphasis|highlight/.test(cleaned)) return 'accent-shape';
+    return undefined;
+  };
+
+  const normalizePlacement = (value: any): string => {
+    if (typeof value !== 'string') return 'top-left';
+    const cleaned = value
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (/top\s*left/.test(cleaned)) return 'top-left';
+    if (/top\s*center/.test(cleaned)) return 'top-center';
+    if (/top\s*right/.test(cleaned)) return 'top-right';
+    if (/below\s*title/.test(cleaned)) return 'below-title';
+    if (/bottom\s*left/.test(cleaned)) return 'bottom-left';
+    if (/bottom\s*center/.test(cleaned)) return 'bottom-center';
+    if (/center/.test(cleaned)) return 'center';
+    return 'top-left';
+  };
+
+  const sanitizeDecorativeColor = (value: any): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const clean = value.trim().toLowerCase();
+    if (!clean || clean.length > 40) return undefined;
+    if (/^#[0-9a-f]{3,8}$/i.test(clean)) return clean;
+    if (/^rgb(a)?\(/i.test(clean) || /^hsl(a)?\(/i.test(clean)) return clean;
+    if (/^(brand[- ]?(primary|secondary|accent)|primary|secondary|accent|text)$/.test(clean)) {
+      return clean.replace(/\s+/g, '-');
+    }
+    return undefined;
+  };
+
   // Safely extract decorative elements
   const decorativeElements = Array.isArray(raw.layerPlan?.decorativeElements)
-    ? raw.layerPlan.decorativeElements.filter((el: any) => el && typeof el.type === 'string')
+    ? raw.layerPlan.decorativeElements
+      .filter((el: any) => el && typeof el.type === 'string')
+      .slice(0, 4)
+      .map((el: any) => {
+        const type = normalizeDecorativeType(el.type);
+        if (!type) return null;
+        return {
+          type,
+          placement: normalizePlacement(el.placement),
+          purpose: typeof el.purpose === 'string' ? el.purpose.slice(0, 80) : 'decorative accent',
+          content: sanitizeDecorativeCopy(el.content),
+          icon: typeof el.icon === 'string' ? el.icon.slice(0, 40) : undefined,
+          color: sanitizeDecorativeColor(el.color)
+        };
+      })
+      .filter((el: any) => !!el)
     : [];
 
   // Safely extract surprises

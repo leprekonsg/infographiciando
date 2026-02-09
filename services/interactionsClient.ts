@@ -415,7 +415,7 @@ export interface InteractionRequest {
     agent?: string;
     input: string | ContentType[];
     system_instruction?: string;
-    tools?: { function_declarations?: ToolDefinition[]; googleSearch?: {} }[];
+    tools?: any[];
     response_format?: any;
     response_mime_type?: string;
     stream?: boolean;
@@ -431,6 +431,58 @@ export interface InteractionRequest {
         max_output_tokens?: number;
     };
     previous_interaction_id?: string;
+}
+
+function normalizeInteractionTools(tools?: any[]): any[] | undefined {
+    if (!Array.isArray(tools) || tools.length === 0) return undefined;
+
+    const normalized: any[] = [];
+
+    tools.forEach(tool => {
+        if (!tool || typeof tool !== 'object') return;
+
+        if (typeof tool.type === 'string') {
+            normalized.push(tool);
+            return;
+        }
+
+        if (Object.prototype.hasOwnProperty.call(tool, 'googleSearch') ||
+            Object.prototype.hasOwnProperty.call(tool, 'google_search')) {
+            normalized.push({ type: 'google_search' });
+            return;
+        }
+
+        if (Array.isArray(tool.function_declarations)) {
+            tool.function_declarations.forEach((decl: ToolDefinition) => {
+                if (!decl?.name || !decl?.parameters) return;
+                normalized.push({
+                    type: 'function',
+                    name: decl.name,
+                    description: decl.description,
+                    parameters: decl.parameters
+                });
+            });
+            return;
+        }
+
+        if (typeof tool.name === 'string' && tool.parameters) {
+            normalized.push({
+                type: 'function',
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters
+            });
+        }
+    });
+
+    if (normalized.length === 0) return undefined;
+    const seen = new Set<string>();
+    return normalized.filter(tool => {
+        const key = JSON.stringify(tool);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 export interface InteractionResponse {
@@ -1096,6 +1148,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
         const BASE_DELAY_MS = 2000;
         
         // --- CIRCUIT BREAKER: Check if we should use fallback model ---
+        const isAgentRequest = typeof request.agent === 'string' && request.agent.trim().length > 0;
         const requestedModel = request.model || MODEL_AGENTIC;
         const isFirstTurn = !request.previous_interaction_id;
         
@@ -1103,7 +1156,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
         let effectiveModel = requestedModel;
         let usingFallback = false;
         
-        if (isFirstTurn && normalizeModelName(requestedModel) === normalizeModelName(MODEL_AGENTIC)) {
+        if (!isAgentRequest && isFirstTurn && normalizeModelName(requestedModel) === normalizeModelName(MODEL_AGENTIC)) {
             const circuitResult = getEffectiveModel(requestedModel, MODEL_SIMPLE);
             effectiveModel = circuitResult.model;
             usingFallback = circuitResult.isFallback;
@@ -1123,7 +1176,8 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
         }
 
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            console.log(`[INTERACTIONS CLIENT] Sending request to ${request.model || 'model'}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}${usingFallback ? ' (circuit breaker fallback)' : ''}...`);
+            const requestTarget = request.agent ? `agent:${request.agent}` : (request.model || 'model');
+            console.log(`[INTERACTIONS CLIENT] Sending request to ${requestTarget}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}${usingFallback ? ' (circuit breaker fallback)' : ''}...`);
 
             const controller = new AbortController();
             const timeoutMs = 300_000; // 5 minute timeout
@@ -1134,14 +1188,18 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
             const progressInterval = setInterval(() => {
                 const elapsed = Math.round((Date.now() - startTime) / 1000);
                 if (elapsed % 10 === 0) { // Log every 10 seconds
-                    console.log(`[INTERACTIONS CLIENT] Waiting for response from ${request.model || 'model'}... (${elapsed}s)`);
+                    const requestTarget = request.agent ? `agent:${request.agent}` : (request.model || 'model');
+                    console.log(`[INTERACTIONS CLIENT] Waiting for response from ${requestTarget}... (${elapsed}s)`);
                 }
             }, 1000);
 
             try {
-                const response = await fetch(`${INTERACTIONS_API_BASE}?key=${this.apiKey}`, {
+                const response = await fetch(`${INTERACTIONS_API_BASE}`, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': this.apiKey
+                    },
                     body: JSON.stringify(request),
                     signal: controller.signal
                 });
@@ -1151,7 +1209,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     const status = response.status;
 
                     // --- CIRCUIT BREAKER: Record failure for the requested model ---
-                    if ((status === 500 || status === 503) && !usingFallback) {
+                    if ((status === 500 || status === 503) && !usingFallback && !isAgentRequest) {
                         recordModelFailure(requestedModel, status);
                     }
 
@@ -1168,7 +1226,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     }
 
                     // --- CIRCUIT BREAKER: Last-ditch fallback if not already using fallback ---
-                    if (status === 500 && attempt === MAX_RETRIES && !usingFallback && isFirstTurn) {
+                    if (status === 500 && attempt === MAX_RETRIES && !usingFallback && isFirstTurn && !isAgentRequest) {
                         console.warn(`🔴 [CIRCUIT BREAKER] Final fallback to ${MODEL_SIMPLE} after exhausting retries`);
                         try {
                             const fallbackRequest: InteractionRequest = {
@@ -1186,9 +1244,12 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                             clearTimeout(timeoutId);
                             clearInterval(progressInterval);
                             
-                            const fallbackResponse = await fetch(`${INTERACTIONS_API_BASE}?key=${this.apiKey}`, {
+                            const fallbackResponse = await fetch(`${INTERACTIONS_API_BASE}`, {
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'x-goog-api-key': this.apiKey
+                                },
                                 body: JSON.stringify(fallbackRequest)
                             });
 
@@ -1291,8 +1352,11 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
      * Retrieve an existing interaction by ID
      */
     async get(interactionId: string): Promise<InteractionResponse> {
-        const response = await fetch(`${INTERACTIONS_API_BASE}/${interactionId}?key=${this.apiKey}`, {
-            method: 'GET'
+        const response = await fetch(`${INTERACTIONS_API_BASE}/${interactionId}`, {
+            method: 'GET',
+            headers: {
+                'x-goog-api-key': this.apiKey
+            }
         });
 
         if (!response.ok) {
@@ -1307,8 +1371,11 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
      * Cancel an in-progress interaction
      */
     async cancel(interactionId: string): Promise<InteractionResponse> {
-        const response = await fetch(`${INTERACTIONS_API_BASE}/${interactionId}:cancel?key=${this.apiKey}`, {
-            method: 'POST'
+        const response = await fetch(`${INTERACTIONS_API_BASE}/${interactionId}:cancel`, {
+            method: 'POST',
+            headers: {
+                'x-goog-api-key': this.apiKey
+            }
         });
 
         if (!response.ok) {
@@ -1516,9 +1583,11 @@ export async function runAgentLoop(
                 model: config.model,
                 input: input, // Context-folded input
                 system_instruction: config.systemInstruction,
-                tools: toolDeclarations.length > 0
-                    ? [{ function_declarations: toolDeclarations }]
-                    : undefined,
+                tools: normalizeInteractionTools(
+                    toolDeclarations.length > 0
+                        ? [{ function_declarations: toolDeclarations }]
+                        : undefined
+                ),
                 generation_config: {
                     temperature: config.temperature ?? 0.2,
                     max_output_tokens: config.maxOutputTokens ?? 8192,
@@ -1727,13 +1796,14 @@ export async function createInteraction(
     model: string,
     prompt: string,
     options: {
+        agent?: string;
         systemInstruction?: string;
         responseFormat?: any;
         responseMimeType?: string;
         temperature?: number;
         maxOutputTokens?: number;
         thinkingLevel?: ThinkingLevel;
-        tools?: { googleSearch?: {} }[];
+        tools?: any[];
         /** Phil Schmid Best Practice: Chain interactions for context */
         previousInteractionId?: string;
     } = {},
@@ -1741,14 +1811,16 @@ export async function createInteraction(
 ): Promise<string> {
     // Use singleton client for connection reuse
     const client = getSharedClient();
+    const hasAgentOverride = typeof options.agent === 'string' && options.agent.trim().length > 0;
 
     const request: InteractionRequest = {
-        model,
+        model: hasAgentOverride ? undefined : model,
+        agent: hasAgentOverride ? options.agent : undefined,
         input: prompt,
         system_instruction: options.systemInstruction,
         response_format: options.responseFormat,
         response_mime_type: options.responseMimeType,
-        tools: options.tools,
+        tools: normalizeInteractionTools(options.tools),
         generation_config: {
             temperature: options.temperature ?? 0.2,
             max_output_tokens: options.maxOutputTokens ?? 8192,
@@ -1981,10 +2053,12 @@ export async function createJsonInteraction<T = any>(
     prompt: string,
     schema: any,
     options: {
+        agent?: string;
         systemInstruction?: string;
         temperature?: number;
         maxOutputTokens?: number;
         thinkingLevel?: ThinkingLevel;
+        tools?: any[];
     } = {},
     costTracker?: CostTracker
 ): Promise<T> {
@@ -2022,7 +2096,6 @@ export async function createJsonInteraction<T = any>(
                 background: "solid",
                 components: [{
                     type: "text-bullets",
-                    title: "Key Points",
                     content: ["Content generation encountered an issue.", "Slide will use fallback content."]
                 }]
             },
@@ -2085,7 +2158,6 @@ export async function createJsonInteraction<T = any>(
                         background: "solid",
                         components: [{
                             type: "text-bullets",
-                            title: "Key Points",
                             content: ["Content generation encountered a processing issue.", "The slide will be regenerated."]
                         }]
                     },
@@ -2107,14 +2179,13 @@ export async function createJsonInteraction<T = any>(
                         console.warn(`[JSON REPAIR] Converting string array to text-bullets fallback`);
                         return {
                             layoutPlan: {
-                                title: "Content",
-                                background: "solid",
-                                components: [{
-                                    type: "text-bullets",
-                                    title: "Key Points",
-                                    content: extractedArray.slice(0, 5)
-                                }]
-                            },
+                            title: "Content",
+                            background: "solid",
+                            components: [{
+                                type: "text-bullets",
+                                content: extractedArray.slice(0, 5)
+                            }]
+                        },
                             speakerNotesLines: ['Generated from extracted content.'],
                             selfCritique: { readabilityScore: 0.6, textDensityStatus: "high", layoutAction: "simplify" }
                         } as T;
@@ -2426,10 +2497,10 @@ function normalizeJsonOutput<T>(parsed: any): T {
                     (line: any) => typeof line === 'string' && line.trim().length > 0
                 );
                 if (parsed.speakerNotesLines.length === 0) {
-                    parsed.speakerNotesLines = ['Generated slide.'];
+                    parsed.speakerNotesLines = [`Slide: ${String(parsed.layoutPlan?.title || parsed.title || 'Content')}`];
                 }
             } else {
-                parsed.speakerNotesLines = ['Generated slide.'];
+                parsed.speakerNotesLines = [`Slide: ${String(parsed.layoutPlan?.title || parsed.title || 'Content')}`];
             }
         }
     }
@@ -2439,3 +2510,4 @@ function normalizeJsonOutput<T>(parsed: any): T {
 // --- EXPORT DEFAULT CLIENT ---
 
 export default InteractionsClient;
+

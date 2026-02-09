@@ -80,7 +80,6 @@ function buildMockComponentsFromContentPlan(
     if (includeTextBullets) {
         components.push({
             type: 'text-bullets',
-            title: 'Key Points',
             content: keyPoints.slice(0, Math.min(caps.bullets, maxItems)).map((kp: any) => trimLine(String(kp), effectiveBulletChars))
         });
     }
@@ -109,7 +108,6 @@ function buildMockComponentsFromContentPlan(
     if (components.length === 0) {
         components.push({
             type: 'text-bullets',
-            title: 'Summary',
             content: [contentPlan?.title || 'Overview']
         });
     }
@@ -126,10 +124,13 @@ function buildMockComponentsFromContentPlan(
 
     if (variant === 'split-left-text' || variant === 'split-right-text') {
         if (components.length === 1) {
+            const fallbackLine = trimLine(
+                String(keyPoints[0] || contentPlan?.title || 'Primary context'),
+                effectiveBulletChars
+            );
             components.push({
                 type: 'text-bullets',
-                title: 'Context',
-                content: ['Condense to fit layout.']
+                content: [fallbackLine]
             });
         }
         return components.slice(0, 2);
@@ -201,7 +202,12 @@ function pickCandidateLayoutVariants(
     }
 
     if (keyPoints.length <= 2) {
-        variants.add('split-left-text');
+        if (keyPoints.length <= 1) {
+            // Sparse content: prefer stable vertical stacks over split layouts.
+            variants.add('standard-vertical');
+        } else {
+            variants.add('split-left-text');
+        }
         // ONLY suggest metrics-rail if we have VALID metric data (min 2 with value+label)
         if (canUseMetrics) {
             variants.add('metrics-rail');

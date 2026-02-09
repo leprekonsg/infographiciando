@@ -98,6 +98,52 @@ const DECORATIVE_TYPE_MAP: Record<string, string> = {
   'narrative-flow-pattern': 'connector',  // Render as flow connector
 };
 
+const normalizeDecorativeType = (rawType: unknown): string | undefined => {
+  if (typeof rawType !== 'string') return undefined;
+  const cleaned = rawType
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .trim();
+  if (!cleaned) return undefined;
+
+  const direct = DECORATIVE_TYPE_MAP[cleaned] || cleaned;
+  if (['badge', 'divider', 'accent-shape', 'glow', 'connector'].includes(direct)) {
+    return direct;
+  }
+
+  for (const [needle, mapped] of Object.entries(DECORATIVE_TYPE_MAP)) {
+    if (cleaned.includes(needle)) return mapped;
+  }
+
+  if (/badge|pill|tag/.test(cleaned)) return 'badge';
+  if (/divider|underline|line/.test(cleaned)) return 'divider';
+  if (/glow|halo/.test(cleaned)) return 'glow';
+  if (/connector|arrow|flow/.test(cleaned)) return 'connector';
+  if (/accent|highlight|emphasis/.test(cleaned)) return 'accent-shape';
+  return undefined;
+};
+
+const resolveSemanticColorToken = (
+  rawColor: unknown,
+  fallback: string,
+  context: DecorativeRenderContext
+): string => {
+  if (typeof rawColor !== 'string') return fallback;
+  const token = rawColor.trim().toLowerCase().replace(/\s+/g, '-');
+  if (!token) return fallback;
+
+  if (/^#[0-9a-f]{3,8}$/i.test(token) || /^rgb(a)?\(/i.test(token) || /^hsl(a)?\(/i.test(token)) {
+    return token;
+  }
+  if (token === 'brand-primary' || token === 'primary') return context.palette.primary;
+  if (token === 'brand-secondary' || token === 'secondary') return context.palette.secondary;
+  if (token === 'brand-accent' || token === 'accent') return context.palette.accent;
+  if (token === 'brand-text' || token === 'text') return context.palette.text;
+  if (token === 'brand-background' || token === 'background') return context.palette.background;
+  return fallback;
+};
+
 export function renderDecorativeElement(
   element: DecorativeElement,
   context: DecorativeRenderContext
@@ -115,7 +161,12 @@ export function renderDecorativeElement(
   
   // Normalize the element type using the mapping
   const rawType = (element as any).type;
-  const normalizedType = DECORATIVE_TYPE_MAP[rawType] || rawType;
+  const normalizedType = normalizeDecorativeType(rawType);
+  if (!normalizedType) {
+    const preview = String(rawType).slice(0, 140);
+    console.warn(`[DecorativeRenderer] Unknown element type (truncated): ${preview}`);
+    return [];
+  }
   
   // If the type was mapped, create a modified element with the normalized type
   const normalizedElement = normalizedType !== rawType
@@ -134,8 +185,8 @@ export function renderDecorativeElement(
     case 'connector':
       return renderConnector(normalizedElement as ConnectorElement, context);
     default:
-      // Only warn if we truly don't recognize the type after normalization
-      console.warn(`[DecorativeRenderer] Unknown element type: ${rawType} (normalized: ${normalizedType})`);
+      // Should be unreachable after normalizeDecorativeType guard.
+      console.warn(`[DecorativeRenderer] Unknown element type: ${String(rawType).slice(0, 140)}`);
       return [];
   }
 }
@@ -218,7 +269,7 @@ export function renderBadge(
   
   const elements: VisualElement[] = [];
   const style = badge.style || 'pill';
-  const color = badge.color || context.palette.primary;
+  const color = resolveSemanticColorToken(badge.color, context.palette.primary, context);
   const textColor = resolveReadableTextColor(context.palette.background, context.palette.text);
   
   // Safely calculate badge dimensions with guards for empty content
@@ -338,7 +389,7 @@ export function renderDivider(
   context: DecorativeRenderContext
 ): VisualElement[] {
   const elements: VisualElement[] = [];
-  const color = divider.color || context.palette.secondary;
+  const color = resolveSemanticColorToken(divider.color, context.palette.secondary, context);
   
   const isHorizontal = divider.orientation === 'horizontal';
   const thickness = 0.02;
@@ -390,7 +441,7 @@ export function renderAccentShape(
   context: DecorativeRenderContext
 ): VisualElement[] {
   const elements: VisualElement[] = [];
-  const color = accent.color || context.palette.accent;
+  const color = resolveSemanticColorToken(accent.color, context.palette.accent, context);
   const thickness = accent.thickness || 0.03;
   
   switch (accent.shape) {
@@ -511,6 +562,7 @@ export function renderGlow(
   
   const spread = typeof glow.blur === 'number' && glow.blur > 0 ? glow.blur : 0.15;
   
+  const glowColor = resolveSemanticColorToken(glow.color, context.palette.accent, context);
   return [{
     type: 'shape',
     shapeType: 'ellipse',
@@ -519,7 +571,7 @@ export function renderGlow(
     w: glow.position.w + (spread * 2),
     h: glow.position.h + (spread * 2),
     fill: {
-      color: normalizeColor(glow.color),
+      color: normalizeColor(glowColor),
       alpha: intensityAlpha
     },
     zIndex: context.baseZIndex
@@ -539,7 +591,7 @@ export function renderConnector(
   context: DecorativeRenderContext
 ): VisualElement[] {
   const elements: VisualElement[] = [];
-  const color = connector.color || context.palette.secondary;
+  const color = resolveSemanticColorToken(connector.color, context.palette.secondary, context);
   
   // Null safety: ensure from/to coordinates exist
   if (!connector.from || !connector.to || 

@@ -26,6 +26,153 @@ const resolveReadableTextColor = (backgroundHex: string, fallbackTextHex: string
   return hasContrast ? fallbackTextHex : preferred;
 };
 
+const BADGE_LABEL_STOPWORDS = new Set([
+  'a', 'an', 'and', 'for', 'from', 'in', 'into', 'is', 'of', 'on', 'or', 'the', 'to', 'with',
+  'slide', 'slides', 'theme', 'contextual', 'anchor', 'badge', 'label'
+]);
+
+const BADGE_LABEL_PLACEHOLDER_PATTERNS = [
+  /contextual anchor/i,
+  /slide'?s?\s+theme/i,
+  /what this slide is about/i,
+  /category badge/i,
+  /^category$/i,
+  /^badge$/i,
+  /^theme$/i,
+  /^overview$/i,
+  /^summary$/i,
+  /^key\s*points?$/i
+];
+
+const looksLikePlaceholderBadgeLabel = (value?: string): boolean => {
+  if (!value || typeof value !== 'string') return true;
+  const clean = value.replace(/\s+/g, ' ').trim();
+  if (!clean) return true;
+  return BADGE_LABEL_PLACEHOLDER_PATTERNS.some(pattern => pattern.test(clean));
+};
+
+const extractBadgeLabelTokens = (value: string): string[] => {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map(token => token.trim())
+    .filter(token => token.length > 2 && !BADGE_LABEL_STOPWORDS.has(token));
+};
+
+const formatBadgeLabel = (tokens: string[]): string => {
+  if (tokens.length === 0) return 'Focus';
+  return tokens
+    .slice(0, 4)
+    .map(token => (/^[a-z]{1,3}$/i.test(token) ? token.toUpperCase() : token[0].toUpperCase() + token.slice(1)))
+    .join(' ')
+    .slice(0, 40);
+};
+
+const resolveBadgeLabel = (
+  slide: SlideNode,
+  explicitContent: unknown
+): string => {
+  const title = typeof slide.title === 'string' ? slide.title : '';
+  const titleTokens = new Set(extractBadgeLabelTokens(title));
+  const explicit = typeof explicitContent === 'string' ? explicitContent.replace(/\s+/g, ' ').trim() : '';
+  if (explicit && !looksLikePlaceholderBadgeLabel(explicit) && explicit.split(/\s+/).length <= 5) {
+    const explicitTokens = extractBadgeLabelTokens(explicit);
+    const overlapWithTitle = explicitTokens.filter(token => titleTokens.has(token)).length;
+    const leakedSchemaTokens = explicitTokens.filter(token =>
+      ['brand', 'color', 'icon', 'placement', 'purpose', 'content', 'corner', 'contextual', 'anchor', 'top', 'left', 'right'].includes(token)
+    ).length;
+    if (leakedSchemaTokens === 0 && (overlapWithTitle > 0 || explicitTokens.length <= 2)) {
+      return explicit.slice(0, 40);
+    }
+  }
+
+  const purpose = typeof slide.purpose === 'string' ? slide.purpose : '';
+  if (titleTokens.size > 0) return formatBadgeLabel(Array.from(titleTokens));
+
+  const purposeTokens = extractBadgeLabelTokens(purpose);
+  const safePurposeTokens = purposeTokens.filter(token =>
+    !['address', 'challenge', 'compressed', 'executive', 'contextual', 'anchor'].includes(token)
+  );
+  if (safePurposeTokens.length > 0) return formatBadgeLabel(safePurposeTokens);
+
+  return 'Focus';
+};
+
+const pickHighContrastDecorativeColor = (palette: {
+  primary: string;
+  secondary: string;
+  accent: string;
+  background: string;
+}): string => {
+  const bgYiq = getYiq(palette.background);
+  const candidates = [palette.accent, palette.secondary, palette.primary];
+  const best = candidates
+    .map(color => ({ color, score: Math.abs(getYiq(color) - bgYiq) }))
+    .sort((a, b) => b.score - a.score)[0];
+  return best?.color || palette.accent;
+};
+
+const normalizeDecorativeType = (value: unknown): 'badge' | 'divider' | 'accent-shape' | 'glow' | 'connector' | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const cleaned = value
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .replace(/-+/g, '-')
+    .trim();
+  if (!cleaned) return undefined;
+
+  const directMap: Record<string, 'badge' | 'divider' | 'accent-shape' | 'glow' | 'connector'> = {
+    'badge': 'badge',
+    'category-badge': 'badge',
+    'floating-stat': 'badge',
+    'quote-callout': 'badge',
+    'divider': 'divider',
+    'accent-underline': 'divider',
+    'gradient-divider': 'divider',
+    'gradient-underline': 'divider',
+    'accent-shape': 'accent-shape',
+    'asymmetric-emphasis': 'accent-shape',
+    'glow': 'glow',
+    'icon-glow': 'glow',
+    'connector': 'connector',
+    'connector-flow': 'connector',
+    'connector-lines': 'connector',
+    'narrative-flow-pattern': 'connector'
+  };
+
+  if (directMap[cleaned]) return directMap[cleaned];
+  for (const [needle, mapped] of Object.entries(directMap)) {
+    if (cleaned.includes(needle)) return mapped;
+  }
+
+  if (/badge|pill|tag/.test(cleaned)) return 'badge';
+  if (/divider|underline|line/.test(cleaned)) return 'divider';
+  if (/glow|halo/.test(cleaned)) return 'glow';
+  if (/connector|arrow|flow/.test(cleaned)) return 'connector';
+  if (/accent|emphasis|highlight/.test(cleaned)) return 'accent-shape';
+  return undefined;
+};
+
+const normalizeDecorativeColor = (
+  rawColor: unknown,
+  palette: { primary: string; secondary: string; accent: string; text: string },
+  fallback: string
+): string => {
+  if (typeof rawColor !== 'string') return fallback;
+  const token = rawColor.trim().toLowerCase().replace(/\s+/g, '-');
+  if (!token) return fallback;
+
+  if (/^#[0-9a-f]{3,8}$/i.test(token) || /^rgb(a)?\(/i.test(token) || /^hsl(a)?\(/i.test(token)) {
+    return token;
+  }
+  if (token === 'brand-primary' || token === 'primary') return palette.primary;
+  if (token === 'brand-secondary' || token === 'secondary') return palette.secondary;
+  if (token === 'brand-accent' || token === 'accent') return palette.accent;
+  if (token === 'text' || token === 'brand-text') return palette.text;
+  return fallback;
+};
+
 // Predefined Spatial Templates for Layout Variants
 // Coordinates are 0-10 (X) and 0-5.625 (Y)
 const LAYOUT_TEMPLATES: Record<string, SpatialZone[]> = {
@@ -444,6 +591,34 @@ export class SpatialLayoutEngine {
 
     const themeTokens = this.resolveThemeTokens(effectiveStyleGuide);
 
+    // Dynamic title clearance: long multi-line titles need extra vertical room to
+    // prevent divider/content collisions in sparse layouts.
+    let titleClearanceShift = 0;
+    const titleZoneTemplate = zones.find(z => z.id === 'title' || z.id === 'hero-title');
+    if (titleZoneTemplate && typeof slide.title === 'string' && slide.title.trim().length > 0) {
+      const shouldAutoClear =
+        variant === 'standard-vertical' ||
+        variant === 'split-left-text' ||
+        variant === 'split-right-text' ||
+        variant === 'metrics-rail' ||
+        variant === 'dashboard-tiles' ||
+        variant === 'asymmetric-grid';
+      if (shouldAutoClear) {
+        const titleFontSize = titleZoneTemplate.id === 'hero-title'
+          ? themeTokens.typography.scale.hero
+          : themeTokens.typography.scale.title;
+        const estimatedTitleLines = this.estimateWrappedLineCount(
+          [slide.title],
+          titleZoneTemplate.w,
+          titleFontSize,
+          effectiveStyleGuide.fontFamilyTitle
+        );
+        if (estimatedTitleLines > 1) {
+          titleClearanceShift = Math.min(0.9, (estimatedTitleLines - 1) * 0.42);
+        }
+      }
+    }
+
     // --- APPLY LAYOUT-LEVEL REPAIR HINTS ---
     // Visual Architect sets these on layoutPlan to fix title/divider positioning
     const layoutPlan = slide.layoutPlan as any; // Cast to access _hint fields
@@ -469,6 +644,25 @@ export class SpatialLayoutEngine {
       // Divider positioning hint
       if ((zone.id === 'divider' || zone.id === 'accent-bar') && dividerYHint !== undefined) {
         effectiveZone.y = dividerYHint;
+      }
+
+      // Auto-clearance for long titles (applies after explicit hints).
+      if (titleClearanceShift > 0) {
+        if (zone.id === 'title' || zone.id === 'hero-title') {
+          effectiveZone.h += titleClearanceShift;
+        }
+        if (zone.id === 'divider' || zone.id === 'accent-bar') {
+          effectiveZone.y += titleClearanceShift;
+        }
+        if (
+          zone.id === 'content-top' ||
+          zone.id === 'content-bottom' ||
+          zone.id === 'text-main' ||
+          zone.id === 'main'
+        ) {
+          effectiveZone.y += titleClearanceShift;
+          effectiveZone.h = Math.max(0.7, effectiveZone.h - titleClearanceShift);
+        }
       }
 
       if (!allocated) {
@@ -529,10 +723,10 @@ export class SpatialLayoutEngine {
     // GAP 5: Apply rendering warnings to slide
     // FIXED: Replace spatial warnings instead of accumulating them across render passes
     // This prevents warning count inflation when the same slide is re-rendered multiple times
-    const spatialWarnings = this.getWarnings();
+    const spatialWarnings = Array.from(new Set(this.getWarnings()));
     if (spatialWarnings.length > 0) {
       // Filter out previous spatial warnings (those matching known patterns)
-      const spatialPatterns = /truncated|hidden|unplaced|overflow|bullets.*requires/i;
+      const spatialPatterns = /truncated|hidden|unplaced|overflow|bullets.*requires|density capped|title scaled down/i;
       const existingNonSpatialWarnings = (slide.warnings || []).filter(w => !spatialPatterns.test(w));
 
       // Combine non-spatial warnings with new spatial warnings
@@ -692,7 +886,8 @@ export class SpatialLayoutEngine {
       // The old area thresholds were too small for the 16:9 coordinate system and never triggered.
       const compactZone = h < 1.9 || w < 3.0;
       const mediumZone = h < 2.6 || w < 4.2;
-      const maxBulletsForZone = compactZone ? 2 : (mediumZone ? 3 : 4);
+      const wideShallowZone = w >= 8 && h >= 1.5;
+      const maxBulletsForZone = wideShallowZone ? 3 : (compactZone ? 2 : (mediumZone ? 3 : 4));
 
       if (lines.length > maxBulletsForZone) {
         lines = lines.slice(0, maxBulletsForZone);
@@ -779,11 +974,37 @@ export class SpatialLayoutEngine {
       // ============================================================================
       const isContentZone = /content|text-main|main|panel|grid/i.test(zone.id);
       const titleEqualsSlide = slideTitle && comp.title && comp.title.trim().toLowerCase() === slideTitle.trim().toLowerCase();
+      const normalizeTitleTokens = (value?: string): Set<string> => {
+        if (!value) return new Set();
+        return new Set(
+          value
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ')
+            .split(/\s+/)
+            .map(token => token.trim())
+            .filter(token => token.length > 2)
+        );
+      };
+      const compTitleTokens = normalizeTitleTokens(comp.title);
+      const slideTitleTokens = normalizeTitleTokens(slideTitle);
+      const tokenIntersection = [...compTitleTokens].filter(token => slideTitleTokens.has(token)).length;
+      const tokenUnion = new Set([...compTitleTokens, ...slideTitleTokens]).size;
+      const semanticTitleOverlap = tokenUnion > 0 ? tokenIntersection / tokenUnion : 0;
+      const repetitiveTitlePattern = typeof comp.title === 'string' && (
+        /(\b[\w-]{3,}\b)\s+\1\b/i.test(comp.title) ||
+        comp.title.split(':').length > 2
+      );
+      const normalizedCompTitle = typeof comp.title === 'string'
+        ? comp.title.trim().toLowerCase()
+        : '';
+      const placeholderComponentTitle =
+        normalizedCompTitle.length === 0 ||
+        /^(key\s*points?|key\s*insights?|summary|overview|content|title|section)$/i.test(normalizedCompTitle);
       const shouldSkipComponentTitle = isContentZone && (
         titleEqualsSlide ||
-        !comp.title || // No title provided
-        comp.title === 'Key Insights' || // Default placeholder
-        comp.title === 'Title' || // Generic placeholder
+        semanticTitleOverlap > 0.45 ||
+        repetitiveTitlePattern ||
+        placeholderComponentTitle ||
         comp.title.length < 3 // Too short to be meaningful
       );
 
@@ -1514,12 +1735,26 @@ export function renderWithLayeredComposition(
     console.warn('[SpatialRenderer] Serendipity renderers not fully available, some features may be limited');
   }
 
+  // Align layered-render palette with VisualDesignSpec overrides used by standard renderer.
+  // This prevents decorative layer contrast from diverging from content/title layers.
+  const baseBackground = normalizeColor(
+    slide.visualDesignSpec?.color_harmony?.background_tone || styleGuide?.colorPalette?.background,
+    '0F172A'
+  );
+  const baseText = normalizeColor(styleGuide?.colorPalette?.text, 'F1F5F9');
+  const contrastText = resolveReadableTextColor(baseBackground, baseText);
   const palette = {
-    primary: normalizeColor(styleGuide?.colorPalette?.primary, '22C55E'),
+    primary: normalizeColor(
+      slide.visualDesignSpec?.color_harmony?.primary || styleGuide?.colorPalette?.primary,
+      '22C55E'
+    ),
     secondary: normalizeColor(styleGuide?.colorPalette?.secondary, '38BDF8'),
-    accent: normalizeColor(styleGuide?.colorPalette?.accentHighContrast, 'F59E0B'),
-    background: normalizeColor(styleGuide?.colorPalette?.background, '0F172A'),
-    text: normalizeColor(styleGuide?.colorPalette?.text, 'F1F5F9'),
+    accent: normalizeColor(
+      slide.visualDesignSpec?.color_harmony?.accent || styleGuide?.colorPalette?.accentHighContrast,
+      'F59E0B'
+    ),
+    background: baseBackground,
+    text: contrastText,
     textMuted: normalizeColor(styleGuide?.colorPalette?.text, 'A1A1AA')
   };
 
@@ -1541,6 +1776,7 @@ export function renderWithLayeredComposition(
 
   // --- LAYER 1: DECORATIVE ELEMENTS (z-index 10-19) ---
   if (hasDecorativeRenderer && compositionPlan.layerPlan.decorativeElements?.length > 0) {
+    const defaultDecorativeColor = pickHighContrastDecorativeColor(palette);
     const decorativeContext = {
       palette,
       iconCache,
@@ -1550,17 +1786,24 @@ export function renderWithLayeredComposition(
     // Convert composition plan decorative elements to renderable format
     const decorativeElements = compositionPlan.layerPlan.decorativeElements
       .filter((el: any) => el && el.type)
-      .map((el: any, idx: number) => {
+      .map((el: any) => {
+        const normalizedType = normalizeDecorativeType(el.type);
+        if (!normalizedType) return null;
+
         // Map placement strings to actual positions
-        const position = mapPlacementToPosition(el.placement, el.type);
+        const position = mapPlacementToPosition(el.placement, normalizedType);
+
+        const isBadgeLike = normalizedType === 'badge';
+        const badgeLabel = isBadgeLike ? resolveBadgeLabel(slide, el.content) : undefined;
+        const color = normalizeDecorativeColor(el.color, palette, defaultDecorativeColor);
 
         // Pre-populate icon if needed
-        if (el.type === 'badge' && el.icon) {
+        if (normalizedType === 'badge' && el.icon) {
           populateIcon(el.icon);
         }
 
         // Connector elements require from/to coordinates; derive from placement if missing
-        if (el.type === 'connector') {
+        if (normalizedType === 'connector') {
           const from = el.from ?? { x: position.x, y: position.y + (position.h / 2) };
           const to = el.to ?? { x: position.x + position.w, y: position.y + (position.h / 2) };
 
@@ -1569,22 +1812,23 @@ export function renderWithLayeredComposition(
             from,
             to,
             style: el.style || 'line',
-            color: el.color || palette.secondary
+            color
           };
         }
 
         return {
-          type: el.type,
+          type: normalizedType,
           position,
-          content: el.content || el.purpose || 'Category',
+          content: isBadgeLike ? badgeLabel : (typeof el.content === 'string' ? el.content : undefined),
           icon: el.icon,
-          color: palette.primary,
+          color,
           style: 'pill',
           orientation: 'horizontal',
           intensity: 'subtle',
           shape: 'underline'
         };
-      });
+      })
+      .filter((el: any) => !!el);
 
     elements.push(...decorativeRenderers.renderDecorativeLayer(decorativeElements, decorativeContext));
   }
@@ -1760,9 +2004,9 @@ function mapPlacementToPosition(
 ): { x: number; y: number; w: number; h: number } {
   // Default positions for different placement strings
   const positions: Record<string, { x: number; y: number; w: number; h: number }> = {
-    'top-left': { x: 0.5, y: 0.3, w: 2.5, h: 0.35 },
-    'top-center': { x: 3.75, y: 0.3, w: 2.5, h: 0.35 },
-    'top-right': { x: 7.0, y: 0.3, w: 2.5, h: 0.35 },
+    'top-left': { x: 0.5, y: 0.18, w: 2.8, h: 0.35 },
+    'top-center': { x: 3.6, y: 0.18, w: 2.8, h: 0.35 },
+    'top-right': { x: 6.7, y: 0.18, w: 2.8, h: 0.35 },
     'below-title': { x: 0.5, y: 1.2, w: 9, h: 0.05 },
     'center': { x: 2, y: 2.5, w: 6, h: 1 },
     'bottom-left': { x: 0.5, y: 5.0, w: 2.5, h: 0.35 },
