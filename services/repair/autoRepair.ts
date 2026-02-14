@@ -1469,7 +1469,13 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
                     .map(item => typeof item === 'string' ? item.trim() : '')
                     .filter(item => item.length > 6 && !isPlaceholderValue(item));
                 const fallback = fallbackFromRaw.length > 0 ? fallbackFromRaw : extractFallbackBullets();
-                const uniqueFallback = Array.from(new Set(fallback.map(item => String(item).trim()).filter(Boolean)));
+                const uniqueFallback: string[] = Array.from(
+                    new Set(
+                        fallback
+                            .map(item => String(item).trim())
+                            .filter((item): item is string => item.length > 0)
+                    )
+                );
                 if (uniqueFallback.length > 0) {
                     c.content = capList(
                         uniqueFallback.map(item => truncateText(item, 90, 'bullet text')),

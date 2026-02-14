@@ -974,6 +974,21 @@ export async function analyzeSlideLayoutSpatial(
     console.log(`[QWEN3-VL SPATIAL] Analyzing layout: ${context.layoutId} (${context.elementCount} elements)`);
 
     try {
+        const isBrowser = typeof window !== 'undefined';
+
+        if (QWEN_VL_PROXY_URL && (isBrowser || !qwenVLClient.isAvailable())) {
+            const proxyResult = await callQwenProxy<any>(
+                '/api/qwen/spatial-analysis',
+                { imageBase64: pngBase64, context },
+                costTracker
+            );
+            const normalized = normalizeSpatialResponse(proxyResult || {});
+            return {
+                ...normalized,
+                latency_ms: Date.now() - startTime
+            };
+        }
+
         // Build spatial analysis prompt with DeepStack-native coordinate system
         const prompt = buildSpatialAnalysisPrompt(context);
         
@@ -1028,6 +1043,50 @@ export async function analyzeSlideLayoutSpatial(
 
     } catch (error: any) {
         console.error('[QWEN3-VL SPATIAL] Analysis failed:', error.message);
+        return null;
+    }
+}
+
+/**
+ * Spatial analysis helper for SVG proxy input.
+ * Uses proxy-side rasterization when available; otherwise uses local rasterizer in Node.
+ */
+export async function analyzeSlideLayoutSpatialFromSvg(
+    svgString: string,
+    context: LayoutAnalysisContext,
+    costTracker?: CostTracker
+): Promise<Qwen3VLSpatialAnalysisResult | null> {
+    if (!qwenVLClient.isAvailable() && !QWEN_VL_PROXY_URL) {
+        console.warn('[QWEN3-VL SPATIAL] API not configured');
+        return null;
+    }
+
+    const isBrowser = typeof window !== 'undefined';
+    const startTime = Date.now();
+
+    try {
+        if (QWEN_VL_PROXY_URL && (isBrowser || !qwenVLClient.isAvailable())) {
+            const proxyResult = await callQwenProxy<any>(
+                '/api/qwen/spatial-analysis',
+                { svgString, context, slideWidth: 1920, slideHeight: 1080 },
+                costTracker
+            );
+            const normalized = normalizeSpatialResponse(proxyResult || {});
+            return {
+                ...normalized,
+                latency_ms: Date.now() - startTime
+            };
+        }
+
+        if (isBrowser) {
+            console.warn('[QWEN3-VL SPATIAL] SVG analysis unavailable in browser without proxy.');
+            return null;
+        }
+
+        const pngBase64 = await svgToPngBase64(svgString, 1920, 1080);
+        return analyzeSlideLayoutSpatial(pngBase64, context, costTracker);
+    } catch (error: any) {
+        console.error('[QWEN3-VL SPATIAL] SVG analysis failed:', error.message);
         return null;
     }
 }

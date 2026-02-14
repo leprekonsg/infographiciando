@@ -26,3 +26,5 @@ dist-ssr
 agent-arch-critique.md
 AGENTS.md
 .github/copilot-instructions.md
+playwright-report/
+test-results/

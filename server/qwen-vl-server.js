@@ -149,6 +149,62 @@ OUTPUT (strict JSON):
 This is a perception task - output score directly without lengthy reasoning.`;
 }
 
+function buildSpatialAnalysisPrompt(context = {}) {
+  const layoutId = context.layoutId || 'standard-vertical';
+  const elementCount = Number.isFinite(Number(context.elementCount)) ? Number(context.elementCount) : 0;
+  const zones = Array.isArray(context.expectedTextZones) && context.expectedTextZones.length > 0
+    ? context.expectedTextZones.join(', ')
+    : 'title, body';
+
+  return `Analyze this slide for spatial layout quality with coordinate grounding.
+
+LAYOUT TYPE: ${layoutId}
+ELEMENT COUNT: ${elementCount}
+EXPECTED TEXT ZONES: ${zones}
+
+TASKS:
+1) Detect text regions and provide bbox [x0,y0,x1,y1]
+2) Classify overflow risk: none | low | high | critical
+3) Detect overcrowded zones with density score 0-1
+4) Propose minimal repair actions
+
+COORDINATE RULE:
+- You may reason in 0-1000 internally.
+- OUTPUT must use normalized 0-1 coordinates.
+
+OUTPUT STRICT JSON:
+{
+  "overall_score": <0-100>,
+  "spatial_analysis": {
+    "text_regions": [
+      {
+        "text": "short excerpt",
+        "bbox": [<x0>, <y0>, <x1>, <y1>],
+        "overflow_risk": "none" | "low" | "high" | "critical"
+      }
+    ],
+    "overcrowded_zones": [
+      {
+        "region": "title" | "body" | "footer",
+        "density_score": <0-1>,
+        "recommendation": "short fix"
+      }
+    ]
+  },
+  "repair_actions": [
+    {
+      "target": "title" | "component-id",
+      "action": "resize" | "reposition" | "reflow" | "reduce_font",
+      "parameters": { "k": 1 },
+      "confidence": <0-1>
+    }
+  ],
+  "verdict": "accept" | "flag_for_review" | "requires_repair"
+}
+
+Return JSON only.`;
+}
+
 async function callQwenVL({ imageBase64, prompt }) {
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -310,6 +366,37 @@ app.post('/api/qwen/layout-score', async (req, res) => {
     const { responseText, usage } = await callQwenVL({
       imageBase64: base64,
       prompt: buildLayoutScorePrompt()
+    });
+
+    const result = parseJsonResponse(responseText);
+    res.json({ result, usage });
+  } catch (err) {
+    res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+app.post('/api/qwen/spatial-analysis', async (req, res) => {
+  try {
+    const {
+      svgString,
+      imageBase64,
+      context = {},
+      slideWidth = 1920,
+      slideHeight = 1080
+    } = req.body || {};
+
+    let base64 = imageBase64;
+    if (!base64 && svgString) {
+      base64 = rasterizeSvgToBase64(svgString, slideWidth, slideHeight);
+    }
+
+    if (!base64) {
+      return res.status(400).json({ error: 'Missing svgString or imageBase64' });
+    }
+
+    const { responseText, usage } = await callQwenVL({
+      imageBase64: base64,
+      prompt: buildSpatialAnalysisPrompt(context)
     });
 
     const result = parseJsonResponse(responseText);

@@ -379,6 +379,13 @@ export type ContentType =
     | { type: 'google_search_call'; id: string; arguments: { queries: string[] } }
     | { type: 'google_search_result'; call_id: string; result: { url: string; title: string }[] };
 
+export type InteractionPart =
+    | { type: 'text'; text: string }
+    | { type: 'image'; image: { data: string; mimeType: string } }
+    | { type: 'json'; json: any };
+
+export type AgentToolResultMode = 'legacy_enveloped' | 'native_result';
+
 export interface FunctionCall {
     name: string;
     id?: string;
@@ -569,6 +576,13 @@ export interface AgentConfig {
      * Default: 2
      */
     maxToolRetries?: number;
+
+    /**
+     * Controls how tool outputs are returned in function_result.
+     * - legacy_enveloped: { success, data|error... } (default)
+     * - native_result: raw tool result (supports multimodal parts)
+     */
+    toolResultMode?: AgentToolResultMode;
 }
 
 // --- LOGGING ---
@@ -909,6 +923,12 @@ export class CostTracker {
     qwenVLOutputTokens = 0;
     qwenVLCalls = 0;
 
+    // Multimodal FC visual pilot metrics (annotation only; cost already counted via addUsage/addQwenVLCost)
+    mmfcVisualCost = 0;
+    mmfcVisualInputTokens = 0;
+    mmfcVisualOutputTokens = 0;
+    mmfcVisualCalls = 0;
+
     addUsage(model: string, usage: InteractionResponse['usage']): void {
         if (!usage) return;
 
@@ -978,6 +998,13 @@ export class CostTracker {
         console.log(`💰 [COST] Qwen-VL: $${cost.toFixed(4)} (${inputTokens} input, ${outputTokens} output tokens)`);
     }
 
+    addMmfcVisualMetrics(costDelta: number, inputTokensDelta: number, outputTokensDelta: number, callsDelta: number = 1): void {
+        this.mmfcVisualCost += Math.max(0, costDelta || 0);
+        this.mmfcVisualInputTokens += Math.max(0, inputTokensDelta || 0);
+        this.mmfcVisualOutputTokens += Math.max(0, outputTokensDelta || 0);
+        this.mmfcVisualCalls += Math.max(0, callsDelta || 0);
+    }
+
     getSummary(): {
         totalCost: number;
         totalInputTokens: number;
@@ -987,6 +1014,12 @@ export class CostTracker {
         totalSavingsVsPro: number;
         modelBreakdown: Record<string, { calls: number; cost: number; inputTokens: number; outputTokens: number; reasoningTokens: number }>;
         qwenVL?: {
+            cost: number;
+            inputTokens: number;
+            outputTokens: number;
+            calls: number;
+        };
+        mmfcVisual?: {
             cost: number;
             inputTokens: number;
             outputTokens: number;
@@ -1010,6 +1043,15 @@ export class CostTracker {
                 inputTokens: this.qwenVLInputTokens,
                 outputTokens: this.qwenVLOutputTokens,
                 calls: this.qwenVLCalls
+            };
+        }
+
+        if (this.mmfcVisualCalls > 0) {
+            summary.mmfcVisual = {
+                cost: this.mmfcVisualCost,
+                inputTokens: this.mmfcVisualInputTokens,
+                outputTokens: this.mmfcVisualOutputTokens,
+                calls: this.mmfcVisualCalls
             };
         }
 
@@ -1536,6 +1578,7 @@ export async function runAgentLoop(
     // Context Folding setup (Phil Schmid pattern)
     const contextMode = config.contextMode || 'server'; // Default to server-side context
     const maxToolRetries = config.maxToolRetries || 3;  // Per-tool retry cap
+    const toolResultMode: AgentToolResultMode = config.toolResultMode || 'legacy_enveloped';
     
     // Full conversation history (always maintained for fallback)
     let fullHistory: ContentType[] = [{ type: 'text', text: prompt }];
@@ -1679,6 +1722,7 @@ export async function runAgentLoop(
                 for (const call of functionCalls) {
                     const tool = config.tools[call.name];
                     let result: ToolResult<unknown>;
+                    let nativeResult: unknown;
                     const startTime = Date.now();
 
                     if (!tool) {
@@ -1705,6 +1749,7 @@ export async function runAgentLoop(
                         } else {
                             try {
                                 const data = await tool.execute(call.arguments);
+                                nativeResult = data;
                                 result = { success: true, data };
                                 // Reset error count on success
                                 toolErrorCounts[call.name] = 0;
@@ -1730,12 +1775,16 @@ export async function runAgentLoop(
                         config.onToolCall(call.name, call.arguments, result);
                     }
 
+                    const modelResult = toolResultMode === 'native_result'
+                        ? (result.success ? nativeResult : { tool_error: result })
+                        : result;
+
                     functionResults.push({
                         type: 'function_result',
                         function_result: {
                             name: call.name,
                             call_id: call.id || call.name,
-                            result
+                            result: modelResult
                         }
                     });
                 }
@@ -2044,6 +2093,73 @@ export async function createInteraction(
     }
 
     return '';
+}
+
+export async function createInteractionWithInput(
+    model: string,
+    input: ContentType[],
+    options: {
+        agent?: string;
+        systemInstruction?: string;
+        responseFormat?: any;
+        responseMimeType?: string;
+        temperature?: number;
+        maxOutputTokens?: number;
+        thinkingLevel?: ThinkingLevel;
+        tools?: any[];
+        previousInteractionId?: string;
+    } = {},
+    costTracker?: CostTracker
+): Promise<string> {
+    const client = getSharedClient();
+    const hasAgentOverride = typeof options.agent === 'string' && options.agent.trim().length > 0;
+
+    const request: InteractionRequest = {
+        model: hasAgentOverride ? undefined : model,
+        agent: hasAgentOverride ? options.agent : undefined,
+        input,
+        system_instruction: options.systemInstruction,
+        response_format: options.responseFormat,
+        response_mime_type: options.responseMimeType,
+        tools: normalizeInteractionTools(options.tools),
+        generation_config: {
+            temperature: options.temperature ?? 0.2,
+            max_output_tokens: options.maxOutputTokens ?? 8192,
+            thinking_level: options.thinkingLevel
+        },
+        previous_interaction_id: options.previousInteractionId
+    };
+
+    const response = await client.create(request);
+
+    const requestedModel = normalizeModelName(model);
+    const resolvedModel = normalizeModelName(response.model || model);
+    if (response.model && resolvedModel !== requestedModel) {
+        console.log(`[INTERACTIONS CLIENT] Model resolved to ${resolvedModel} (requested ${requestedModel})`);
+    }
+
+    if (costTracker) {
+        const usage = normalizeUsage(response);
+        if (usage) {
+            costTracker.addUsage(resolvedModel, usage);
+        } else {
+            console.warn(`[INTERACTIONS CLIENT] Missing usage metadata for ${resolvedModel}`);
+        }
+    }
+
+    const outputs = response.outputs || [];
+    let extractedText = '';
+    for (const output of outputs) {
+        if (output.type === 'text') {
+            extractedText += output.text;
+        }
+    }
+
+    if (extractedText.trim().length > 0) {
+        return extractedText;
+    }
+
+    throw new Error('No text output returned by multimodal interaction');
 }
 
 // --- CONVENIENCE: JSON Mode Interaction ---

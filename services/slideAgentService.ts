@@ -45,6 +45,7 @@ import { runArchitect } from "./agents/architect";
 import { runRouter } from "./agents/router";
 import { runContentPlanner, ContentDensityHint, ContentPlanResult, StyleAwareContentHint } from "./agents/contentPlanner";
 import { runQwenLayoutSelector } from "./agents/qwenLayoutSelector";
+import { runMultimodalVisualGatePilot } from "./agents/visualGateOrchestrator";
 import { runAgentLoop } from "./agentLoopKernel";
 import type { LoopIssue, LoopRunTrace, LoopVerdict } from "../types/agentLoopTypes";
 import {
@@ -63,6 +64,7 @@ export const SERENDIPITY_MODE_ENABLED = true; // Layer-based composition with pr
 // Enable Director mode - uses orchestrator pattern with browser-based rendering
 // When true, routes to DirectorAgent pipeline instead of legacy multi-agent pipeline
 export const ENABLE_DIRECTOR_MODE = false; // Set to true to test new architecture
+export const ENABLE_MMFC_VISUAL_GATE = process.env.ENABLE_MMFC_VISUAL_GATE === 'true';
 
 // Default style mode - can be overridden per-request
 export const DEFAULT_STYLE_MODE: StyleMode = 'professional';
@@ -77,6 +79,12 @@ export const DEFAULT_STYLE_MODE: StyleMode = 'professional';
 import { MODEL_AGENTIC, isCircuitBreakerActive } from "./interactionsClient";
 
 const MAX_AGENT_ITERATIONS = 10; // Global escape hatch per Phil Schmid's recommendation (reduced from 15 for faster convergence)
+const MMFC_VISUAL_HIGH_RISK_LAYOUTS = new Set([
+    'bento-grid',
+    'dashboard-tiles',
+    'metrics-rail',
+    'asymmetric-grid'
+]);
 
 // --- AGENT DATA CONTRACT UTILITIES ---
 
@@ -1940,69 +1948,128 @@ Expected structure:
                 try {
                     // Import Visual Architect functions
                     const { runQwenVisualArchitectLoop, isQwenVLAvailable } = await import('./visualCortex');
-
-                    // Check if Qwen-VL Visual Architect is available (DEFAULT)
                     const qwenAvailable = isQwenVLAvailable();
-                    console.log(`[VISUAL ARCHITECT] Availability: ${qwenAvailable ? 'available' : 'unavailable'}`);
-                    if (qwenAvailable) {
-                        console.log('✨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
 
-                        const architectResult = await runQwenVisualArchitectLoop(
-                            candidate,
-                            styleGuide,
-                            routerConfig,
-                            costTracker,
-                            3 // maxRounds
-                        );
+                    let mmfcHandled = false;
+                    const layoutVariant = String(candidate.routerConfig?.layoutVariant || '');
+                    const shouldRunMmfcPilot = ENABLE_MMFC_VISUAL_GATE
+                        && qwenAvailable
+                        && MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(layoutVariant);
 
-                        // Update candidate with Visual Architect result
-                        candidate = architectResult.slide;
-                        system2Rounds = architectResult.rounds;
-                        visualRepairSucceeded = architectResult.converged;
-                        visualRepairAttempted = architectResult.rounds > 0;
-                        system2Cost = architectResult.totalCost || 0;
-                        system2InputTokens = architectResult.totalInputTokens || 0;
-                        system2OutputTokens = architectResult.totalOutputTokens || 0;
+                    if (ENABLE_MMFC_VISUAL_GATE && MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(layoutVariant) && !qwenAvailable) {
+                        console.log(`[MMFC VISUAL GATE] Skipped: Qwen-VL unavailable for high-risk layout ${layoutVariant}.`);
+                    }
 
-                        // Update validation with final score
-                        candidate.validation = validateSlide(candidate);
-                        lastValidation = candidate.validation;
+                    if (shouldRunMmfcPilot) {
+                        console.log(`[MMFC VISUAL GATE] Pilot enabled for high-risk layout: ${layoutVariant}`);
+                        try {
+                            const mmfcResult = await runMultimodalVisualGatePilot({
+                                slide: candidate,
+                                styleGuide,
+                                routerConfig,
+                                costTracker,
+                                maxIterations: 3
+                            });
 
-                        console.log(`✅ [VISUAL ARCHITECT] Complete: ${system2Rounds} rounds, final score: ${architectResult.finalScore}, converged: ${architectResult.converged}, cost: $${system2Cost.toFixed(4)}`);
+                            candidate = mmfcResult.slide;
+                            system2Rounds = mmfcResult.rounds;
+                            visualRepairAttempted = mmfcResult.attempted;
+                            system2Cost = mmfcResult.cost;
+                            system2InputTokens = mmfcResult.inputTokens;
+                            system2OutputTokens = mmfcResult.outputTokens;
 
-                        if (progress?.onProgress) {
-                            progress.onProgress(`Visual Architect complete: score ${Math.round(architectResult.finalScore)} (${architectResult.converged ? 'converged' : 'not converged'})`);
+                            if (mmfcResult.verdict === 'accept') {
+                                mmfcHandled = true;
+                                visualRepairSucceeded = true;
+
+                                candidate.validation = validateSlide(candidate);
+                                lastValidation = candidate.validation;
+                                console.log(`[MMFC VISUAL GATE] Complete: verdict=${mmfcResult.verdict}, reason="${mmfcResult.reason}", cost=$${mmfcResult.cost.toFixed(4)}`);
+                                if (progress?.onProgress) {
+                                    progress.onProgress(`MMFC visual gate: ${mmfcResult.verdict}`);
+                                }
+                            } else {
+                                if (mmfcResult.verdict === 'accept_with_warnings') {
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `MMFC visual gate accepted with warnings (escalating): ${mmfcResult.reason}`
+                                    ];
+                                } else {
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `MMFC visual gate requested reroute: ${mmfcResult.reason}`
+                                    ];
+                                }
+                                console.log(`[MMFC VISUAL GATE] Non-final verdict (${mmfcResult.verdict}). Continuing to Qwen visual architect.`);
+                            }
+                        } catch (mmfcErr: any) {
+                            console.warn(`[MMFC VISUAL GATE] Pilot failed, falling back: ${mmfcErr.message}`);
                         }
+                    }
 
-                    } else {
-                        // Fallback: Use legacy System 2 critique loop
-                        console.log('[VISUAL ARCHITECT] Qwen-VL not available (missing proxy/key or Node rasterizer). Using legacy System 2');
+                    if (!mmfcHandled) {
+                        // Check if Qwen-VL Visual Architect is available (DEFAULT)
+                        console.log(`[VISUAL ARCHITECT] Availability: ${qwenAvailable ? 'available' : 'unavailable'}`);
+                        if (qwenAvailable) {
+                            console.log('✨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
 
-                        const system2Result = await runRecursiveVisualCritique(
-                            candidate,
-                            validation,
-                            costTracker,
-                            styleGuide,
-                            progress?.styleMode  // Pass styleMode for style-aware thresholds
-                        );
+                            const architectResult = await runQwenVisualArchitectLoop(
+                                candidate,
+                                styleGuide,
+                                routerConfig,
+                                costTracker,
+                                3 // maxRounds
+                            );
 
-                        // Update candidate with System 2 result
-                        candidate = system2Result.slide;
-                        system2Rounds = system2Result.rounds;
-                        visualRepairSucceeded = system2Result.repairSucceeded;
-                        visualRepairAttempted = system2Result.rounds > 0;
-                        system2Cost = system2Result.system2Cost;
-                        system2InputTokens = system2Result.system2InputTokens;
-                        system2OutputTokens = system2Result.system2OutputTokens;
+                            // Update candidate with Visual Architect result
+                            candidate = architectResult.slide;
+                            system2Rounds += architectResult.rounds;
+                            visualRepairSucceeded = architectResult.converged;
+                            visualRepairAttempted = visualRepairAttempted || architectResult.rounds > 0;
+                            system2Cost += architectResult.totalCost || 0;
+                            system2InputTokens += architectResult.totalInputTokens || 0;
+                            system2OutputTokens += architectResult.totalOutputTokens || 0;
 
-                        // Update validation with final score
-                        candidate.validation = validateSlide(candidate);
-                        lastValidation = candidate.validation;
+                            // Update validation with final score
+                            candidate.validation = validateSlide(candidate);
+                            lastValidation = candidate.validation;
 
-                        console.log(`[GENERATOR] Legacy System 2 complete: ${system2Rounds} rounds, final score: ${system2Result.finalScore}, cost: $${system2Result.system2Cost.toFixed(4)}`);
+                            console.log(`✅ [VISUAL ARCHITECT] Complete: ${system2Rounds} rounds, final score: ${architectResult.finalScore}, converged: ${architectResult.converged}, cost: $${system2Cost.toFixed(4)}`);
 
-                        if (progress?.onProgress) {
-                            progress.onProgress(`Visual critique complete: score ${Math.round(system2Result.finalScore)}`);
+                            if (progress?.onProgress) {
+                                progress.onProgress(`Visual Architect complete: score ${Math.round(architectResult.finalScore)} (${architectResult.converged ? 'converged' : 'not converged'})`);
+                            }
+
+                        } else {
+                            // Fallback: Use legacy System 2 critique loop
+                            console.log('[VISUAL ARCHITECT] Qwen-VL not available (missing proxy/key or Node rasterizer). Using legacy System 2');
+
+                            const system2Result = await runRecursiveVisualCritique(
+                                candidate,
+                                candidate.validation || validateSlide(candidate),
+                                costTracker,
+                                styleGuide,
+                                progress?.styleMode  // Pass styleMode for style-aware thresholds
+                            );
+
+                            // Update candidate with System 2 result
+                            candidate = system2Result.slide;
+                            system2Rounds += system2Result.rounds;
+                            visualRepairSucceeded = system2Result.repairSucceeded;
+                            visualRepairAttempted = visualRepairAttempted || system2Result.rounds > 0;
+                            system2Cost += system2Result.system2Cost;
+                            system2InputTokens += system2Result.system2InputTokens;
+                            system2OutputTokens += system2Result.system2OutputTokens;
+
+                            // Update validation with final score
+                            candidate.validation = validateSlide(candidate);
+                            lastValidation = candidate.validation;
+
+                            console.log(`[GENERATOR] Legacy System 2 complete: ${system2Rounds} rounds, final score: ${system2Result.finalScore}, cost: $${system2Result.system2Cost.toFixed(4)}`);
+
+                            if (progress?.onProgress) {
+                                progress.onProgress(`Visual critique complete: score ${Math.round(system2Result.finalScore)}`);
+                            }
                         }
                     }
 
@@ -2026,7 +2093,7 @@ Expected structure:
             let qwenQaScore: number | null = null;
             let qwenQaVerdict: string | null = null;
             try {
-                const { isQwenVLAvailable, getVisualCritiqueFromSvg } = await import('./visualCortex');
+                const { isQwenVLAvailable, getVisualCritiqueFromSvg, analyzeSlideLayoutSpatialFromSvg } = await import('./visualCortex');
 
                 if (isQwenVLAvailable()) {
                     const svgProxy = await generateSvgProxy(candidate, styleGuide);
@@ -2058,6 +2125,57 @@ Expected structure:
                                 ...(candidate.warnings || []),
                                 `Qwen QA edit hints: ${hints}`
                             ];
+                        }
+
+                        const currentLayoutVariant = String(candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant || 'standard-vertical');
+                        const shouldRunSpatialEscalation = MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(currentLayoutVariant)
+                            && qwenQaVerdict === 'flag_for_review';
+
+                        if (shouldRunSpatialEscalation) {
+                            const spatial = await analyzeSlideLayoutSpatialFromSvg(
+                                svgProxy,
+                                {
+                                    layoutId: currentLayoutVariant,
+                                    elementCount: candidate.layoutPlan?.components?.length || 0,
+                                    expectedTextZones: ['title', 'body', 'metrics'],
+                                    styleMode: progress?.styleMode || 'professional'
+                                },
+                                costTracker
+                            );
+
+                            if (spatial) {
+                                const overflowRisks = (spatial.spatial_analysis?.text_regions || []).filter((r: any) =>
+                                    r?.overflow_risk === 'high' || r?.overflow_risk === 'critical'
+                                );
+                                const denseZones = (spatial.spatial_analysis?.overcrowded_zones || []).filter((z: any) =>
+                                    Number(z?.density_score || 0) >= 0.85
+                                );
+
+                                qwenQaScore = qwenQaScore === null
+                                    ? spatial.overall_score
+                                    : Math.min(qwenQaScore, spatial.overall_score);
+
+                                if (spatial.verdict === 'requires_repair' || overflowRisks.length > 0) {
+                                    qwenQaVerdict = 'requires_repair';
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `Qwen3-VL spatial escalation requires repair (score: ${spatial.overall_score}, overflow regions: ${overflowRisks.length})`
+                                    ];
+                                } else if (spatial.verdict === 'flag_for_review' || denseZones.length > 0) {
+                                    if (qwenQaVerdict !== 'requires_repair') {
+                                        qwenQaVerdict = 'flag_for_review';
+                                    }
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `Qwen3-VL spatial escalation flagged review (score: ${spatial.overall_score}, dense zones: ${denseZones.length})`
+                                    ];
+                                } else {
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `Qwen3-VL spatial escalation accepted (score: ${spatial.overall_score})`
+                                    ];
+                                }
+                            }
                         }
                     } else {
                         console.warn('[QWEN QA] Critique unavailable (proxy/key missing or rasterizer unavailable).');
@@ -2098,7 +2216,8 @@ Expected structure:
 
             console.log(`[CIRCUIT BREAKER] Slide "${candidate.title}": fit_score=${envSnapshot.fit_score.toFixed(2)}, health=${envSnapshot.health_level}, needs_reroute=${envSnapshot.needs_reroute}`);
 
-            const criticalErrors = validation.errors.filter(e =>
+            const currentValidation = candidate.validation || validateSlide(candidate);
+            const criticalErrors = currentValidation.errors.filter(e =>
                 e.code === 'ERR_TEXT_OVERFLOW_CRITICAL' ||
                 e.code === 'ERR_MISSING_VISUALS_CRITICAL' ||
                 e.code === 'ERR_LAYOUT_MISMATCH_CRITICAL' ||
@@ -2106,12 +2225,15 @@ Expected structure:
                 e.code === 'ERR_TOO_MANY_COMPONENTS' ||
                 e.code === 'ERR_ITEM_COUNT_CRITICAL' ||
                 e.code === 'ERR_PLACEHOLDER_METRIC'
-            );
+            ).map(e => ({
+                code: String(e.code || 'UNKNOWN'),
+                message: String(e.message || 'Validation error')
+            }));
 
-            const visualFocusError = validation.errors.find(e => e.code === 'VISUAL_FOCUS_MISSING');
+            const visualFocusError = currentValidation.errors.find(e => e.code === 'VISUAL_FOCUS_MISSING');
             const loopDecision = await evaluateGeneratorLoopDecision({
                 candidate,
-                validation,
+                validation: currentValidation,
                 envSnapshot,
                 attempt,
                 maxRetries: MAX_RETRIES,
@@ -2144,7 +2266,7 @@ Expected structure:
             }
 
             if (loopDecision.verdict === 'accept' || loopDecision.verdict === 'accept_with_warnings') {
-                candidate.validation = validation;
+                candidate.validation = currentValidation;
                 (candidate as any).environmentSnapshot = envSnapshot;
 
                 if (loopDecision.verdict === 'accept_with_warnings' && loopDecision.reason) {
@@ -2169,7 +2291,7 @@ Expected structure:
                 };
             }
 
-            console.warn(`[GENERATOR] Validation failed (attempt ${attempt + 1}):`, validation.errors);
+            console.warn(`[GENERATOR] Validation failed (attempt ${attempt + 1}):`, currentValidation.errors);
             generatorFailures++;
 
         } catch (e: any) {

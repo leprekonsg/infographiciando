@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "qwen:server": "node server/qwen-vl-server.js"
+    "qwen:server": "node server/qwen-vl-server.js",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
     "@google/genai": "^1.30.0",
