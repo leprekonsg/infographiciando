@@ -1777,6 +1777,11 @@ export function renderWithLayeredComposition(
   // --- LAYER 1: DECORATIVE ELEMENTS (z-index 10-19) ---
   if (hasDecorativeRenderer && compositionPlan.layerPlan.decorativeElements?.length > 0) {
     const defaultDecorativeColor = pickHighContrastDecorativeColor(palette);
+    const layoutVariant = String(slide.routerConfig?.layoutVariant || 'standard-vertical');
+    const titleSafeY = estimateDecorativeTitleSafeY(
+      typeof slide.title === 'string' ? slide.title : '',
+      layoutVariant
+    );
     const decorativeContext = {
       palette,
       iconCache,
@@ -1791,7 +1796,10 @@ export function renderWithLayeredComposition(
         if (!normalizedType) return null;
 
         // Map placement strings to actual positions
-        const position = mapPlacementToPosition(el.placement, normalizedType);
+        const position = mapPlacementToPosition(el.placement, normalizedType, {
+          layoutVariant,
+          titleSafeY
+        });
 
         const isBadgeLike = normalizedType === 'badge';
         const badgeLabel = isBadgeLike ? resolveBadgeLabel(slide, el.content) : undefined;
@@ -1998,15 +2006,55 @@ export function renderWithLayeredComposition(
 /**
  * Maps placement strings from composition plan to actual slide coordinates
  */
+interface DecorativePlacementContext {
+  layoutVariant?: string;
+  titleSafeY?: number;
+}
+
+function estimateDecorativeTitleSafeY(
+  slideTitle: string,
+  layoutVariant?: string
+): number {
+  const trimmedTitle = (slideTitle || '').replace(/\s+/g, ' ').trim();
+  if (!trimmedTitle) return 0.14;
+
+  const variant = String(layoutVariant || 'standard-vertical');
+  const zones = LAYOUT_TEMPLATES[variant] || LAYOUT_TEMPLATES['standard-vertical'];
+  const titleZone = zones?.find(z => z.id === 'title' || z.id === 'hero-title');
+  const titleY = typeof titleZone?.y === 'number' ? titleZone.y : 0.5;
+  const titleH = typeof titleZone?.h === 'number' ? titleZone.h : 0.8;
+  const titleW = typeof titleZone?.w === 'number' ? titleZone.w : 9;
+
+  // If title sits lower on the slide (hero-centered), keep top band free for badges.
+  if (titleY >= 0.9) {
+    return 0.14;
+  }
+
+  // Conservative wrapping estimate for large title fonts in PPTX.
+  const charsPerUnitAt14pt = 9.2;
+  const titleFontScale = 14 / DEFAULT_THEME_TOKENS.typography.scale.title;
+  const usableWidth = titleW * 0.84;
+  const maxCharsPerLine = Math.max(18, Math.floor(usableWidth * charsPerUnitAt14pt * titleFontScale));
+  const estimatedLines = Math.max(1, Math.min(4, Math.ceil(trimmedTitle.length / maxCharsPerLine)));
+  if (estimatedLines <= 1) {
+    return 0.14;
+  }
+
+  const expandedTitleBand = titleY + Math.min(titleH + 0.35, 0.42 + ((estimatedLines - 1) * 0.34));
+  // Keep decorative elements outside wrapped title bands plus a small safety margin.
+  return Math.max(0.9, Math.min(1.9, expandedTitleBand + 0.08));
+}
+
 function mapPlacementToPosition(
   placement: string | undefined,
-  elementType: string
+  elementType: string,
+  context?: DecorativePlacementContext
 ): { x: number; y: number; w: number; h: number } {
   // Default positions for different placement strings
   const positions: Record<string, { x: number; y: number; w: number; h: number }> = {
-    'top-left': { x: 0.5, y: 0.18, w: 2.8, h: 0.35 },
-    'top-center': { x: 3.6, y: 0.18, w: 2.8, h: 0.35 },
-    'top-right': { x: 6.7, y: 0.18, w: 2.8, h: 0.35 },
+    'top-left': { x: 0.5, y: 0.14, w: 2.4, h: 0.3 },
+    'top-center': { x: 3.8, y: 0.14, w: 2.4, h: 0.3 },
+    'top-right': { x: 7.0, y: 0.14, w: 2.4, h: 0.3 },
     'below-title': { x: 0.5, y: 1.2, w: 9, h: 0.05 },
     'center': { x: 2, y: 2.5, w: 6, h: 1 },
     'bottom-left': { x: 0.5, y: 5.0, w: 2.5, h: 0.35 },
@@ -2018,11 +2066,57 @@ function mapPlacementToPosition(
     'badge': 'top-left',
     'divider': 'below-title',
     'accent-shape': 'below-title',
-    'glow': 'center'
+    'glow': 'center',
+    'connector': 'below-title'
   };
 
   const normalizedPlacement = (placement || '').toLowerCase().replace(/\s+/g, '-');
   const defaultPlacement = typeDefaults[elementType] || 'top-left';
+  const hasExplicitPlacement = Boolean(normalizedPlacement && positions[normalizedPlacement]);
+  const resolvedPlacement = positions[normalizedPlacement]
+    ? normalizedPlacement
+    : (positions[defaultPlacement] ? defaultPlacement : 'top-left');
+  const base = positions[resolvedPlacement] || positions['top-left'];
+  const adjusted = { ...base };
 
-  return positions[normalizedPlacement] || positions[defaultPlacement] || positions['top-left'];
+  const titleSafeY = typeof context?.titleSafeY === 'number' ? context.titleSafeY : undefined;
+  const isTopBandPlacement = resolvedPlacement === 'top-left' || resolvedPlacement === 'top-center' || resolvedPlacement === 'top-right';
+
+  if (titleSafeY !== undefined) {
+    // Prevent decorative elements from intruding into wrapped title bands.
+    if (resolvedPlacement === 'below-title') {
+      adjusted.y = Math.max(adjusted.y, titleSafeY);
+    }
+
+    if (isTopBandPlacement && elementType === 'badge') {
+      // Keep badges in top-left band and shrink them instead of pushing below title.
+      adjusted.h = Math.min(adjusted.h, titleSafeY >= 0.9 ? 0.24 : 0.28);
+      adjusted.w = Math.min(adjusted.w, titleSafeY >= 0.9 ? 1.9 : 2.3);
+    }
+
+    if (isTopBandPlacement && elementType === 'divider') {
+      // Top-band dividers behave like subtle overlines and should not intersect the badge.
+      adjusted.y = Math.min(adjusted.y, 0.08);
+      adjusted.h = Math.min(adjusted.h, 0.02);
+      adjusted.w = Math.min(adjusted.w, 1.8);
+    }
+
+    if (isTopBandPlacement && elementType === 'connector') {
+      // Keep top-band connectors compact to avoid title/header collisions.
+      adjusted.y = Math.min(adjusted.y, 0.12);
+      adjusted.h = Math.min(adjusted.h, 0.02);
+      adjusted.w = Math.min(adjusted.w, 1.6);
+    }
+
+    if (!hasExplicitPlacement && isTopBandPlacement && (elementType === 'connector' || elementType === 'divider')) {
+      adjusted.y = Math.max(adjusted.y, titleSafeY);
+    }
+  }
+
+  if (elementType === 'connector') {
+    adjusted.h = Math.min(adjusted.h, 0.03);
+    adjusted.w = Math.min(adjusted.w, 2.0);
+  }
+
+  return adjusted;
 }

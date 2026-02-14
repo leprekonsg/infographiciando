@@ -1111,6 +1111,7 @@ ANALYZE:
 2. BODY ZONES: Identify all text blocks, measure their bounding boxes
 3. OVERLAP DETECTION: Check if any text regions overlap
 4. DENSITY ANALYSIS: Calculate elements per zone (0-1 scale where 1 = overcrowded)
+5. TOP BAND COLLISION: Detect decorative badges/icons/lines colliding with title in top 36% of slide
 
 OVERFLOW RISK CLASSIFICATION:
 - "none": Text fits well within container with margins
@@ -1155,6 +1156,7 @@ CRITICAL RULES:
 - If no issues found, return empty arrays for repair_actions
 - Do NOT hallucinate problems - absence of issues is valid
 - Focus on SPATIAL issues, not aesthetic preferences
+- If title overlaps with decorative elements in the top band, verdict MUST be "requires_repair"
 - Ignore compression artifacts from rasterization`;
 }
 
@@ -1915,6 +1917,64 @@ const SLIDE_BUDGET_LIMITS = {
     maxStagnantRounds: 2       // If same issue persists 2 rounds, abort
 };
 
+const VISUAL_ARCHITECT_HIGH_RISK_LAYOUTS = new Set([
+    'bento-grid',
+    'dashboard-tiles',
+    'metrics-rail',
+    'asymmetric-grid'
+]);
+
+interface VisualArchitectLoopOptions {
+    layoutVariant?: string;
+    highRiskLayout?: boolean;
+    titleLength?: number;
+    warningCount?: number;
+}
+
+function resolveVisualArchitectBudget(
+    slide: SlideNode,
+    routerConfig: RouterDecision,
+    maxRounds: number,
+    options?: VisualArchitectLoopOptions
+): typeof SLIDE_BUDGET_LIMITS {
+    const layoutVariant = String(
+        options?.layoutVariant ||
+        slide.routerConfig?.layoutVariant ||
+        routerConfig?.layoutVariant ||
+        ''
+    );
+    const highRiskLayout = Boolean(options?.highRiskLayout) || VISUAL_ARCHITECT_HIGH_RISK_LAYOUTS.has(layoutVariant);
+    const titleLength = Number.isFinite(options?.titleLength as number)
+        ? Number(options?.titleLength)
+        : String(slide.title || '').replace(/\s+/g, ' ').trim().length;
+    const warningCount = Number.isFinite(options?.warningCount as number)
+        ? Number(options?.warningCount)
+        : (Array.isArray(slide.warnings) ? slide.warnings.length : 0);
+
+    let maxTimeMs = SLIDE_BUDGET_LIMITS.maxTimeMs;
+    let maxCostDollars = SLIDE_BUDGET_LIMITS.maxCostDollars;
+
+    if (highRiskLayout) {
+        maxTimeMs += 6_000;
+        maxCostDollars += 0.015;
+    }
+    if (titleLength >= 72) {
+        maxTimeMs += 4_000;
+    }
+    if (warningCount >= 3) {
+        maxTimeMs += 3_000;
+    }
+    if (maxRounds > 3) {
+        maxTimeMs += Math.min(4_000, (maxRounds - 3) * 1_500);
+    }
+
+    return {
+        maxTimeMs: Math.min(30_000, maxTimeMs),
+        maxCostDollars: Math.min(0.09, maxCostDollars),
+        maxStagnantRounds: SLIDE_BUDGET_LIMITS.maxStagnantRounds
+    };
+}
+
 interface BudgetCheckResult {
     exceeded: boolean;
     reason?: 'time' | 'cost' | 'stagnation' | 'none';
@@ -1953,8 +2013,8 @@ function detectStagnation(repairs: RepairAction[][], currentRepairs: RepairActio
  * Generates SVG proxy, critiques with Qwen-VL, applies repairs, repeats until convergence
  * 
  * NEW: Per-slide budget aborts to prevent runaway costs:
- * - Time limit: 15s per slide
- * - Cost limit: $0.05 per slide
+ * - Time limit: adaptive 15-30s per slide based on risk/title/warnings
+ * - Cost limit: adaptive $0.05-$0.09 per slide
  * - Stagnation detection: same issue 2+ rounds → abort and reroute/simplify
  */
 export async function runQwenVisualArchitectLoop(
@@ -1962,11 +2022,16 @@ export async function runQwenVisualArchitectLoop(
     styleGuide: GlobalStyleGuide,
     routerConfig: RouterDecision,
     costTracker: CostTracker,
-    maxRounds: number = 3
+    maxRounds: number = 3,
+    options?: VisualArchitectLoopOptions
 ): Promise<VisualArchitectResult> {
     console.log('✨ [VISUAL ARCHITECT] Starting vision-first critique loop');
 
     const startTime = Date.now();
+    const budgetLimits = resolveVisualArchitectBudget(slide, routerConfig, maxRounds, options);
+    console.log(
+        `[VISUAL ARCHITECT] Budget profile: time=${Math.round(budgetLimits.maxTimeMs / 1000)}s, cost=$${budgetLimits.maxCostDollars.toFixed(3)}`
+    );
     const isBrowser = typeof window !== 'undefined';
     if (isBrowser && !QWEN_VL_PROXY_URL) {
         console.warn('[VISUAL ARCHITECT] Skipping Qwen-VL loop in browser (requires QWEN_VL_PROXY_URL).');
@@ -2034,8 +2099,8 @@ export async function runQwenVisualArchitectLoop(
         const elapsedMs = Date.now() - startTime;
         
         // Check time budget
-        if (elapsedMs > SLIDE_BUDGET_LIMITS.maxTimeMs) {
-            console.warn(`[VISUAL ARCHITECT] ⏱️  TIME BUDGET EXCEEDED (${Math.round(elapsedMs / 1000)}s > ${SLIDE_BUDGET_LIMITS.maxTimeMs / 1000}s). Aborting.`);
+        if (elapsedMs > budgetLimits.maxTimeMs) {
+            console.warn(`[VISUAL ARCHITECT] ⏱️  TIME BUDGET EXCEEDED (${Math.round(elapsedMs / 1000)}s > ${budgetLimits.maxTimeMs / 1000}s). Aborting.`);
             return {
                 slide: currentSlide,
                 rounds: round - 1,
@@ -2050,8 +2115,8 @@ export async function runQwenVisualArchitectLoop(
         }
         
         // Check cost budget
-        if (totalCost > SLIDE_BUDGET_LIMITS.maxCostDollars) {
-            console.warn(`[VISUAL ARCHITECT] 💰 COST BUDGET EXCEEDED ($${totalCost.toFixed(4)} > $${SLIDE_BUDGET_LIMITS.maxCostDollars}). Aborting.`);
+        if (totalCost > budgetLimits.maxCostDollars) {
+            console.warn(`[VISUAL ARCHITECT] 💰 COST BUDGET EXCEEDED ($${totalCost.toFixed(4)} > $${budgetLimits.maxCostDollars}). Aborting.`);
             return {
                 slide: currentSlide,
                 rounds: round - 1,

@@ -278,33 +278,77 @@ export function renderBadge(
     console.warn('[renderBadge] Empty badge content');
     return [];
   }
-  
-  // Improved character width calculation (accounting for letter-spacing)
-  const charWidth = 0.065; // Slightly narrower base
-  const letterSpacingWidth = (contentText.length - 1) * 0.015; // Extra width from spacing
-  const textWidth = (contentText.length * charWidth) + letterSpacingWidth;
-  const iconWidth = badge.icon ? 0.3 : 0;
-  const padding = 0.16;
-  const totalWidth = textWidth + iconWidth + (padding * 2);
-  const height = 0.38;
+
+  const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+  const requestedHeight = typeof badge.position.h === 'number' && badge.position.h > 0 ? badge.position.h : 0.38;
+  const maxAllowedWidth = typeof badge.position.w === 'number' && badge.position.w > 0 ? badge.position.w : 3.6;
+
+  // Allow badges/icons to resize from placement hints instead of hard-coding dimensions.
+  const baseHeight = 0.38;
+  const height = clamp(requestedHeight, 0.24, 0.42);
+  const sizeScale = height / baseHeight;
+  const padding = clamp(0.16 * sizeScale, 0.08, 0.2);
+  const iconSize = clamp(0.22 * sizeScale, 0.14, 0.24);
+  const iconGap = clamp(0.07 * sizeScale, 0.04, 0.1);
+  const iconInsetX = clamp(0.09 * sizeScale, 0.05, 0.12);
+  const textInsetY = clamp(0.08 * sizeScale, 0.04, 0.1);
+  const charWidth = 0.065 * sizeScale;
+  const letterSpacingWidthPerChar = 0.015 * sizeScale;
+
+  const computeTextWidth = (text: string): number => {
+    const length = text.length;
+    if (length === 0) return 0;
+    return (length * charWidth) + (Math.max(0, length - 1) * letterSpacingWidthPerChar);
+  };
+
+  let normalizedText = contentText.toUpperCase();
+  let textWidth = computeTextWidth(normalizedText);
+
+  const iconData = badge.icon ? context.iconCache.get(badge.icon) : undefined;
+  const hasIcon = Boolean(iconData);
+  const iconSlotWidth = hasIcon ? iconSize + iconGap : 0;
+
+  let totalWidth = textWidth + iconSlotWidth + (padding * 2);
+  if (totalWidth > maxAllowedWidth) {
+    const reservedWidth = iconSlotWidth + (padding * 2);
+    const maxTextWidth = Math.max(0.48, maxAllowedWidth - reservedWidth);
+    if (textWidth > maxTextWidth) {
+      const avgCharWidth = Math.max(0.03, charWidth + letterSpacingWidthPerChar);
+      const allowedChars = Math.max(6, Math.floor(maxTextWidth / avgCharWidth));
+      if (normalizedText.length > allowedChars) {
+        const suffix = '...';
+        const headLength = Math.max(3, allowedChars - suffix.length);
+        normalizedText = `${normalizedText.slice(0, headLength).trimEnd()}${suffix}`;
+      }
+      textWidth = computeTextWidth(normalizedText);
+    }
+    totalWidth = Math.min(maxAllowedWidth, textWidth + reservedWidth);
+  }
+
+  const textBoxWidth = Math.max(0.35, totalWidth - iconSlotWidth - (padding * 2) + 0.06);
+  const textBoxHeight = Math.max(0.12, height - clamp(0.14 * sizeScale, 0.08, 0.18));
+  const fontSize = Math.round(clamp(BADGE_TYPOGRAPHY.fontSize * sizeScale, 8, 12));
+  const letterSpacing = clamp(BADGE_TYPOGRAPHY.letterSpacing * sizeScale, 0.6, 2.0);
   
   // Get premium style config with safe lookup
   const styleConfig = BADGE_PREMIUM_STYLES[style] || BADGE_PREMIUM_STYLES['pill'];
+  const radius = clamp(styleConfig.radius * sizeScale, 0.08, 0.5);
+  const borderWidth = clamp(styleConfig.borderWidth * sizeScale, 0.5, 1.4);
   
   // 0. Premium: Subtle glow behind badge (rendered first, lowest z-index)
   if (styleConfig.hasGlow) {
     elements.push({
       type: 'shape',
       shapeType: 'roundRect',
-      x: badge.position.x - 0.03,
-      y: badge.position.y - 0.02,
-      w: totalWidth + 0.06,
-      h: height + 0.04,
+      x: badge.position.x - (0.03 * sizeScale),
+      y: badge.position.y - (0.02 * sizeScale),
+      w: totalWidth + (0.06 * sizeScale),
+      h: height + (0.04 * sizeScale),
       fill: {
         color: normalizeColor(color),
         alpha: styleConfig.glowAlpha
       },
-      rectRadius: styleConfig.radius + 0.1,
+      rectRadius: clamp(radius + 0.1, 0.1, 0.6),
       zIndex: context.baseZIndex - 1
     });
   }
@@ -323,47 +367,43 @@ export function renderBadge(
     },
     border: {
       color: normalizeColor(color),
-      width: styleConfig.borderWidth,
+      width: borderWidth,
       alpha: styleConfig.borderAlpha
     },
-    rectRadius: styleConfig.radius,
+    rectRadius: radius,
     zIndex: context.baseZIndex
   });
   
   // 2. Icon (if present)
   let textX = badge.position.x + padding;
   
-  if (badge.icon) {
-    const iconData = context.iconCache.get(badge.icon);
-    if (iconData) {
-      const iconSize = 0.22;
-      elements.push({
-        type: 'image',
-        data: iconData,
-        x: badge.position.x + 0.09,
-        y: badge.position.y + (height - iconSize) / 2,
-        w: iconSize,
-        h: iconSize,
-        zIndex: context.baseZIndex + 1
-      });
-      textX += iconWidth;
-    }
+  if (hasIcon && iconData) {
+    elements.push({
+      type: 'image',
+      data: iconData,
+      x: badge.position.x + iconInsetX,
+      y: badge.position.y + (height - iconSize) / 2,
+      w: iconSize,
+      h: iconSize,
+      zIndex: context.baseZIndex + 1
+    });
+    textX += iconSlotWidth;
   }
   
   // 3. Text with premium letter-spacing
   elements.push({
     type: 'text',
-    content: contentText.toUpperCase(),
+    content: normalizedText,
     x: textX,
-    y: badge.position.y + 0.08,
-    w: textWidth + 0.1,
-    h: height - 0.14,
-    fontSize: BADGE_TYPOGRAPHY.fontSize,
+    y: badge.position.y + textInsetY,
+    w: textBoxWidth,
+    h: textBoxHeight,
+    fontSize,
     color: normalizeColor(textColor),
     bold: true,
     align: 'left',
     zIndex: context.baseZIndex + 2,
-    letterSpacing: BADGE_TYPOGRAPHY.letterSpacing,
+    letterSpacing,
     fontWeight: BADGE_TYPOGRAPHY.fontWeight,
     textTransform: 'uppercase'
   });

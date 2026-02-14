@@ -167,6 +167,7 @@ TASKS:
 2) Classify overflow risk: none | low | high | critical
 3) Detect overcrowded zones with density score 0-1
 4) Propose minimal repair actions
+5) Detect title collisions with decorative badges/icons/lines in top 36% of slide
 
 COORDINATE RULE:
 - You may reason in 0-1000 internally.
@@ -201,6 +202,9 @@ OUTPUT STRICT JSON:
   ],
   "verdict": "accept" | "flag_for_review" | "requires_repair"
 }
+
+CRITICAL RULE:
+- If title overlaps with decorative elements in top band, verdict must be "requires_repair".
 
 Return JSON only.`;
 }

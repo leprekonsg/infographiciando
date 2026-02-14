@@ -359,6 +359,66 @@ function sanitizeSlideText(value: string, maxLen = 160): string {
     return text;
 }
 
+function parseNormalizedYFromTargetRegion(targetRegion: string): number | null {
+    const match = targetRegion.match(/(?:^|,)\s*y:\s*([0-9]*\.?[0-9]+)/i);
+    if (!match) return null;
+    const raw = Number(match[1]);
+    if (!Number.isFinite(raw)) return null;
+    return raw > 1 ? raw / 1000 : raw;
+}
+
+function detectQwenTopBandCollision(qaCritique: any): { detected: boolean; reason?: string } {
+    if (!qaCritique || typeof qaCritique !== 'object') {
+        return { detected: false };
+    }
+
+    const issueList = Array.isArray(qaCritique.issues) ? qaCritique.issues : [];
+    const issueHit = issueList.find((issue: any) => {
+        const severity = String(issue?.severity || '').toLowerCase();
+        const category = String(issue?.category || '').toLowerCase();
+        const yRaw = Number(issue?.location?.y);
+        const y = Number.isFinite(yRaw) ? (yRaw > 1 ? yRaw / 1000 : yRaw) : null;
+        const topBandByLocation = y !== null && y <= 0.36;
+        const issueText = `${issue?.description || ''} ${issue?.suggested_fix || ''}`.toLowerCase();
+        const hasCollisionLanguage = /overlap|collid|intersect|crowd|occlud|obstruct|cover/.test(issueText);
+        const hasTopBandLanguage = /top[-\s]?(left|center|right|band)|header|badge|icon|divider|line|overline/.test(issueText);
+        const mentionsTitle = /\btitle\b/.test(issueText);
+        const isRelevantCategory = category === 'text_overlap' || category === 'alignment' || category === 'density';
+        const isSerious = severity === 'critical' || severity === 'warning';
+        const hasReliableTopBandSignal = topBandByLocation || hasTopBandLanguage;
+        return isSerious
+            && isRelevantCategory
+            && hasCollisionLanguage
+            && (hasReliableTopBandSignal || (mentionsTitle && topBandByLocation));
+    });
+
+    if (issueHit) {
+        const category = String(issueHit.category || 'visual');
+        return { detected: true, reason: `Qwen issue ${category} in top/title band` };
+    }
+
+    const editList = Array.isArray(qaCritique.edit_instructions) ? qaCritique.edit_instructions : [];
+    const editHit = editList.find((instruction: any) => {
+        const targetRegion = String(instruction?.target_region || '').toLowerCase();
+        const detail = `${instruction?.detail || ''} ${instruction?.action || ''}`.toLowerCase();
+        const topBandTarget =
+            /top-left|top-center|top-right|header|badge|icon|overline/.test(targetRegion) ||
+            (() => {
+                const y = parseNormalizedYFromTargetRegion(targetRegion);
+                return y !== null && y <= 0.36;
+            })();
+        const overlapLanguage = /overlap|collid|intersect|crowd|occlud|obstruct|cover/.test(detail);
+        const decorativeLanguage = /badge|icon|divider|line|decorative|label|overline/.test(`${targetRegion} ${detail}`);
+        return topBandTarget && overlapLanguage && decorativeLanguage;
+    });
+
+    if (editHit) {
+        return { detected: true, reason: `Qwen edit hint indicates top-band collision (${String(editHit.target_region || 'region')})` };
+    }
+
+    return { detected: false };
+}
+
 function applySpatialPreflightAdjustments(
     slide: SlideNode,
     styleGuide: GlobalStyleGuide
@@ -1053,6 +1113,15 @@ async function evaluateGeneratorLoopDecision(
                 });
             }
 
+            if (env.qwenQaVerdict === 'flag_for_review' && fitScore < 0.85) {
+                issues.push({
+                    code: 'generator_qwen_flag_review_low_fit',
+                    severity: fitScore < 0.75 ? 'critical' : 'major',
+                    category: 'visual',
+                    message: `Qwen QA flagged review with low fit score ${fitScore.toFixed(2)}`
+                });
+            }
+
             if (env.visualFocusError) {
                 issues.push({
                     code: 'generator_visual_focus_missing',
@@ -1112,6 +1181,12 @@ async function evaluateGeneratorLoopDecision(
                 state = {
                     verdict: 'reroute',
                     reason: `Qwen QA requires repair (score: ${env.qwenQaScore ?? 'n/a'})`,
+                    reasonType: GeneratorFailureReason.QwenQaFailed
+                };
+            } else if (env.qwenQaVerdict === 'flag_for_review' && atMaxRetry && fitScore < 0.85) {
+                state = {
+                    verdict: 'reroute',
+                    reason: `Qwen QA flagged review and fit score remained low (${fitScore.toFixed(2)})`,
                     reasonType: GeneratorFailureReason.QwenQaFailed
                 };
             } else if (env.visualFocusError && atMaxRetry) {
@@ -1711,15 +1786,14 @@ Expected structure:
             const currentLayout = candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant;
             const requiredTypes = LAYOUT_REQUIREMENTS[currentLayout];
             
-            // Only run this check if we're still on a metric-dependent layout
-            // (early precondition check may have already rerouted)
-            if (requiredTypes && candidate.layoutPlan?.components) {
+            if (candidate.layoutPlan?.components) {
                 const componentTypes = candidate.layoutPlan.components.map((c: any) => c.type);
-                const hasRequiredType = requiredTypes.some(rt => componentTypes.includes(rt));
+                const hasRequiredType = !requiredTypes || requiredTypes.some(rt => componentTypes.includes(rt));
                 
                 // Also check component count for layouts that need 2+ components
                 const LAYOUT_MIN_COMPONENTS: Record<string, number> = {
                     'metrics-rail': 2,
+                    'asymmetric-grid': 3,
                     // Split layouts can render acceptably with a single component
                     // when sparse content is intentionally chosen.
                     'split-left-text': 1,
@@ -1727,12 +1801,20 @@ Expected structure:
                 };
                 const minRequired = LAYOUT_MIN_COMPONENTS[currentLayout];
                 const hasEnoughComponents = !minRequired || candidate.layoutPlan.components.length >= minRequired;
+
+                // Asymmetric grid needs component diversity. Text-only payloads tend to
+                // produce "floating bullets" and poor hierarchy in the side panels.
+                const isAsymmetricGrid = currentLayout === 'asymmetric-grid';
+                const allTextBullets = componentTypes.length > 0 && componentTypes.every((t: string) => t === 'text-bullets');
+                const degradedAsymmetricGrid = isAsymmetricGrid && allTextBullets;
                 
-                if (!hasRequiredType || !hasEnoughComponents) {
+                if (!hasRequiredType || !hasEnoughComponents || degradedAsymmetricGrid) {
                     // Layout requires specific components that are missing - reroute to standard-vertical
-                    const reason = !hasRequiredType 
-                        ? `${currentLayout} requires ${requiredTypes.join(' or ')}` 
-                        : `${currentLayout} requires at least ${minRequired} components`;
+                    const reason = degradedAsymmetricGrid
+                        ? 'asymmetric-grid degraded to text-only components'
+                        : !hasRequiredType
+                            ? `${currentLayout} requires ${requiredTypes.join(' or ')}`
+                            : `${currentLayout} requires at least ${minRequired} components`;
                     
                     // Avoid duplicate warnings if early precondition already added one
                     const alreadyWarned = (candidate.warnings || []).some(w => 
@@ -2013,12 +2095,20 @@ Expected structure:
                         if (qwenAvailable) {
                             console.log('✨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
 
+                            const visualArchitectOptions = {
+                                layoutVariant,
+                                highRiskLayout: MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(layoutVariant),
+                                titleLength: String(candidate.title || '').length,
+                                warningCount: (candidate.warnings || []).length
+                            };
+
                             const architectResult = await runQwenVisualArchitectLoop(
                                 candidate,
                                 styleGuide,
                                 routerConfig,
                                 costTracker,
-                                3 // maxRounds
+                                3, // maxRounds
+                                visualArchitectOptions
                             );
 
                             // Update candidate with Visual Architect result
@@ -2092,6 +2182,7 @@ Expected structure:
             // --- QWEN VISUAL QA (always inspect slide if available) ---
             let qwenQaScore: number | null = null;
             let qwenQaVerdict: string | null = null;
+            let qwenTopBandCollisionDetected = false;
             try {
                 const { isQwenVLAvailable, getVisualCritiqueFromSvg, analyzeSlideLayoutSpatialFromSvg } = await import('./visualCortex');
 
@@ -2103,6 +2194,8 @@ Expected structure:
                         console.log(`[QWEN QA] Score=${qaCritique.overall_score}, Verdict=${qaCritique.overall_verdict}, Fidelity=${qaCritique.renderFidelity}`);
                         qwenQaScore = qaCritique.overall_score ?? null;
                         qwenQaVerdict = qaCritique.overall_verdict ?? null;
+                        const topBandCollision = detectQwenTopBandCollision(qaCritique);
+                        qwenTopBandCollisionDetected = topBandCollision.detected;
 
                         if (qaCritique.overall_verdict === 'requires_repair') {
                             candidate.warnings = [
@@ -2113,6 +2206,14 @@ Expected structure:
                             candidate.warnings = [
                                 ...(candidate.warnings || []),
                                 `Qwen QA flagged for review (score: ${qaCritique.overall_score})`
+                            ];
+                        }
+
+                        if (topBandCollision.detected) {
+                            qwenQaVerdict = 'requires_repair';
+                            candidate.warnings = [
+                                ...(candidate.warnings || []),
+                                `Qwen QA escalated to repair due to top-band/title collision risk (${topBandCollision.reason || 'overlap signal'})`
                             ];
                         }
 
@@ -2128,8 +2229,10 @@ Expected structure:
                         }
 
                         const currentLayoutVariant = String(candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant || 'standard-vertical');
-                        const shouldRunSpatialEscalation = MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(currentLayoutVariant)
-                            && qwenQaVerdict === 'flag_for_review';
+                        const hasLongTitle = String(candidate.title || '').replace(/\s+/g, ' ').trim().length >= 72;
+                        const shouldRunSpatialEscalation =
+                            (MMFC_VISUAL_HIGH_RISK_LAYOUTS.has(currentLayoutVariant) || hasLongTitle || qwenTopBandCollisionDetected)
+                            && (qwenQaVerdict === 'flag_for_review' || qwenTopBandCollisionDetected);
 
                         if (shouldRunSpatialEscalation) {
                             const spatial = await analyzeSlideLayoutSpatialFromSvg(
@@ -2147,6 +2250,14 @@ Expected structure:
                                 const overflowRisks = (spatial.spatial_analysis?.text_regions || []).filter((r: any) =>
                                     r?.overflow_risk === 'high' || r?.overflow_risk === 'critical'
                                 );
+                                const titleBandRisks = (spatial.spatial_analysis?.text_regions || []).filter((r: any) => {
+                                    const bbox = Array.isArray(r?.bbox) ? r.bbox : [];
+                                    const y0 = Number(bbox[1]);
+                                    const topBand = Number.isFinite(y0) && y0 <= 0.36;
+                                    const overflow = r?.overflow_risk === 'high' || r?.overflow_risk === 'critical';
+                                    const textHint = /title|ai landscape|adoption|scaling/i.test(String(r?.text || ''));
+                                    return overflow && (topBand || textHint);
+                                });
                                 const denseZones = (spatial.spatial_analysis?.overcrowded_zones || []).filter((z: any) =>
                                     Number(z?.density_score || 0) >= 0.85
                                 );
@@ -2155,11 +2266,12 @@ Expected structure:
                                     ? spatial.overall_score
                                     : Math.min(qwenQaScore, spatial.overall_score);
 
-                                if (spatial.verdict === 'requires_repair' || overflowRisks.length > 0) {
+                                const forceRepairFromTopBand = qwenTopBandCollisionDetected && spatial.verdict !== 'accept';
+                                if (spatial.verdict === 'requires_repair' || overflowRisks.length > 0 || titleBandRisks.length > 0 || forceRepairFromTopBand) {
                                     qwenQaVerdict = 'requires_repair';
                                     candidate.warnings = [
                                         ...(candidate.warnings || []),
-                                        `Qwen3-VL spatial escalation requires repair (score: ${spatial.overall_score}, overflow regions: ${overflowRisks.length})`
+                                        `Qwen3-VL spatial escalation requires repair (score: ${spatial.overall_score}, overflow regions: ${overflowRisks.length}, title-band risks: ${titleBandRisks.length})`
                                     ];
                                 } else if (spatial.verdict === 'flag_for_review' || denseZones.length > 0) {
                                     if (qwenQaVerdict !== 'requires_repair') {
