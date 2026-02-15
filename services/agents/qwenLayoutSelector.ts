@@ -145,7 +145,7 @@ function buildMockComponentsFromContentPlan(
 
 /**
  * Check if dataPoints are valid for metric-cards rendering.
- * CRITICAL: Must match canUseMetricCards() in slideAgentService.ts exactly!
+ * CRITICAL: Must stay aligned with canUseMetricCards() semantics in slideAgentService.ts.
  * Requires at least 2 dataPoints with BOTH value AND label (not either/or).
  * 
  * Previously this used lenient "hasValue || hasLabel" which caused Qwen to
@@ -153,23 +153,47 @@ function buildMockComponentsFromContentPlan(
  */
 function hasValidMetricData(dataPoints: any[]): boolean {
     if (!Array.isArray(dataPoints) || dataPoints.length < 2) return false;
-    
-    // Count how many dataPoints have BOTH value AND label (strict validation)
-    // This must match canUseMetricCards() to prevent layout/generator mismatch
-    const validCount = dataPoints.filter((dp: any) => {
-        if (!dp || typeof dp !== 'object') return false;
-        
-        // Must have a label that's a non-empty string
-        const hasLabel = typeof dp.label === 'string' && dp.label.trim().length > 0;
-        
-        // Must have a value that's defined, non-null, and non-empty when stringified
-        const hasValue = dp.value !== undefined && 
-                         dp.value !== null && 
-                         String(dp.value).trim().length > 0;
-        
-        return hasLabel && hasValue; // STRICT: require BOTH
-    }).length;
-    
+
+    const hasExplicitUnitToken = (value: string): boolean => {
+        if (!value) return false;
+        return /[%$]|\b(?:sec|min|hr|hrs|day|days|week|weeks|month|months|year|years|yr|yrs|x)\b/i.test(value);
+    };
+
+    const isPlaceholderLikeLabel = (label: string): boolean => {
+        const normalized = String(label || '').toLowerCase().trim();
+        return !normalized ||
+            /^(?:metric|kpi|value|label|stat|data point)\s*\d*$/.test(normalized) ||
+            /^(?:n\/?a|tbd|coming soon|placeholder|unknown)$/i.test(normalized);
+    };
+
+    const isLowSignalLabel = (label: string): boolean => {
+        const normalized = String(label || '').toLowerCase().trim();
+        return /^(metric|kpi|score|index|rating|value)\s*\d*$/.test(normalized) ||
+            /\b(utility|importance|effectiveness|readiness|maturity|contribution)\b/.test(normalized);
+    };
+
+    const extractNumeric = (text: string): string => {
+        if (typeof text !== 'string') return '';
+        const m = text.match(/\$?\d[\d,.]*(?:\.\d+)?%?/);
+        return m ? m[0].trim() : '';
+    };
+
+    const normalizePoint = (dp: any): { label: string; value: string } | null => {
+        if (!dp || typeof dp !== 'object') return null;
+        const label = String(dp.label ?? dp.name ?? dp.title ?? '').trim();
+        let value = String(dp.value ?? dp.amount ?? dp.metric ?? dp.score ?? '').trim();
+        if (!value) {
+            const textFallback = String(dp.claim ?? dp.text ?? dp.description ?? '').trim();
+            value = extractNumeric(textFallback);
+        }
+        if (!label || !value) return null;
+        if (!/\d/.test(value)) return null;
+        if (isPlaceholderLikeLabel(label)) return null;
+        if (isLowSignalLabel(label) && !hasExplicitUnitToken(value)) return null;
+        return { label, value };
+    };
+
+    const validCount = dataPoints.filter((dp: any) => !!normalizePoint(dp)).length;
     return validCount >= 2;
 }
 
@@ -187,12 +211,16 @@ function pickCandidateLayoutVariants(
     // CRITICAL: Check DATA QUALITY not just quantity for metric-dependent layouts
     const canUseMetrics = hasValidMetricData(dataPoints);
 
-    if (slideMeta?.type === SLIDE_TYPES.TITLE || slideMeta?.order === 1) {
+    const slideType = String(slideMeta?.type || '').toLowerCase();
+    const isTitleLike = slideType.includes('title') || slideType.includes('section-header') || slideMeta?.order === 1;
+    if (isTitleLike) {
         variants.add('hero-centered');
+        variants.add('standard-vertical');
+        variants.add('split-left-text');
     }
 
     // Only suggest metric-heavy layouts if we have VALID metric data
-    if (canUseMetrics && dataPoints.length >= 3) {
+    if (canUseMetrics && dataPoints.length >= 3 && keyPoints.length >= 2 && !isTitleLike) {
         variants.add('bento-grid');
         variants.add('dashboard-tiles');
     }
@@ -238,7 +266,17 @@ function pickCandidateLayoutVariants(
     }
 
     const filtered = Array.from(variants).filter(v => !avoid.has(v));
-    return filtered.slice(0, 3);
+
+    const titlePriority: LayoutVariant[] = ['hero-centered', 'split-left-text', 'standard-vertical', 'split-right-text', 'asymmetric-grid', 'metrics-rail', 'dashboard-tiles', 'bento-grid', 'timeline-horizontal'];
+    const sparsePriority: LayoutVariant[] = ['standard-vertical', 'split-left-text', 'hero-centered', 'split-right-text', 'asymmetric-grid', 'metrics-rail', 'dashboard-tiles', 'bento-grid', 'timeline-horizontal'];
+    const defaultPriority: LayoutVariant[] = ['standard-vertical', 'split-left-text', 'split-right-text', 'asymmetric-grid', 'hero-centered', 'metrics-rail', 'dashboard-tiles', 'bento-grid', 'timeline-horizontal'];
+    const priority = isTitleLike ? titlePriority : (keyPoints.length <= 1 ? sparsePriority : defaultPriority);
+    const rank = (variant: LayoutVariant): number => {
+        const idx = priority.indexOf(variant);
+        return idx >= 0 ? idx : priority.length + 1;
+    };
+
+    return filtered.sort((a, b) => rank(a) - rank(b)).slice(0, 3);
 }
 
 export async function runQwenLayoutSelector(
@@ -265,6 +303,18 @@ export async function runQwenLayoutSelector(
 
     let bestVariant = baseRouterConfig.layoutVariant;
     let bestScore = -1;
+    let bestTieRank = Number.POSITIVE_INFINITY;
+    const titleLen = String(contentPlan?.title || slideMeta?.title || '').replace(/\s+/g, ' ').trim().length;
+    const keyPoints = Array.isArray(contentPlan?.keyPoints) ? contentPlan.keyPoints : [];
+    const runSlideType = String(slideMeta?.type || '').toLowerCase();
+    const isTitleLike = runSlideType.includes('title') || runSlideType.includes('section-header') || slideMeta?.order === 1;
+    const tieBreakPriority: LayoutVariant[] = isTitleLike
+        ? ['hero-centered', 'split-left-text', 'standard-vertical', 'split-right-text', 'asymmetric-grid', 'metrics-rail', 'dashboard-tiles', 'bento-grid', 'timeline-horizontal']
+        : ['standard-vertical', 'split-left-text', 'hero-centered', 'split-right-text', 'asymmetric-grid', 'metrics-rail', 'dashboard-tiles', 'bento-grid', 'timeline-horizontal'];
+    const tieRank = (variant: LayoutVariant): number => {
+        const idx = tieBreakPriority.indexOf(variant);
+        return idx >= 0 ? idx : tieBreakPriority.length + 1;
+    };
 
     for (const variant of candidateVariants) {
         const components = Array.isArray(componentsOverride) && componentsOverride.length > 0
@@ -303,6 +353,17 @@ export async function runQwenLayoutSelector(
             if (fastScore && typeof fastScore.overall_score === 'number') {
                 score = fastScore.overall_score;
                 console.log(`[QWEN LAYOUT SELECTOR] Fast score for ${variant}: ${score} (issue: ${fastScore.primary_issue || 'none'})`);
+                if (fastScore.primary_issue === 'sparse') {
+                    if (variant === 'hero-centered' && titleLen >= 42) {
+                        score = Math.max(0, score - 8);
+                    }
+                    if ((variant === 'bento-grid' || variant === 'dashboard-tiles') && keyPoints.length <= 1) {
+                        score = Math.max(0, score - 10);
+                    }
+                    if (variant === 'standard-vertical' && keyPoints.length <= 1) {
+                        score = Math.min(100, score + 4);
+                    }
+                }
             } else {
                 // Fallback to full critique
                 const critique = await getVisualCritiqueFromSvg(svgProxy, costTracker);
@@ -321,9 +382,11 @@ export async function runQwenLayoutSelector(
 
             console.log(`[QWEN LAYOUT SELECTOR] Variant ${variant} final score: ${score}`);
 
-            if (score > bestScore) {
+            const variantTieRank = tieRank(variant);
+            if (score > bestScore || (score === bestScore && variantTieRank < bestTieRank)) {
                 bestScore = score;
                 bestVariant = variant;
+                bestTieRank = variantTieRank;
             }
         } catch (err: any) {
             console.warn(`[QWEN LAYOUT SELECTOR] Failed to score variant ${variant}: ${err.message}`);
@@ -341,3 +404,4 @@ export async function runQwenLayoutSelector(
 
     return baseRouterConfig;
 }
+

@@ -250,7 +250,7 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
     title: 70,
     bullet: 120,
     metricValue: 10,
-    metricLabel: 20,
+    metricLabel: 28,
     stepTitle: 15,
     stepDescription: 70,
     iconLabel: 20,
@@ -577,7 +577,16 @@ const PLACEHOLDER_PATTERNS = [
  */
 function isPlaceholderContent(text: string): boolean {
   const trimmed = text.trim();
-  if (!trimmed || trimmed.length < 3) return true;
+  if (!trimmed) return true;
+
+  // Numeric metric values like "50", "78%", "$12.4M" are valid content, not placeholders.
+  if (/^\$?\d[\d,]*(\.\d+)?%?$/.test(trimmed)) return false;
+
+  // Keep short placeholder tokens blocked while allowing concise real values.
+  if (trimmed.length < 3) {
+    return /^(?:-|--|na|n\/a|tbd)$/i.test(trimmed);
+  }
+
   return PLACEHOLDER_PATTERNS.some(pattern => pattern.test(trimmed));
 }
 

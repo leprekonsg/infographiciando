@@ -26,6 +26,12 @@ const resolveReadableTextColor = (backgroundHex: string, fallbackTextHex: string
   return hasContrast ? fallbackTextHex : preferred;
 };
 
+const resolveMutedTextColor = (backgroundHex: string): string => {
+  const yiq = getYiq(backgroundHex);
+  // Keep body/secondary text readable across dark/light themes.
+  return yiq > 180 ? '334155' : 'CBD5E1';
+};
+
 const BADGE_LABEL_STOPWORDS = new Set([
   'a', 'an', 'and', 'for', 'from', 'in', 'into', 'is', 'of', 'on', 'or', 'the', 'to', 'with',
   'slide', 'slides', 'theme', 'contextual', 'anchor', 'badge', 'label'
@@ -602,7 +608,8 @@ export class SpatialLayoutEngine {
         variant === 'split-right-text' ||
         variant === 'metrics-rail' ||
         variant === 'dashboard-tiles' ||
-        variant === 'asymmetric-grid';
+        variant === 'asymmetric-grid' ||
+        variant === 'hero-centered';
       if (shouldAutoClear) {
         const titleFontSize = titleZoneTemplate.id === 'hero-title'
           ? themeTokens.typography.scale.hero
@@ -614,7 +621,9 @@ export class SpatialLayoutEngine {
           effectiveStyleGuide.fontFamilyTitle
         );
         if (estimatedTitleLines > 1) {
-          titleClearanceShift = Math.min(0.9, (estimatedTitleLines - 1) * 0.42);
+          const shiftFactor = variant === 'hero-centered' ? 0.52 : 0.42;
+          const maxShift = variant === 'hero-centered' ? 1.2 : 0.9;
+          titleClearanceShift = Math.min(maxShift, (estimatedTitleLines - 1) * shiftFactor);
         }
       }
     }
@@ -658,7 +667,8 @@ export class SpatialLayoutEngine {
           zone.id === 'content-top' ||
           zone.id === 'content-bottom' ||
           zone.id === 'text-main' ||
-          zone.id === 'main'
+          zone.id === 'main' ||
+          zone.id === 'hero-content'
         ) {
           effectiveZone.y += titleClearanceShift;
           effectiveZone.h = Math.max(0.7, effectiveZone.h - titleClearanceShift);
@@ -688,9 +698,33 @@ export class SpatialLayoutEngine {
       }
 
       if (allocated.type === 'title') {
-        const fontSize = effectiveZone.purpose === 'hero'
+        let fontSize = effectiveZone.purpose === 'hero'
           ? (variant === 'hero-centered' ? themeTokens.typography.scale.hero : themeTokens.typography.scale.title)
           : themeTokens.typography.scale.subtitle;
+
+        // Long hero titles frequently wrap into 3+ lines; downscale proactively to preserve body separation.
+        if (variant === 'hero-centered' && typeof allocated.content === 'string') {
+          const titleText = allocated.content.replace(/\s+/g, ' ').trim();
+          let estimatedLines = this.estimateWrappedLineCount(
+            [titleText],
+            effectiveZone.w,
+            fontSize,
+            effectiveStyleGuide.fontFamilyTitle
+          );
+          if (estimatedLines >= 3 || titleText.length >= 46) {
+            fontSize = Math.max(themeTokens.typography.scale.title, fontSize - 8);
+            estimatedLines = this.estimateWrappedLineCount(
+              [titleText],
+              effectiveZone.w,
+              fontSize,
+              effectiveStyleGuide.fontFamilyTitle
+            );
+            if (estimatedLines >= 3) {
+              fontSize = Math.max(30, fontSize - 4);
+            }
+            this.addWarning(`Hero title scaled down for long heading (${titleText.length} chars)`);
+          }
+        }
         elements.push({
           type: 'text',
           content: allocated.content,
@@ -1119,7 +1153,22 @@ export class SpatialLayoutEngine {
         if (m.icon) {
           const iconUrl = getIconUrl(m.icon);
           if (iconUrl) {
-            els.push({ type: 'image', data: iconUrl, x: cardX + spacing.sm, y: cardY + spacing.sm, w: 0.5, h: 0.5, zIndex: 11 });
+            const hintedIconScale = typeof (m as any)?._hintIconSize === 'number'
+              ? Math.max(0.2, Math.min(0.6, Number((m as any)._hintIconSize)))
+              : 0.22;
+            const iconSize = Math.max(
+              0.18,
+              Math.min(0.42, Math.min(cardW, cardH) * hintedIconScale)
+            );
+            els.push({
+              type: 'image',
+              data: iconUrl,
+              x: cardX + spacing.sm,
+              y: cardY + spacing.sm,
+              w: iconSize,
+              h: iconSize,
+              zIndex: 11
+            });
           }
         }
 
@@ -1755,7 +1804,7 @@ export function renderWithLayeredComposition(
     ),
     background: baseBackground,
     text: contrastText,
-    textMuted: normalizeColor(styleGuide?.colorPalette?.text, 'A1A1AA')
+    textMuted: resolveMutedTextColor(baseBackground)
   };
 
   const iconCache = new Map<string, string>();
@@ -1950,12 +1999,14 @@ export function renderWithLayeredComposition(
           id: `content-card-${idx}`,
           position: { x: cardX, y: cardY, w: cardWidth, h: cardH },
           style: contentStructure.cardStyle || 'glass',
+          _hintIconSize: typeof (comp as any)?._hintIconSize === 'number' ? (comp as any)._hintIconSize : undefined,
           header: {
             icon,
             iconContainer: 'circle' as const,
             iconColor: isNarrativeFlow ? iconColor : palette.primary,
             overline: isNarrativeFlow ? overline : undefined,
-            title
+            title,
+            _hintIconSize: typeof (comp as any)?._hintIconSize === 'number' ? (comp as any)._hintIconSize : undefined
           },
           body,
           emphasis: idx === 0 ? 'primary' as const : 'secondary' as const
@@ -2072,10 +2123,12 @@ function mapPlacementToPosition(
 
   const normalizedPlacement = (placement || '').toLowerCase().replace(/\s+/g, '-');
   const defaultPlacement = typeDefaults[elementType] || 'top-left';
-  const hasExplicitPlacement = Boolean(normalizedPlacement && positions[normalizedPlacement]);
-  const resolvedPlacement = positions[normalizedPlacement]
+  let resolvedPlacement = positions[normalizedPlacement]
     ? normalizedPlacement
     : (positions[defaultPlacement] ? defaultPlacement : 'top-left');
+  if (elementType === 'badge' && resolvedPlacement === 'below-title') {
+    resolvedPlacement = 'top-left';
+  }
   const base = positions[resolvedPlacement] || positions['top-left'];
   const adjusted = { ...base };
 
@@ -2091,14 +2144,15 @@ function mapPlacementToPosition(
     if (isTopBandPlacement && elementType === 'badge') {
       // Keep badges in top-left band and shrink them instead of pushing below title.
       adjusted.h = Math.min(adjusted.h, titleSafeY >= 0.9 ? 0.24 : 0.28);
-      adjusted.w = Math.min(adjusted.w, titleSafeY >= 0.9 ? 1.9 : 2.3);
+      adjusted.w = Math.min(adjusted.w, titleSafeY >= 0.9 ? 2.2 : 2.3);
     }
 
     if (isTopBandPlacement && elementType === 'divider') {
-      // Top-band dividers behave like subtle overlines and should not intersect the badge.
-      adjusted.y = Math.min(adjusted.y, 0.08);
+      // Keep divider away from top-left badge/icon by centering overline in top band.
+      adjusted.x = 3.0;
+      adjusted.y = 0.08;
       adjusted.h = Math.min(adjusted.h, 0.02);
-      adjusted.w = Math.min(adjusted.w, 1.8);
+      adjusted.w = 3.4;
     }
 
     if (isTopBandPlacement && elementType === 'connector') {
@@ -2108,8 +2162,9 @@ function mapPlacementToPosition(
       adjusted.w = Math.min(adjusted.w, 1.6);
     }
 
-    if (!hasExplicitPlacement && isTopBandPlacement && (elementType === 'connector' || elementType === 'divider')) {
-      adjusted.y = Math.max(adjusted.y, titleSafeY);
+    if (isTopBandPlacement && elementType === 'badge') {
+      // Never push badges below the title band; shrink instead.
+      adjusted.y = Math.min(adjusted.y, 0.16);
     }
   }
 

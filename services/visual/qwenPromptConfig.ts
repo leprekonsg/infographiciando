@@ -232,6 +232,7 @@ COMPONENT ID REFERENCE (use ONLY IDs from ComponentManifest comment):
 - For slide title positioning, use "title" (not a numbered component)
 - For divider/accent bar positioning, use "divider" (not a numbered component)
 - DO NOT use render-order IDs like "text-0", "shape-1" - use component IDs only
+- DO NOT use sub-element IDs like "metric-cards-1-2" - always target the base component ID
 
 VALID COMPONENT TYPES:
 - "text-bullets-N" for bullet point lists

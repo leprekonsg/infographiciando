@@ -75,7 +75,13 @@ IMPORTANT:
 - Output ONLY valid JSON`;
 }
 
-function buildRepairPrompt() {
+function buildRepairPrompt(components = []) {
+  const manifest = Array.isArray(components)
+    ? components
+      .map((c, idx) => `${String(c?.type || '').toLowerCase()}-${idx}`)
+      .filter(Boolean)
+      .join(', ')
+    : '';
   return `ANALYZE this slide for visual quality and output STRUCTURED REPAIRS.
 
 ANALYZE FOR:
@@ -94,6 +100,8 @@ Format: "{component-type}-{index}" mapping directly to layoutPlan.components[ind
 - "chart-frame-0" maps to layoutPlan.components[0] (if type is chart-frame)
 - For slide title/divider elements: use "title" or "divider" (not numbered)
 DO NOT use legacy IDs like "text-title-0" or "shape-card-0" - these are internal only.
+DO NOT use sub-element IDs like "metric-cards-1-2" - target the base component ID only.
+AVAILABLE COMPONENT IDs: ${manifest || 'none'}
 
 OUTPUT JSON:
 {
@@ -113,7 +121,7 @@ OUTPUT JSON:
 ACTION PARAM SCHEMAS (MUST include numeric values):
 - reposition: { "x": <0-1 normalized>, "y": <0-1 normalized> }
 - resize: { "width": <0-1 fraction of slide>, "height": <0-1 fraction> }
-- adjust_spacing: { "lineHeight": <1.2-2.0>, "padding": <0.01-0.1 normalized> }
+- adjust_spacing: { "lineHeight": <1.2-1.5>, "padding": <0.01-0.1 normalized> }
 - adjust_color: { "color": "#XXXXXX" }
 - simplify_content: { "removeCount": <1-3> }
 
@@ -122,7 +130,7 @@ CRITICAL RULES:
 2. All coordinates/sizes normalized 0-1 (x=0 is left, y=0 is top)
 3. Title optimal y position: 0.08-0.15
 4. Bullets optimal y position: 0.25-0.40
-5. Line height 1.6-1.8 for readability
+5. Line height 1.2-1.5 only (never above 1.5)
 6. Output ONLY valid JSON`;
 }
 
@@ -331,7 +339,7 @@ app.post('/api/qwen/critique', async (req, res) => {
 
 app.post('/api/qwen/critique-repairs', async (req, res) => {
   try {
-    const { svgString, imageBase64, slideWidth = 1920, slideHeight = 1080 } = req.body || {};
+    const { svgString, imageBase64, components = [], slideWidth = 1920, slideHeight = 1080 } = req.body || {};
 
     let base64 = imageBase64;
     if (!base64 && svgString) {
@@ -344,7 +352,7 @@ app.post('/api/qwen/critique-repairs', async (req, res) => {
 
     const { responseText, usage } = await callQwenVL({
       imageBase64: base64,
-      prompt: buildRepairPrompt()
+      prompt: buildRepairPrompt(components)
     });
 
     const result = parseJsonResponse(responseText);

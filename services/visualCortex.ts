@@ -1556,7 +1556,7 @@ function parseComponentId(componentId: string): {
     const indexStr = parts[parts.length - 1];
     const hasNumericIndex = /^\d+$/.test(indexStr);
     
-    const index = hasNumericIndex ? parseInt(indexStr) : 0;
+    const index = hasNumericIndex ? parseInt(indexStr) : -1;
     const type = hasNumericIndex ? parts.slice(0, -1).join('-') : normalized;
     
     // Legacy ID patterns that map to title/divider
@@ -1623,6 +1623,63 @@ function findComponentByFlexibleMatch(
     
     console.warn(`[REPAIR] No component found for ${type}-${index}`);
     return null;
+}
+
+/**
+ * Normalize Qwen repair targets to the current component manifest IDs.
+ * This prevents sub-element IDs from mapping to the wrong component index.
+ */
+function normalizeRepairTargetsToManifest(
+    repairs: RepairAction[],
+    components: any[]
+): RepairAction[] {
+    if (!Array.isArray(repairs) || repairs.length === 0) return [];
+    if (!Array.isArray(components) || components.length === 0) return [];
+
+    const manifest = components.map((c, idx) => ({
+        id: `${String(c?.type || 'component').toLowerCase()}-${idx}`,
+        type: String(c?.type || '').toLowerCase()
+    }));
+
+    return repairs.flatMap((repair) => {
+        const rawId = String(repair.component_id || '').trim().toLowerCase();
+        if (!rawId) return [];
+
+        if (rawId === 'title' || rawId === 'heading') {
+            return [{ ...repair, component_id: 'title' }];
+        }
+        if (rawId === 'divider' || rawId === 'accent-bar' || rawId === 'line') {
+            return [{ ...repair, component_id: 'divider' }];
+        }
+
+        const prefixed = manifest.find(m => rawId === m.id || rawId.startsWith(`${m.id}-`));
+        if (prefixed) {
+            if (repair.component_id !== prefixed.id) {
+                console.log(`[REPAIR] Normalized target "${repair.component_id}" -> "${prefixed.id}"`);
+            }
+            return [{ ...repair, component_id: prefixed.id }];
+        }
+
+        const parsed = parseComponentId(rawId);
+        if (parsed.index >= 0 && parsed.index < manifest.length) {
+            const byIndex = manifest[parsed.index];
+            if (repair.component_id !== byIndex.id) {
+                console.log(`[REPAIR] Rebound target "${repair.component_id}" -> "${byIndex.id}" (index fallback)`);
+            }
+            return [{ ...repair, component_id: byIndex.id }];
+        }
+
+        const byType = manifest.find(m => m.type === parsed.type);
+        if (byType) {
+            if (repair.component_id !== byType.id) {
+                console.log(`[REPAIR] Rebound target "${repair.component_id}" -> "${byType.id}" (type fallback)`);
+            }
+            return [{ ...repair, component_id: byType.id }];
+        }
+
+        console.warn(`[REPAIR] Dropping repair with unknown target "${repair.component_id}"`);
+        return [];
+    });
 }
 
 /**
@@ -1749,6 +1806,15 @@ function applyRepairsToSlide(
                 // Add resize hints that spatial renderer can use
                 if (params?.width !== undefined) (component as any)._hintWidth = params.width;
                 if (params?.height !== undefined) (component as any)._hintHeight = params.height;
+                if ((component.type === 'metric-cards' || component.type === 'icon-grid') &&
+                    (params?.width !== undefined || params?.height !== undefined)) {
+                    const rawIconHint = params?.height !== undefined ? Number(params.height) : Number(params?.width);
+                    if (Number.isFinite(rawIconHint)) {
+                        const iconHint = Math.max(0.2, Math.min(0.6, rawIconHint));
+                        (component as any)._hintIconSize = iconHint;
+                        console.log(`[REPAIR] Setting icon size hint on ${component_id}: ${iconHint.toFixed(2)}`);
+                    }
+                }
                 appliedCount++;
                 break;
 
@@ -1912,7 +1978,7 @@ function applyRepairsToSlide(
 // ============================================================================
 // Prevents runaway VL costs on problematic slides
 const SLIDE_BUDGET_LIMITS = {
-    maxTimeMs: 15_000,         // 15 seconds max per slide
+    maxTimeMs: 18_000,         // 18 seconds base max per slide
     maxCostDollars: 0.05,      // $0.05 max per slide (roughly 25K tokens at VL rates)
     maxStagnantRounds: 2       // If same issue persists 2 rounds, abort
 };
@@ -1955,7 +2021,7 @@ function resolveVisualArchitectBudget(
     let maxCostDollars = SLIDE_BUDGET_LIMITS.maxCostDollars;
 
     if (highRiskLayout) {
-        maxTimeMs += 6_000;
+        maxTimeMs += 8_000;
         maxCostDollars += 0.015;
     }
     if (titleLength >= 72) {
@@ -1969,7 +2035,7 @@ function resolveVisualArchitectBudget(
     }
 
     return {
-        maxTimeMs: Math.min(30_000, maxTimeMs),
+        maxTimeMs: Math.min(32_000, maxTimeMs),
         maxCostDollars: Math.min(0.09, maxCostDollars),
         maxStagnantRounds: SLIDE_BUDGET_LIMITS.maxStagnantRounds
     };
@@ -2054,6 +2120,7 @@ export async function runQwenVisualArchitectLoop(
     let allRepairs: RepairAction[] = [];
     let repairHistory: RepairAction[][] = []; // Track repairs per round for stagnation detection
     let previousScore = 0;
+    let stagnantScoreRounds = 0;
     let previousSvgHash = ''; // Track SVG hash to detect ineffective repairs
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
@@ -2192,9 +2259,9 @@ export async function runQwenVisualArchitectLoop(
             const rawRepairs = critiqueResult.repairs || [];
             const verdict = critiqueResult.verdict || 'flag_for_review';
             
-            // CRITICAL: Normalize repairs to ensure params have numeric values
-            // Extracts values from reason text when Qwen-VL doesn't provide them in params
-            const repairs = normalizeRepairs(rawRepairs);
+            // CRITICAL: Normalize repair params and align targets with manifest IDs.
+            const normalizedRepairs = normalizeRepairs(rawRepairs);
+            const repairs = normalizeRepairTargetsToManifest(normalizedRepairs, components);
 
             console.log(`[VISUAL ARCHITECT] Score: ${currentScore}/100, Verdict: ${verdict}, Repairs: ${repairs.length}`);
             
@@ -2240,28 +2307,17 @@ export async function runQwenVisualArchitectLoop(
                 };
             }
 
-            // Check for improvement
-            if (round > 1 && currentScore <= previousScore + MIN_IMPROVEMENT_DELTA) {
-                console.warn(`[VISUAL ARCHITECT] No improvement detected (${previousScore} → ${currentScore}), exiting early`);
-                // FIX: Return best slide if current is worse (rollback to best state)
-                const returnSlide = bestScore > currentScore ? bestSlide : currentSlide;
-                const returnScore = bestScore > currentScore ? bestScore : currentScore;
-                const returnRepairs = bestScore > currentScore ? bestRepairs : allRepairs;
-                if (bestScore > currentScore) {
-                    console.log(`[VISUAL ARCHITECT] ↩️ Rolling back to best score: ${bestScore} (current: ${currentScore})`);
+            // Soft convergence signal: low score movement alone should not force an early exit.
+            let lowImprovement = false;
+            if (round > 1) {
+                lowImprovement = currentScore <= previousScore + MIN_IMPROVEMENT_DELTA;
+                if (lowImprovement) {
+                    stagnantScoreRounds += 1;
+                    console.warn(`[VISUAL ARCHITECT] Low score movement (${previousScore} -> ${currentScore}), stagnant rounds=${stagnantScoreRounds}/${budgetLimits.maxStagnantRounds}`);
+                } else {
+                    stagnantScoreRounds = 0;
                 }
-                return {
-                    slide: returnSlide,
-                    rounds: round,
-                    finalScore: returnScore,
-                    repairs: returnRepairs,
-                    converged: false,
-                    totalCost,
-                    totalInputTokens,
-                    totalOutputTokens
-                };
             }
-
             // Step 4: Apply repairs (with error reflection - filter problematic repairs)
             if (repairs.length > 0) {
                 // ============================================================================
@@ -2350,6 +2406,25 @@ export async function runQwenVisualArchitectLoop(
                     allRepairs = [...allRepairs, ...filteredRepairs];
                 } else {
                     console.warn('[VISUAL ARCHITECT] All repairs filtered out - keeping current state');
+                    if (lowImprovement && stagnantScoreRounds >= budgetLimits.maxStagnantRounds) {
+                        const returnSlide = bestScore > currentScore ? bestSlide : currentSlide;
+                        const returnScore = bestScore > currentScore ? bestScore : currentScore;
+                        const returnRepairs = bestScore > currentScore ? bestRepairs : allRepairs;
+                        if (bestScore > currentScore) {
+                            console.log(`[VISUAL ARCHITECT] Rolling back to best score: ${bestScore} (current: ${currentScore})`);
+                        }
+                        return {
+                            slide: returnSlide,
+                            rounds: round,
+                            finalScore: returnScore,
+                            repairs: returnRepairs,
+                            converged: false,
+                            totalCost,
+                            totalInputTokens,
+                            totalOutputTokens,
+                            warning: 'No actionable repairs and score stagnated'
+                        };
+                    }
                 }
             } else {
                 console.warn('[VISUAL ARCHITECT] No repairs suggested, exiting');

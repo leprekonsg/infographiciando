@@ -85,6 +85,7 @@ const MMFC_VISUAL_HIGH_RISK_LAYOUTS = new Set([
     'metrics-rail',
     'asymmetric-grid'
 ]);
+const BOX_HEAVY_COMPOSITION_PATTERNS = new Set(['card-row', 'card-grid', 'metrics-rail']);
 
 // --- AGENT DATA CONTRACT UTILITIES ---
 
@@ -197,16 +198,254 @@ function validateComponentType(rawType: string | undefined): string {
  * Returns true if dataPoints are sufficient for metric-cards.
  */
 function canUseMetricCards(dataPoints: any[] | undefined): boolean {
-    if (!dataPoints || !Array.isArray(dataPoints)) return false;
-    const validPoints = dataPoints.filter(d => 
-        d && 
-        typeof d.label === 'string' && 
-        d.label.trim().length > 0 &&
-        d.value !== undefined &&
-        d.value !== null &&
-        String(d.value).trim().length > 0
-    );
+    if (!Array.isArray(dataPoints)) return false;
+    const validPoints = dataPoints
+        .map((d, idx) => normalizeMetricDataPoint(d, idx))
+        .filter((d): d is { value: string; label: string; icon: string } => !!d);
     return validPoints.length >= 2;
+}
+
+function normalizeMetricValue(value: unknown): string {
+    if (value === undefined || value === null) return '';
+    return String(value).replace(/\s+/g, ' ').trim().slice(0, 24);
+}
+
+function isPlaceholderLikeMetricToken(value: unknown): boolean {
+    const token = String(value ?? '').replace(/\s+/g, ' ').trim();
+    if (!token) return true;
+    if (/^(?:n\/?a|tbd|coming soon|placeholder|no data available)$/i.test(token)) return true;
+    if (/^(?:metric|kpi|value|label|stat|data point)\s*\d*$/i.test(token)) return true;
+    return false;
+}
+
+function extractFirstNumericToken(text: string): string {
+    if (typeof text !== 'string') return '';
+    const match = text.match(/\$?\d[\d,.]*(?:\.\d+)?%?/);
+    return match ? match[0].trim() : '';
+}
+
+function inferMetricUnitHint(
+    label: string,
+    contexts: string[]
+): '%' | '$' | 'sec' | 'min' | 'hrs' | 'days' | 'wks' | 'mos' | 'yrs' | 'x' | undefined {
+    const corpus = [label, ...contexts].join(' ').toLowerCase();
+    if (!corpus.trim()) return undefined;
+    if (/%|\bpercent(age)?\b|\bpct\b|\brate\b/.test(corpus)) return '%';
+    if (/\$|\busd\b|\bdollar(s)?\b|\brevenue\b|\bcost\b|\bspend\b|\bbudget\b|\broi\b|\bprofit\b/.test(corpus)) return '$';
+    if (/\bsecond(s)?\b|\bsec\b/.test(corpus)) return 'sec';
+    if (/\bminute(s)?\b|\bmin\b/.test(corpus)) return 'min';
+    if (/\bhour(s)?\b|\bhr(s)?\b/.test(corpus)) return 'hrs';
+    if (/\bday(s)?\b/.test(corpus)) return 'days';
+    if (/\bweek(s)?\b/.test(corpus)) return 'wks';
+    if (/\bmonth(s)?\b/.test(corpus)) return 'mos';
+    if (/\byear(s)?\b|\byr(s)?\b|\bannual\b/.test(corpus)) return 'yrs';
+    if (/\bx\b|\bfold\b|\btimes\b/.test(corpus)) return 'x';
+    return undefined;
+}
+
+function hasExplicitUnitToken(value: string): boolean {
+    if (!value) return false;
+    return /[%$]|\b(?:sec|min|hr|hrs|day|days|week|weeks|month|months|year|years|yr|yrs|x)\b/i.test(value);
+}
+
+function formatMetricValueWithUnit(valueRaw: unknown, unitHint: ReturnType<typeof inferMetricUnitHint>): string {
+    const normalized = normalizeMetricValue(valueRaw);
+    if (!normalized) return '';
+    if (hasExplicitUnitToken(normalized) || /[a-zA-Z]/.test(normalized)) return normalized;
+    if (!unitHint) return normalized;
+    if (unitHint === '%') return `${normalized}%`;
+    if (unitHint === '$') return `$${normalized}`;
+    if (unitHint === 'x') return `${normalized}x`;
+    return `${normalized} ${unitHint}`;
+}
+
+function isAbstractMetricLabel(label: string): boolean {
+    const tokens = String(label || '')
+        .toLowerCase()
+        .replace(/[^\w\s]/g, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+    if (tokens.length === 0) return true;
+
+    const abstractTokens = new Set([
+        'utility', 'importance', 'score', 'index', 'rating', 'contribution',
+        'effectiveness', 'readiness', 'maturity', 'impact', 'priority'
+    ]);
+    const concreteTokens = new Set([
+        'time', 'window', 'seconds', 'sec', 'minutes', 'min', 'hours', 'hrs',
+        'days', 'weeks', 'months', 'years', 'adoption', 'roi', 'revenue',
+        'cost', 'lead', 'retention', 'completion', 'latency', 'throughput',
+        'error', 'quality', 'savings', 'users', 'customers', 'conversion'
+    ]);
+
+    const hasAbstract = tokens.some(t => abstractTokens.has(t));
+    const hasConcrete = tokens.some(t => concreteTokens.has(t));
+    return hasAbstract && !hasConcrete;
+}
+
+function normalizeMetricDataPoint(
+    dataPoint: any,
+    index: number
+): { value: string; label: string; icon: string } | null {
+    if (!dataPoint || typeof dataPoint !== 'object') return null;
+
+    const labelCandidates = [
+        dataPoint.label,
+        dataPoint.name,
+        dataPoint.title,
+        dataPoint.metricName,
+        dataPoint.kpi,
+        dataPoint.category
+    ];
+    const valueCandidates = [
+        dataPoint.value,
+        dataPoint.amount,
+        dataPoint.metric,
+        dataPoint.score,
+        dataPoint.percent,
+        dataPoint.percentage,
+        dataPoint.rate
+    ];
+    const textCandidates = [
+        dataPoint.claim,
+        dataPoint.text,
+        dataPoint.description,
+        dataPoint.summary
+    ];
+
+    let label = labelCandidates
+        .find((v: any) => typeof v === 'string' && v.trim().length > 0);
+    let valueRaw = valueCandidates.find((v: any) =>
+        v !== undefined && v !== null && String(v).trim().length > 0
+    );
+
+    if (!valueRaw) {
+        const textFallback = textCandidates.find((v: any) => typeof v === 'string' && v.trim().length > 0);
+        if (typeof textFallback === 'string') {
+            valueRaw = extractFirstNumericToken(textFallback);
+        }
+    }
+
+    if (!label) {
+        const labelTextSource = textCandidates.find((v: any) => typeof v === 'string' && v.trim().length > 0);
+        if (typeof labelTextSource === 'string') {
+            label = labelTextSource
+                .replace(/[$€£]?\d[\d,.]*(?:\.\d+)?%?/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .split(' ')
+                .slice(0, 5)
+                .join(' ');
+        }
+    }
+
+    const contextTexts = textCandidates
+        .filter((v: any): v is string => typeof v === 'string' && v.trim().length > 0)
+        .map(v => v.trim());
+    const normalizedLabel = typeof label === 'string' ? label.replace(/\s+/g, ' ').trim().slice(0, 36) : '';
+    const unitHint = inferMetricUnitHint(normalizedLabel, contextTexts);
+    const value = formatMetricValueWithUnit(valueRaw, unitHint);
+    if (!normalizedLabel || !value) return null;
+    if (!/\d/.test(value)) return null;
+    if (isPlaceholderLikeMetricToken(normalizedLabel) || isPlaceholderLikeMetricToken(value)) return null;
+    if (isAbstractMetricLabel(normalizedLabel) && !hasExplicitUnitToken(value)) return null;
+
+    return {
+        value,
+        label: normalizedLabel,
+        icon: inferMetricIcon(normalizedLabel, index)
+    };
+}
+
+function inferMetricIcon(label: string, index: number): string {
+    const text = String(label || '').toLowerCase();
+    if (/roi|return|revenue|cost|spend|budget|financial/.test(text)) return 'DollarSign';
+    if (/%|percent|rate|ratio|growth|adoption|increase|decrease/.test(text)) return 'TrendingUp';
+    if (/user|customer|employee|team|organization|enterprise/.test(text)) return 'Users';
+    if (/time|speed|latency|efficiency|cycle/.test(text)) return 'Gauge';
+    if (/risk|quality|error|defect|failure/.test(text)) return 'Shield';
+    const fallbackIcons = ['BarChart3', 'TrendingUp', 'Target'];
+    return fallbackIcons[index % fallbackIcons.length];
+}
+
+function synthesizeMetricsFromDataPoints(
+    dataPoints: any[] | undefined,
+    maxItems = 3
+): Array<{ value: string; label: string; icon: string }> {
+    if (!Array.isArray(dataPoints)) return [];
+    const normalized = dataPoints
+        .map((d, idx) => normalizeMetricDataPoint(d, idx))
+        .filter((d): d is { value: string; label: string; icon: string } => !!d);
+
+    return normalized.slice(0, Math.max(2, Math.min(maxItems, 4)));
+}
+
+function isOpeningNarrativeSlide(slideMeta: any, slideIndex: number): boolean {
+    const type = String(slideMeta?.type || '').toLowerCase();
+    if (slideIndex === 0) return true;
+    if (type === 'title-slide' || type === 'section-header') return true;
+    return false;
+}
+
+function sanitizeOpeningContentPlan(plan: ContentPlanResult): ContentPlanResult {
+    const keyPoints = Array.isArray(plan?.keyPoints)
+        ? plan.keyPoints
+            .map(k => sanitizeSlideText(String(k || ''), 80))
+            .filter(k => !!k)
+            .slice(0, 2)
+        : [];
+
+    return {
+        ...plan,
+        keyPoints,
+        dataPoints: []
+    };
+}
+
+function enforceOpeningCompositionPrinciples(
+    plan: CompositionPlan | undefined,
+    context: {
+        openingNarrative: boolean;
+        layoutVariant?: string;
+    }
+): CompositionPlan | undefined {
+    if (!plan || !context.openingNarrative) return plan;
+
+    const variant = String(context.layoutVariant || '').toLowerCase();
+    const pattern = (variant === 'split-left-text' || variant === 'split-right-text')
+        ? 'split-content'
+        : 'single-hero';
+
+    const decorative = Array.isArray(plan.layerPlan?.decorativeElements)
+        ? plan.layerPlan.decorativeElements
+            .filter((el: any) => ['badge', 'glow', 'accent-shape'].includes(String(el?.type || '').toLowerCase()))
+            .slice(0, 1)
+        : [];
+
+    const surprises = Array.isArray(plan.serendipityPlan?.allocatedSurprises)
+        ? plan.serendipityPlan.allocatedSurprises.slice(0, 1).map((s: any) => ({
+            ...s,
+            intensity: 'subtle' as const
+        }))
+        : [];
+
+    return {
+        ...plan,
+        layerPlan: {
+            ...plan.layerPlan,
+            decorativeElements: decorative,
+            contentStructure: {
+                ...plan.layerPlan.contentStructure,
+                pattern,
+                cardCount: pattern === 'single-hero' ? 0 : undefined
+            }
+        },
+        serendipityPlan: {
+            ...plan.serendipityPlan,
+            allocatedSurprises: surprises
+        },
+        reasoning: `${plan.reasoning || ''} [opening-principles-enforced:${pattern}]`.trim()
+    };
 }
 
 const hashStringToUnit = (input: string): number => {
@@ -241,6 +480,50 @@ const buildStyleHints = (
     styleDNA: styleGuide?.styleDNA,
     variationBudget: clamp01(variationBudget)
 });
+
+function rebalanceCompositionPatternForDeck(
+    plan: CompositionPlan | undefined,
+    recentPatterns: string[],
+    context: {
+        layoutVariant?: string;
+        hasValidMetricData: boolean;
+        slideIndex: number;
+        totalSlides: number;
+    }
+): CompositionPlan | undefined {
+    if (!plan?.layerPlan?.contentStructure?.pattern) return plan;
+    const pattern = String(plan.layerPlan.contentStructure.pattern);
+    if (!BOX_HEAVY_COMPOSITION_PATTERNS.has(pattern)) return plan;
+
+    const recent = recentPatterns.slice(-2);
+    const recentBoxHeavyCount = recent.filter(p => BOX_HEAVY_COMPOSITION_PATTERNS.has(p)).length;
+    const repeatedPattern = recent.filter(p => p === pattern).length;
+    const introOrClose = context.slideIndex === 0 || context.slideIndex >= context.totalSlides - 1;
+
+    // Allow more freedom on intro/outro slides; constrain repeated card-heavy runs in body slides.
+    if (introOrClose) return plan;
+    if (recentBoxHeavyCount < 2 && repeatedPattern === 0) return plan;
+
+    const fallbackPattern = context.hasValidMetricData && context.layoutVariant === 'metrics-rail'
+        ? 'metrics-rail'
+        : 'split-content';
+
+    if (fallbackPattern === pattern) return plan;
+
+    console.log(`[ORCHESTRATOR] Rebalancing composition pattern: ${pattern} -> ${fallbackPattern} (reduce repeated box-heavy slides)`);
+    return {
+        ...plan,
+        layerPlan: {
+            ...plan.layerPlan,
+            contentStructure: {
+                ...plan.layerPlan.contentStructure,
+                pattern: fallbackPattern,
+                cardCount: undefined
+            }
+        },
+        reasoning: `${plan.reasoning || ''} [pattern-rebalanced:${pattern}->${fallbackPattern}]`.trim()
+    };
+}
 
 // Deterministic visual focus enforcement for visual design spec
 function enforceVisualFocusInSpec(
@@ -417,6 +700,65 @@ function detectQwenTopBandCollision(qaCritique: any): { detected: boolean; reaso
     }
 
     return { detected: false };
+}
+
+function applySpatialEscalationRepairHints(
+    slide: SlideNode,
+    spatial: any
+): number {
+    if (!slide?.layoutPlan || !Array.isArray(spatial?.repair_actions)) return 0;
+
+    const normalize01 = (raw: any): number | undefined => {
+        const num = Number(raw);
+        if (!Number.isFinite(num)) return undefined;
+        const normalized = num > 1 ? num / 1000 : num;
+        if (normalized < 0 || normalized > 1) return undefined;
+        return normalized;
+    };
+
+    const toSlideY = (normalizedY: number): number => Math.max(0.2, Math.min(5.0, normalizedY * 5.625));
+    const plan: any = slide.layoutPlan;
+    let applied = 0;
+
+    for (const rawAction of spatial.repair_actions) {
+        const target = String(rawAction?.target || '').toLowerCase();
+        const action = String(rawAction?.action || '').toLowerCase();
+        const params = rawAction?.parameters || {};
+
+        if (target === 'title' || target.includes('title')) {
+            const yNorm = normalize01(params.y ?? params.top ?? params.y0);
+            if (yNorm !== undefined && (action === 'reposition' || action === 'reflow' || action === 'resize')) {
+                plan._titleMarginTop = toSlideY(yNorm);
+                applied++;
+            }
+            if (action === 'reduce_font') {
+                const currentHeight = typeof plan._titleHeight === 'number' ? plan._titleHeight : 1;
+                plan._titleHeight = Math.max(0.7, Math.min(1.2, currentHeight * 0.9));
+                applied++;
+            }
+            continue;
+        }
+
+        if (target === 'divider' || target.includes('divider') || target.includes('line')) {
+            const yNorm = normalize01(params.y ?? params.top ?? params.y0);
+            if (yNorm !== undefined) {
+                plan._dividerY = toSlideY(yNorm);
+                applied++;
+            }
+            const widthNorm = normalize01(params.width);
+            if (widthNorm !== undefined) {
+                plan._dividerWidth = Math.max(0.12, Math.min(0.35, widthNorm));
+                applied++;
+            }
+            const heightNorm = normalize01(params.height);
+            if (heightNorm !== undefined) {
+                plan._dividerHeight = Math.max(0.005, Math.min(0.03, heightNorm));
+                applied++;
+            }
+        }
+    }
+
+    return applied;
 }
 
 function applySpatialPreflightAdjustments(
@@ -1438,12 +1780,13 @@ async function runGenerator(
             let metricExample: string;
             if (hasValidDataPoints) {
                 // Extract valid dataPoints with proper fallbacks
-                const validDps = safeContentPlan.dataPoints
-                    .filter((d: any) => d && (d.value !== undefined || d.label))
+                const normalizedMetrics = (safeContentPlan.dataPoints || [])
+                    .map((dp: any, i: number) => normalizeMetricDataPoint(dp, i))
+                    .filter((dp: any) => !!dp)
                     .slice(0, 3);
-                const metricsJson = validDps.map((dp: any, i: number) => {
-                    const value = String(dp.value ?? dp.amount ?? dp.metric ?? 'N/A').slice(0, 15);
-                    const label = String(dp.label ?? dp.name ?? `Metric ${i+1}`).slice(0, 25);
+                const metricsJson = normalizedMetrics.map((dp: any, i: number) => {
+                    const value = String(dp.value || 'N/A').slice(0, 15);
+                    const label = String(dp.label || `Metric ${i + 1}`).slice(0, 25);
                     const icon = dp.icon ?? ['TrendingUp', 'Activity', 'BarChart'][i % 3];
                     return `{"value":"${value}","label":"${label}","icon":"${icon}"}`;
                 }).join(',');
@@ -1698,9 +2041,33 @@ Expected structure:
                 candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
                     // METRIC-CARDS: Check both precondition AND actual array content
                     if (c.type === 'metric-cards') {
-                        const hasMetricsArray = Array.isArray(c.metrics) && c.metrics.length >= 2;
+                        const normalizedGeneratedMetrics = Array.isArray(c.metrics)
+                            ? c.metrics
+                                .map((m: any, idx: number) => normalizeMetricDataPoint(m, idx))
+                                .filter((m: any) => !!m)
+                                .slice(0, 4)
+                            : [];
+                        const hasMetricsArray = normalizedGeneratedMetrics.length >= 2;
+                        if (hasMetricsArray) {
+                            return {
+                                ...c,
+                                metrics: normalizedGeneratedMetrics
+                            };
+                        }
+                        if (!hasMetricsArray && hasEnoughDataPoints) {
+                            const synthesized = synthesizeMetricsFromDataPoints(safeContentPlan.dataPoints, 3);
+                            if (synthesized.length >= 2) {
+                                console.log(`[GENERATOR] Recovered metric-cards from contentPlan.dataPoints (${synthesized.length} metrics)`);
+                                return {
+                                    ...c,
+                                    type: 'metric-cards',
+                                    metrics: synthesized
+                                };
+                            }
+                        }
+
                         if (!hasEnoughDataPoints || !hasMetricsArray) {
-                            console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${c.metrics?.length || 0}) → text-bullets`);
+                            console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${Array.isArray(c.metrics) ? c.metrics.length : 0}) → text-bullets`);
                             return {
                                 type: 'text-bullets',
                                 ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
@@ -2247,6 +2614,13 @@ Expected structure:
                             );
 
                             if (spatial) {
+                                const appliedSpatialHints = applySpatialEscalationRepairHints(candidate, spatial);
+                                if (appliedSpatialHints > 0) {
+                                    candidate.warnings = [
+                                        ...(candidate.warnings || []),
+                                        `Applied ${appliedSpatialHints} Qwen3-VL spatial hint(s) to title/divider before final validation`
+                                    ];
+                                }
                                 const overflowRisks = (spatial.spatial_analysis?.text_regions || []).filter((r: any) =>
                                     r?.overflow_risk === 'high' || r?.overflow_risk === 'critical'
                                 );
@@ -2686,6 +3060,7 @@ export const generateAgenticDeck = async (
 
     // --- SERENDIPITY STATE (Layer-based composition) ---
     let usedSurprisesInDeck: string[] = []; // Track used surprise types to avoid repetition
+    let recentCompositionPatterns: string[] = []; // Track recent composition patterns to avoid box-heavy repetition
     let serendipityDNA: SerendipityDNA | undefined;
 
     // --- RELIABILITY METRICS ---
@@ -2848,8 +3223,14 @@ export const generateAgenticDeck = async (
             // FIX: Ensure minimal floor for bullets and chars to prevent "Content Too Sparse" loops
             // Even hero slides need at least 2 bullets and 60 chars to avoid empty component arrays
             const densityHint: ContentDensityHint = {
-                maxBullets: Math.max(2, isHeroOrIntro ? Math.min(2, styleAdjustedBullets) : styleAdjustedBullets),
-                maxCharsPerBullet: Math.max(60, isHeroOrIntro ? Math.min(50, layoutBudget.maxCharsPerBullet) : layoutBudget.maxCharsPerBullet),
+                // Intro/hero slides can legitimately carry just one concise bullet.
+                maxBullets: isHeroOrIntro
+                    ? Math.max(1, Math.min(2, styleAdjustedBullets))
+                    : Math.max(2, styleAdjustedBullets),
+                // Keep intro bullets concise; previous floor forced 60 chars and increased overlap risk.
+                maxCharsPerBullet: isHeroOrIntro
+                    ? Math.max(35, Math.min(50, layoutBudget.maxCharsPerBullet))
+                    : Math.max(50, layoutBudget.maxCharsPerBullet),
                 maxDataPoints: layoutVariant === 'bento-grid' ? 4 : 3
             };
 
@@ -2871,8 +3252,15 @@ export const generateAgenticDeck = async (
             // We still validate with ensureValidContentPlan for defense-in-depth
             const rawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, densityHint, styleAwareHint);
             const safeContentPlan: ContentPlanResult = ensureValidContentPlan(rawContentPlan, slideMeta);
+            const openingNarrative = isOpeningNarrativeSlide(slideMeta, i);
+            const routedContentPlan: ContentPlanResult = openingNarrative
+                ? sanitizeOpeningContentPlan(safeContentPlan)
+                : safeContentPlan;
+            if (openingNarrative) {
+                console.log(`[ORCHESTRATOR] Opening-slide policy: suppressing metric-driven structures for slide ${i + 1}`);
+            }
 
-            console.log(`[ORCHESTRATOR] Content plan validated: ${safeContentPlan.keyPoints.length} keyPoints, ${safeContentPlan.dataPoints.length} dataPoints${safeContentPlan.contentStrategy ? ` (${safeContentPlan.contentStrategy.preferredFormat})` : ''}`);
+            console.log(`[ORCHESTRATOR] Content plan validated: ${routedContentPlan.keyPoints.length} keyPoints, ${routedContentPlan.dataPoints.length} dataPoints${routedContentPlan.contentStrategy ? ` (${routedContentPlan.contentStrategy.preferredFormat})` : ''}`);
 
             // ============================================================================
             // DATA-VIZ MODE MISMATCH PREVENTION (Fixed 2026-01-26)
@@ -2887,10 +3275,10 @@ export const generateAgenticDeck = async (
             // 2. dataPoints lack valid value+label pairs (insufficient for metric-cards)
             // This keeps the agentic contract clean - each agent gets accurate context.
             // ============================================================================
-            const hasChartSpec = safeContentPlan.chartSpec && safeContentPlan.chartSpec.type;
+            const hasChartSpec = routedContentPlan.chartSpec && routedContentPlan.chartSpec.type;
             // FIX: Use canUseMetricCards for consistent data quality check across all code paths
             // Previous check (length >= 2) didn't validate data STRUCTURE, causing downstream failures
-            const hasValidDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
+            const hasValidDataPoints = canUseMetricCards(routedContentPlan.dataPoints);
             
             if (slideMeta.type === 'data-viz' && !hasChartSpec && !hasValidDataPoints) {
                 console.log(`[ORCHESTRATOR] ⚠️ data-viz slide "${slideMeta.title}" lacks valid data (chartSpec: ${!!hasChartSpec}, validDataPoints: ${hasValidDataPoints})`);
@@ -2923,7 +3311,7 @@ export const generateAgenticDeck = async (
                     ...(slideConstraints.avoidLayoutVariants || []),
                     ...dataRequiringLayouts.filter(l => !slideConstraints.avoidLayoutVariants?.includes(l))
                 ];
-                console.log(`[ORCHESTRATOR] No valid dataPoints (${safeContentPlan.dataPoints.length}), avoiding data-requiring layouts: ${dataRequiringLayouts.join(', ')}`);
+                console.log(`[ORCHESTRATOR] No valid dataPoints (${routedContentPlan.dataPoints.length}), avoiding data-requiring layouts: ${dataRequiringLayouts.join(', ')}`);
 
                 // STYLE-AWARE FALLBACK: Corporate mode without data degrades to professional
                 if (styleMode === 'corporate') {
@@ -2935,7 +3323,7 @@ export const generateAgenticDeck = async (
             // 3b.1 Qwen Layout Selector (visual QA-driven layout selection)
             routerConfig = await runQwenLayoutSelector(
                 slideMeta,
-                safeContentPlan,
+                routedContentPlan,
                 routerConfig,
                 outline.styleGuide,
                 costTracker,
@@ -2953,7 +3341,7 @@ export const generateAgenticDeck = async (
 
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
-                safeContentPlan,
+                routedContentPlan,
                 routerConfig,
                 facts,
                 costTracker,
@@ -3001,8 +3389,8 @@ export const generateAgenticDeck = async (
                     slidePurpose: slideMeta.purpose,
                     routerConfig,
                     contentPlan: {
-                        keyPoints: safeContentPlan.keyPoints || [],
-                        dataPoints: (safeContentPlan as any).dataPoints || []
+                        keyPoints: routedContentPlan.keyPoints || [],
+                        dataPoints: (routedContentPlan as any).dataPoints || []
                     },
                     serendipityDNA,
                     variationBudget: detailedBudget.overall,
@@ -3011,8 +3399,29 @@ export const generateAgenticDeck = async (
                     styleMode // Pass styleMode to Composition Architect
                 }, costTracker);
 
+                compositionPlan = rebalanceCompositionPatternForDeck(
+                    compositionPlan,
+                    recentCompositionPatterns,
+                    {
+                        layoutVariant: routerConfig.layoutVariant,
+                        hasValidMetricData: hasValidDataPoints,
+                        slideIndex: i,
+                        totalSlides
+                    }
+                );
+                compositionPlan = enforceOpeningCompositionPrinciples(compositionPlan, {
+                    openingNarrative,
+                    layoutVariant: routerConfig.layoutVariant
+                });
+
                 // Track used surprises to avoid repetition
                 usedSurprisesInDeck = trackUsedSurprises(usedSurprisesInDeck, compositionPlan);
+                if (compositionPlan?.layerPlan?.contentStructure?.pattern) {
+                    recentCompositionPatterns.push(compositionPlan.layerPlan.contentStructure.pattern);
+                    if (recentCompositionPatterns.length > 4) {
+                        recentCompositionPatterns = recentCompositionPatterns.slice(-4);
+                    }
+                }
 
                 console.log(`[ORCHESTRATOR] Composition plan: ${compositionPlan.layerPlan.contentStructure.pattern}, surprises: ${compositionPlan.serendipityPlan.allocatedSurprises.length} [${styleMode}]`);
             }
@@ -3026,7 +3435,7 @@ export const generateAgenticDeck = async (
             // CRITICAL: Use typed ContentPlanResult throughout the generation loop
             // This ensures all downstream consumers (generator, visual designer, layout selector)
             // receive a guaranteed-valid content plan shape
-            let currentContentPlan: ContentPlanResult = safeContentPlan;
+            let currentContentPlan: ContentPlanResult = routedContentPlan;
             let currentVisualDesign = visualDesign;
             let currentRouterConfig = routerConfig;
             let currentCompositionPlan = compositionPlan; // Pass composition plan to generator
@@ -3106,6 +3515,9 @@ export const generateAgenticDeck = async (
                     // Re-run content planner with tighter constraints and validate result (preserve style)
                     const rerouteRawContentPlan = await runContentPlanner(slideMeta, factsContext, costTracker, recentHistory, rerouteDensityHint, rerouteStyleHint);
                     currentContentPlan = ensureValidContentPlan(rerouteRawContentPlan, slideMeta);
+                    if (isOpeningNarrativeSlide(slideMeta, i)) {
+                        currentContentPlan = sanitizeOpeningContentPlan(currentContentPlan);
+                    }
                     console.log(`[ORCHESTRATOR] Reroute content plan: ${currentContentPlan.keyPoints.length} keyPoints`);
 
                     // Re-run Qwen layout selector (visual QA-driven)
@@ -3127,6 +3539,46 @@ export const generateAgenticDeck = async (
                         outline.styleGuide,
                         rerouteVariationBudget
                     );
+
+                    if (SERENDIPITY_MODE_ENABLED) {
+                        const rerouteBudget = computeDetailedVariationBudget(
+                            i,
+                            totalSlides,
+                            slideMeta.type,
+                            serendipityDNA
+                        );
+                        const rerouteHasValidMetricData = canUseMetricCards(currentContentPlan.dataPoints);
+                        currentCompositionPlan = await runCompositionArchitect({
+                            slideId: `slide-${i}-reroute-${slideRerouteCount}`,
+                            slideTitle: slideMeta.title,
+                            slidePurpose: slideMeta.purpose,
+                            routerConfig: currentRouterConfig,
+                            contentPlan: {
+                                keyPoints: currentContentPlan.keyPoints || [],
+                                dataPoints: (currentContentPlan as any).dataPoints || []
+                            },
+                            serendipityDNA,
+                            variationBudget: rerouteBudget.overall,
+                            narrativeTrail: recentHistory,
+                            usedSurprisesInDeck,
+                            styleMode
+                        }, costTracker);
+
+                        currentCompositionPlan = rebalanceCompositionPatternForDeck(
+                            currentCompositionPlan,
+                            recentCompositionPatterns,
+                            {
+                                layoutVariant: currentRouterConfig.layoutVariant,
+                                hasValidMetricData: rerouteHasValidMetricData,
+                                slideIndex: i,
+                                totalSlides
+                            }
+                        );
+                        currentCompositionPlan = enforceOpeningCompositionPrinciples(currentCompositionPlan, {
+                            openingNarrative: isOpeningNarrativeSlide(slideMeta, i),
+                            layoutVariant: currentRouterConfig.layoutVariant
+                        });
+                    }
 
                     // Continue loop for another attempt
                     continue;
@@ -3158,7 +3610,7 @@ export const generateAgenticDeck = async (
             }
 
             // 3e. Image Generation
-            const finalVisualPrompt = visualDesign.prompt_with_composition || `${slideNode.title} professional abstract background`;
+            const finalVisualPrompt = currentVisualDesign?.prompt_with_composition || `${slideNode.title} professional abstract background`;
             slideNode.visualPrompt = finalVisualPrompt;
 
             if (finalVisualPrompt) {
@@ -3487,5 +3939,3 @@ export const regenerateSingleSlide = async (
     }
     return newSlide;
 };
-
-

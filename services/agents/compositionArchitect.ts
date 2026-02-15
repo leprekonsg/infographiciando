@@ -542,6 +542,17 @@ function normalizeCompositionPlan(
     return 'top-left';
   };
 
+  const normalizePlacementForType = (placement: string, type: string): string => {
+    const topBandPlacements = ['top-left', 'top-center', 'top-right'];
+    if (type === 'badge') {
+      return topBandPlacements.includes(placement) ? placement : 'top-left';
+    }
+    if ((type === 'divider' || type === 'connector') && topBandPlacements.includes(placement)) {
+      return 'below-title';
+    }
+    return placement;
+  };
+
   const sanitizeDecorativeColor = (value: any): string | undefined => {
     if (typeof value !== 'string') return undefined;
     const clean = value.trim().toLowerCase();
@@ -562,9 +573,10 @@ function normalizeCompositionPlan(
       .map((el: any) => {
         const type = normalizeDecorativeType(el.type);
         if (!type) return null;
+        const placement = normalizePlacementForType(normalizePlacement(el.placement), type);
         return {
           type,
-          placement: normalizePlacement(el.placement),
+          placement,
           purpose: typeof el.purpose === 'string' ? el.purpose.slice(0, 80) : 'decorative accent',
           content: sanitizeDecorativeCopy(el.content),
           icon: typeof el.icon === 'string' ? el.icon.slice(0, 40) : undefined,
@@ -573,6 +585,28 @@ function normalizeCompositionPlan(
       })
       .filter((el: any) => !!el)
     : [];
+
+  // Prevent decorative overload: max one badge + one line/connector + one accent/glow.
+  const curatedDecorativeElements: typeof decorativeElements = [];
+  let hasBadge = false;
+  let hasLineElement = false;
+  for (const el of decorativeElements) {
+    if (!el) continue;
+    if (el.type === 'badge') {
+      if (hasBadge) continue;
+      hasBadge = true;
+      curatedDecorativeElements.push(el);
+      continue;
+    }
+    if (el.type === 'divider' || el.type === 'connector') {
+      if (hasLineElement) continue;
+      hasLineElement = true;
+      curatedDecorativeElements.push(el);
+      continue;
+    }
+    curatedDecorativeElements.push(el);
+    if (curatedDecorativeElements.length >= 3) break;
+  }
 
   // Safely extract surprises
   const rawSurprises = Array.isArray(raw.serendipityPlan?.allocatedSurprises)
@@ -597,7 +631,16 @@ function normalizeCompositionPlan(
   // Validate content pattern
   const validPatterns = ['single-hero', 'card-row', 'card-grid', 'split-content', 'metrics-rail', 'narrative-flow'];
   const rawPattern = raw.layerPlan?.contentStructure?.pattern;
-  const pattern = validPatterns.includes(rawPattern) ? rawPattern : 'split-content';
+  const basePattern = validPatterns.includes(rawPattern) ? rawPattern : 'split-content';
+  const keyPointCount = Array.isArray(input.contentPlan?.keyPoints) ? input.contentPlan.keyPoints.length : 0;
+  const validDataCount = Array.isArray(input.contentPlan?.dataPoints)
+    ? input.contentPlan.dataPoints.filter((d: any) => d && typeof d.label === 'string' && String(d.value ?? '').trim().length > 0).length
+    : 0;
+  const pattern = (basePattern === 'card-row' || basePattern === 'card-grid') &&
+    keyPointCount < 3 &&
+    validDataCount < 2
+      ? 'split-content'
+      : basePattern;
 
   return {
     slideId: raw.slideId || input.slideId,
@@ -608,7 +651,7 @@ function normalizeCompositionPlan(
           : 'gradient',
         suggestion: String(raw.layerPlan?.background?.suggestion || 'Dark professional gradient')
       },
-      decorativeElements,
+      decorativeElements: curatedDecorativeElements,
       contentStructure: {
         pattern,
         cardCount: typeof raw.layerPlan?.contentStructure?.cardCount === 'number'

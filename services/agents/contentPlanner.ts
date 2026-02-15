@@ -246,7 +246,7 @@ function normalizeDataPoints(
     maxDataPoints: number
 ): Array<{ label: string; value: number | string }> {
     if (!Array.isArray(items)) return [];
-    
+
     const normalized: Array<{ label: string; value: number | string }> = [];
 
     const parseNumber = (value: any): number | null => {
@@ -259,33 +259,113 @@ function normalizeDataPoints(
         return null;
     };
 
+    const hasExplicitUnitToken = (value: string): boolean => {
+        if (!value) return false;
+        return /[%$]|\b(?:sec|min|hr|hrs|day|days|week|weeks|month|months|year|years|yr|yrs|x)\b/i.test(value);
+    };
+
+    const normalizeUnit = (rawUnit: any): string => {
+        const unit = String(rawUnit ?? '').trim().toLowerCase();
+        if (!unit) return '';
+        if (unit === '%' || /percent|percentage|pct/.test(unit)) return '%';
+        if (unit === '$' || /usd|dollar/.test(unit)) return '$';
+        if (/second|sec/.test(unit)) return 'sec';
+        if (/minute|min/.test(unit)) return 'min';
+        if (/hour|hr/.test(unit)) return 'hrs';
+        if (/day/.test(unit)) return 'days';
+        if (/week/.test(unit)) return 'wks';
+        if (/month/.test(unit)) return 'mos';
+        if (/year|yr|annual/.test(unit)) return 'yrs';
+        if (/times|fold|^x$/.test(unit)) return 'x';
+        return unit.slice(0, 6);
+    };
+
+    const detectUnitFromText = (text: string): string => {
+        const corpus = String(text || '').toLowerCase();
+        if (!corpus) return '';
+        if (/%|\bpercent(age)?\b|\bpct\b/.test(corpus)) return '%';
+        if (/\$|\busd\b|\bdollar(s)?\b/.test(corpus)) return '$';
+        if (/\bsecond(s)?\b|\bsec\b/.test(corpus)) return 'sec';
+        if (/\bminute(s)?\b|\bmin\b/.test(corpus)) return 'min';
+        if (/\bhour(s)?\b|\bhr(s)?\b/.test(corpus)) return 'hrs';
+        if (/\bday(s)?\b/.test(corpus)) return 'days';
+        if (/\bweek(s)?\b/.test(corpus)) return 'wks';
+        if (/\bmonth(s)?\b/.test(corpus)) return 'mos';
+        if (/\byear(s)?\b|\byr(s)?\b|\bannual\b/.test(corpus)) return 'yrs';
+        if (/\bx\b|\btimes\b|\bfold\b/.test(corpus)) return 'x';
+        return '';
+    };
+
+    const formatValueWithUnit = (value: number, unit: string): string => {
+        const normalizedValue = Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.00$/, '');
+        if (!unit) return normalizedValue;
+        if (unit === '%') return `${normalizedValue}%`;
+        if (unit === '$') return `$${normalizedValue}`;
+        if (unit === 'x') return `${normalizedValue}x`;
+        return `${normalizedValue} ${unit}`;
+    };
+
+    const isLowSignalLabel = (label: string): boolean => {
+        const normalizedLabel = String(label || '').toLowerCase().trim();
+        if (!normalizedLabel) return true;
+        return /^(metric|kpi|score|index|rating|value)\s*\d*$/.test(normalizedLabel) ||
+            /\b(utility|importance|effectiveness|readiness|maturity|contribution)\b/.test(normalizedLabel);
+    };
+
+    const isPlaceholderLikeLabel = (label: string): boolean => {
+        const normalizedLabel = String(label || '').toLowerCase().trim();
+        return !normalizedLabel ||
+            /^(?:metric|kpi|value|label|stat|data point)\s*\d*$/.test(normalizedLabel) ||
+            /^(?:n\/?a|tbd|coming soon|placeholder|unknown)$/i.test(normalizedLabel);
+    };
+
+    const deriveLabelFromContext = (raw: any, fallback: string): string => {
+        const claimText = String(raw?.claim ?? raw?.description ?? raw?.summary ?? '').trim();
+        if (!claimText) return fallback;
+        const candidate = claimText
+            .replace(/\$?\d[\d,.]*(?:\.\d+)?%?/g, ' ')
+            .replace(/[^\w\s]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .split(' ')
+            .slice(0, 5)
+            .join(' ');
+        return candidate.length >= 6 ? candidate : fallback;
+    };
+
     for (let idx = 0; idx < items.length && normalized.length < maxDataPoints; idx++) {
         const raw = items[idx];
         
         if (raw && typeof raw === 'object') {
-            const numValue = parseNumber(raw.value ?? raw.amount ?? raw.metric);
-            const label = String(raw.label ?? raw.name ?? `Metric ${idx + 1}`).trim();
-            
+            const rawValue = raw.value ?? raw.amount ?? raw.metric;
+            const numValue = parseNumber(rawValue);
+            const baseLabel = String(raw.label ?? raw.name ?? `Metric ${idx + 1}`).trim();
+            const label = isLowSignalLabel(baseLabel) ? deriveLabelFromContext(raw, baseLabel) : baseLabel;
+            const normalizedUnit = normalizeUnit(raw.unit);
+            const inferredUnit = detectUnitFromText(`${rawValue ?? ''} ${raw.claim ?? ''} ${raw.description ?? ''} ${label}`);
+            const unit = normalizedUnit || inferredUnit;
+
             if (label && label.length > 0) {
-                // Keep string values for display (e.g., "42M", "$1.2B")
-                const displayValue = numValue !== null 
-                    ? numValue 
-                    : String(raw.value ?? raw.amount ?? raw.metric ?? '').trim();
-                    
-                if (displayValue !== '' && displayValue !== 0) {
-                    normalized.push({ 
-                        label: label.slice(0, 40), // Cap label length
-                        value: displayValue 
-                    });
-                }
+                const normalizedLabel = label.replace(/\s+/g, ' ').trim().slice(0, 40);
+                if (!normalizedLabel || isPlaceholderLikeLabel(normalizedLabel)) continue;
+
+                const rawValueText = String(rawValue ?? '').trim().slice(0, 20);
+                const displayValue = rawValueText
+                    ? (hasExplicitUnitToken(rawValueText) || /[a-zA-Z]/.test(rawValueText)
+                        ? rawValueText
+                        : (numValue !== null ? formatValueWithUnit(numValue, unit) : rawValueText))
+                    : (numValue !== null ? formatValueWithUnit(numValue, unit) : '');
+
+                if (!displayValue) continue;
+                if (!/\d/.test(String(displayValue))) continue;
+                if (isLowSignalLabel(normalizedLabel) && !hasExplicitUnitToken(String(displayValue))) continue;
+
+                normalized.push({
+                    label: normalizedLabel,
+                    value: String(displayValue)
+                });
             }
             continue;
-        }
-
-        // Handle raw numeric values
-        const parsed = parseNumber(raw);
-        if (parsed !== null) {
-            normalized.push({ label: `Metric ${idx + 1}`, value: parsed });
         }
     }
 

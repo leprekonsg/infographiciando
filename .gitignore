@@ -28,3 +28,4 @@ AGENTS.md
 .github/copilot-instructions.md
 playwright-report/
 test-results/
+/output/playwright

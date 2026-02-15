@@ -119,6 +119,7 @@ export function getIconContainerSize(
   style: IconContainerStyle,
   options?: {
     zoneHeight?: number;    // Height of containing zone (0-1 slide units)
+    zoneWidth?: number;     // Width of containing zone (0-1 slide units)
     itemCount?: number;     // Number of icons being rendered
     emphasis?: string;      // 'primary' | 'secondary' | 'muted'
     _hintIconSize?: number; // LLM hint for icon size override (0.3-0.8)
@@ -146,6 +147,15 @@ export function getIconContainerSize(
       scaleFactor *= 0.85; // Medium zone
     } else if (options.zoneHeight > 0.6) {
       scaleFactor *= 1.15; // Large zone - slightly bigger icons
+    }
+  }
+
+  // FACTOR 1b: Zone width adjustment (critical for vertical/narrow cards)
+  if (options?.zoneWidth !== undefined) {
+    if (options.zoneWidth < 0.28) {
+      scaleFactor *= 0.7;
+    } else if (options.zoneWidth < 0.4) {
+      scaleFactor *= 0.82;
     }
   }
   
@@ -474,8 +484,19 @@ function renderIconContainer(
 ): VisualElement[] {
   const elements: VisualElement[] = [];
   const containerStyle = card.header?.iconContainer || 'circle';
-  // Safe lookup with fallback to 'circle' if unknown container style
-  const containerConfig = ICON_CONTAINER_SIZES[containerStyle] || ICON_CONTAINER_SIZES['circle'];
+  const normalizedZoneHeight = Math.max(0.2, Math.min(1, card.position.h / 5.625));
+  const normalizedZoneWidth = Math.max(0.2, Math.min(1, card.position.w / 10));
+  const dynamicContainerConfig = getIconContainerSize(containerStyle, {
+    zoneHeight: normalizedZoneHeight,
+    zoneWidth: normalizedZoneWidth,
+    emphasis: card.emphasis,
+    _hintIconSize: (card as any)?._hintIconSize ?? (card.header as any)?._hintIconSize
+  });
+  const maxCardBound = Math.max(0.2, Math.min(0.34, Math.min(card.position.w * 0.15, card.position.h * 0.1)));
+  const containerConfig = {
+    ...dynamicContainerConfig,
+    size: Math.min(dynamicContainerConfig.size, maxCardBound)
+  };
 
   if (containerStyle === 'none' || !card.header?.icon) {
     return elements;
@@ -564,7 +585,20 @@ function renderCardHeader(
   const header = card.header!;
 
   const padding = 0.18; // Slightly more padding for breathing room
-  const containerConfig = ICON_CONTAINER_SIZES[header.iconContainer || 'circle'] || ICON_CONTAINER_SIZES['circle'];
+  const containerStyle = header.iconContainer || 'circle';
+  const normalizedZoneHeight = Math.max(0.2, Math.min(1, card.position.h / 5.625));
+  const normalizedZoneWidth = Math.max(0.2, Math.min(1, card.position.w / 10));
+  const dynamicContainerConfig = getIconContainerSize(containerStyle, {
+    zoneHeight: normalizedZoneHeight,
+    zoneWidth: normalizedZoneWidth,
+    emphasis: card.emphasis,
+    _hintIconSize: (card as any)?._hintIconSize ?? (header as any)?._hintIconSize
+  });
+  const maxCardBound = Math.max(0.2, Math.min(0.34, Math.min(card.position.w * 0.15, card.position.h * 0.1)));
+  const containerConfig = {
+    ...dynamicContainerConfig,
+    size: Math.min(dynamicContainerConfig.size, maxCardBound)
+  };
 
   // Calculate text start position
   // If icon exists, start text below it
@@ -599,7 +633,7 @@ function renderCardHeader(
       w: textW,
       h: overlineHeight,
       fontSize: CARD_PREMIUM_TYPOGRAPHY.overline.size,
-      color: normalizeColor(context.palette.textMuted),
+      color: normalizeColor(context.palette.text),
       bold: true,
       align: 'left',
       zIndex: zIndex++,
@@ -726,7 +760,7 @@ function renderCardBody(
     w: bodyWidth,
     h: bodyHeight,
     fontSize: CARD_BODY_TYPOGRAPHY.size,
-    color: normalizeColor(context.palette.textMuted),
+    color: normalizeColor(context.palette.text),
     bold: false,
     align: 'left',
     zIndex,

@@ -251,6 +251,19 @@ const normalizeTitleText = (input: string): string => {
         cleaned = dedupedWords.join(' ');
     }
 
+    // Collapse duplicated trailing n-grams, e.g. "... AI Landscape Landscape"
+    const tailWords = cleaned.split(/\s+/).filter(Boolean);
+    const normalizedTail = tailWords.map(w => w.toLowerCase().replace(/[^\w]/g, ''));
+    for (let n = 3; n >= 1; n--) {
+        if (normalizedTail.length < n * 2) continue;
+        const a = normalizedTail.slice(-2 * n, -n).join(' ');
+        const b = normalizedTail.slice(-n).join(' ');
+        if (a && b && a === b) {
+            cleaned = tailWords.slice(0, -n).join(' ');
+            break;
+        }
+    }
+
     // Final whitespace normalization
     cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
     return cleaned;
@@ -489,7 +502,7 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         title: 70,
         bullet: 120,
         metricValue: 10,
-        metricLabel: 20,
+        metricLabel: 28,
         stepTitle: 15,
         stepDescription: 70,
         iconLabel: 20,
@@ -998,7 +1011,7 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
 
             if (overflowBullets.length > 0) {
                 const textTarget = trimmed.find((c: any) => c.type === 'text-bullets');
-                if (textTarget) {
+                if (textTarget && layoutVariant !== 'hero-centered') {
                     const existing = Array.isArray(textTarget.content) ? textTarget.content : [];
                     const seen = new Set(existing.map((line: any) => String(line).trim().toLowerCase()));
                     const merged = [...existing];

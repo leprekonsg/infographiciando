@@ -292,8 +292,8 @@ export function renderBadge(
   const iconGap = clamp(0.07 * sizeScale, 0.04, 0.1);
   const iconInsetX = clamp(0.09 * sizeScale, 0.05, 0.12);
   const textInsetY = clamp(0.08 * sizeScale, 0.04, 0.1);
-  const charWidth = 0.065 * sizeScale;
-  const letterSpacingWidthPerChar = 0.015 * sizeScale;
+  const charWidth = 0.075 * sizeScale;
+  const letterSpacingWidthPerChar = 0.018 * sizeScale;
 
   const computeTextWidth = (text: string): number => {
     const length = text.length;
@@ -314,7 +314,7 @@ export function renderBadge(
     const maxTextWidth = Math.max(0.48, maxAllowedWidth - reservedWidth);
     if (textWidth > maxTextWidth) {
       const avgCharWidth = Math.max(0.03, charWidth + letterSpacingWidthPerChar);
-      const allowedChars = Math.max(6, Math.floor(maxTextWidth / avgCharWidth));
+      const allowedChars = Math.max(6, Math.floor((maxTextWidth / avgCharWidth) * 0.9));
       if (normalizedText.length > allowedChars) {
         const suffix = '...';
         const headLength = Math.max(3, allowedChars - suffix.length);
