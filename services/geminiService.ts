@@ -11,6 +11,7 @@
 
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { PROMPTS } from "./promptRegistry";
+import { paceGeminiApiCall, registerGeminiRateLimit } from "./interactionsClient";
 
 // Re-export Interactions API types for compatibility
 export {
@@ -81,7 +82,7 @@ interface GenerationPlan {
 
 export type GenerationMode = 'infographic' | 'presentation' | 'visual-asset' | 'vector-svg' | 'sticker';
 
-const MODEL_SMART = "gemini-3-pro-preview";
+const MODEL_SMART = "gemini-3.1-pro-preview";
 const MODEL_FAST = "gemini-3-flash-preview";
 const MODEL_SIMPLE = "gemini-2.5-flash"; // Added for simple/pattern-matching tasks
 const MODEL_BACKUP = "gemini-2.0-flash";
@@ -283,7 +284,7 @@ export async function runJsonRepair(brokenJson: string, schema: any, tracker?: T
     /([a-z_-]{4,})\1{4,}/i,
     /([a-z0-9])\1{10,}/
   ];
-  
+
   if (degenerationPatterns.some(p => p.test(last200))) {
     console.warn("[JSON REPAIR] Input is severely degenerated - skipping model repair");
     throw new JsonParseError('MALFORMED', brokenJson.substring(0, 100), "Input too degenerated to repair");
@@ -304,7 +305,7 @@ export async function runJsonRepair(brokenJson: string, schema: any, tracker?: T
       tracker
     );
 
-    const timeoutPromise = new Promise((_, reject) => 
+    const timeoutPromise = new Promise((_, reject) =>
       setTimeout(() => reject(new Error('JSON repair timeout after 30s')), REPAIR_TIMEOUT_MS)
     );
 
@@ -387,6 +388,7 @@ export async function callAI(
       config: config
     };
 
+    await paceGeminiApiCall(effectiveModel);
     // Timeout wrapper to prevent hanging indefinitely
     const generatePromise = client.models.generateContent(req);
 
@@ -401,7 +403,7 @@ export async function callAI(
       // Support both old TokenTracker and new CostTracker interfaces
       const inputTokens = response.usageMetadata.promptTokenCount || 0;
       const outputTokens = response.usageMetadata.candidatesTokenCount || 0;
-      
+
       if ('addTokenUsage' in tracker && typeof tracker.addTokenUsage === 'function') {
         // Old TokenTracker interface
         tracker.addTokenUsage(effectiveModel, inputTokens, outputTokens);
@@ -434,6 +436,7 @@ export async function callAI(
     const isQuota = status === 429 || errorMessage.includes('429') || errorMessage.includes('quota') || errorMessage.includes('RESOURCE_EXHAUSTED');
     const isOverloaded = status === 503 || errorMessage.includes('503') || errorMessage.includes('Overloaded');
     const isTimeout = status === 499 || errorMessage.includes('cancelled') || errorMessage.includes('timeout') || errorMessage.includes('The operation was cancelled');
+    registerGeminiRateLimit(effectiveModel, errorMessage, status);
 
     if (effectiveModel === model) {
       reportFailure(model, isQuota || isOverloaded || isTimeout);
@@ -565,7 +568,8 @@ const removeWhiteBackground = (base64Data: string): Promise<string> => {
 // Retry utility for transient errors
 const callWithRetry = async <T>(
   operation: () => Promise<T>,
-  onRetry: (attempt: number, delayMs: number) => void
+  onRetry: (attempt: number, delayMs: number) => void,
+  modelName?: string
 ): Promise<T> => {
   const MAX_RETRIES = 3;
   let lastError: any;
@@ -580,6 +584,10 @@ const callWithRetry = async <T>(
         err.status === 503 ||
         err.status === 429 ||
         (err.message && err.message.toLowerCase().includes('overloaded'));
+
+      if (modelName) {
+        registerGeminiRateLimit(modelName, String(err?.message || err), err?.status);
+      }
 
       if (attempt <= MAX_RETRIES && isTransient) {
         // Exponential backoff: 2s, 4s, 8s
@@ -705,17 +713,21 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
 
     try {
       const response = await callWithRetry<any>(
-        () => ai.models.generateContent({
-          model: modelName,
-          contents: taskPrompt,
-          config: {
-            systemInstruction: systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema: responseFormat,
-            thinkingConfig: enableThinking ? { thinkingBudget: 2048 } : undefined
-          }
-        }),
-        (attempt, delay) => console.log(`Planning retry attempt ${attempt}...`)
+        async () => {
+          await paceGeminiApiCall(modelName);
+          return ai.models.generateContent({
+            model: modelName,
+            contents: taskPrompt,
+            config: {
+              systemInstruction: systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: responseFormat,
+              thinkingConfig: enableThinking ? { thinkingBudget: 2048 } : undefined
+            }
+          });
+        },
+        (attempt, delay) => console.log(`Planning retry attempt ${attempt}...`),
+        modelName
       );
 
       const rawText = response.text;
@@ -735,7 +747,7 @@ const analyzeAndPlanContent = async (markdown: string, mode: GenerationMode): Pr
     }
   };
 
-  return await generatePlanWithModel('gemini-3-flash-preview', true);
+  return await generatePlanWithModel('gemini-3.1-pro-preview', true);
 };
 
 // --- RLM CORE: THE EXECUTOR ---
@@ -785,15 +797,19 @@ export const generateVisualContent = async (
 
       try {
         const response = await callWithRetry<any>(
-          () => ai.models.generateContent({
-            model: 'gemini-3-flash-preview',
-            contents: svgPrompt,
-            config: {
-              systemInstruction: svgSystemInstruction,
-              thinkingConfig: { thinkingBudget: 1024 }
-            }
-          }),
-          (attempt, delay) => onStatus(`System overloaded. Retrying SVG ${page.title} (Attempt ${attempt})...`)
+          async () => {
+            await paceGeminiApiCall('gemini-3.1-pro-preview');
+            return ai.models.generateContent({
+              model: 'gemini-3.1-pro-preview',
+              contents: svgPrompt,
+              config: {
+                systemInstruction: svgSystemInstruction,
+                thinkingConfig: { thinkingBudget: 1024 }
+              }
+            });
+          },
+          (attempt, delay) => onStatus(`System overloaded. Retrying SVG ${page.title} (Attempt ${attempt})...`),
+          'gemini-3.1-pro-preview'
         );
 
         const rawText = response.text;
@@ -873,6 +889,7 @@ export const generateVisualContent = async (
             generateConfig.tools = tools;
           }
 
+          await paceGeminiApiCall(modelName);
           const response = await ai.models.generateContent({
             model: modelName,
             contents: { parts: [{ text: finalPrompt }] },
@@ -904,6 +921,7 @@ export const generateVisualContent = async (
             if (!foundImage) console.warn(`No image found for ${page.title} with ${modelName}`);
           }
         } catch (err: any) {
+          registerGeminiRateLimit(modelName, String(err?.message || err), err?.status);
           const isQuota = err.status === 429 || (err.message && (err.message.includes('429') || err.message.includes('quota')));
           if (isQuota && modelName !== models[models.length - 1]) {
             console.warn(`Quota exceeded for ${modelName}, failing over...`);

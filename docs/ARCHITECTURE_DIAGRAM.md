@@ -1,7 +1,7 @@
 ﻿# InfographIQ Architecture (Current)
 
-> **Updated**: 2026-01-28  
-> **Version**: 3.5 (Three-Tier Visual Validation + Qwen3-VL Primary)
+> **Updated**: 2026-02-22  
+> **Version**: 4.0 (Four-Tier Validation + Qwen3-VL Primary + Hardened PPTX Extractor)
 
 ---
 
@@ -11,7 +11,7 @@ InfographIQ is a **client-first, agent-orchestrated** slide generation system. I
 
 Key characteristics:
 - **Adaptive Director orchestration** with non-linear state machine (loop-back on thin content).
-- **Three-tier visual validation** (Logic Gate → Qwen3-VL Spatial → Gemini Code Drone).
+- **Four-tier visual validation** (Logic Gate → Post-Assembly Smoke Test → Qwen3-VL Spatial → Gemini Code Drone).
 - **Risk-based visual sampling** (high-risk layouts always validated, low-risk skipped).
 - **Asset drift protection** via content IDs (prevents stale image injection).
 - **Back-pressure controlled** parallel asset generation (max 3 concurrent).
@@ -169,14 +169,20 @@ Each layout has different content expectations:
 - `MAX_PRUNE_ATTEMPTS`: 2 (prevents over-condensation)
 - `MAX_TOTAL_ATTEMPTS`: 4 (safety valve per slide)
 
-### 4.4) Three-Tier Validation (Logic + Qwen3-VL Spatial + Gemini Code)
+### 4.4) Four-Tier Validation (Logic + Post-Assembly Smoke Test + Qwen3-VL Spatial + Gemini Code)
 
-The Director uses a **three-tier validation stack** for quality control and cost efficiency:
+The Director uses a **four-tier validation stack** for quality control and cost efficiency:
 
 **Tier 1: Logic Gate (Fast - Always On)**
 - Character counts + layout-specific limits
 - `evaluateContentQuality()` with bidirectional checks
+- Margin constraint enforcement
 - Instant, deterministic, no external calls
+
+**Tier 1.5: Post-Assembly Smoke Test (Fast - Always On)**
+- Fast regex and structural heuristic check on entire assembled deck
+- Detects visual anti-patterns (layout repetition, empty content, contrast issues)
+- Flags warnings for UI visibility
 
 **Tier 2: Qwen3-VL Spatial Gate (Risk-Based Sampling)**
 - `runVisualGateQwen3VL()` / spatial critique in VisualSensor
@@ -384,13 +390,15 @@ SpatialLayoutEngine
      ▼
 InfographicRenderer
      ├─ normalizeColor() (LLM-friendly → hex)
+     ├─ safePptxColor(), safeShadowOpts() Guard Check
      ├─ Diagram rendering (diagram-svg) via SVG → PNG (Node) or SVG data URL (Browser)
      └─ compileSlide() → VisualElement[]
      │
      ▼
 SlideDeckBuilder (pptxgenjs)
      ├─ Background image
-     ├─ Visual elements placement
+     ├─ Visual elements placement (Primitive shapes vs. Native Objects)
+     ├─ addChart() Native PPTX editable Chart Injection
      └─ Speaker notes + citations
 ```
 
@@ -485,12 +493,12 @@ Cost tracking is centralized in `CostTracker`:
 | Architect | gemini-3-flash-preview | medium | Narrative + outline planning |
 | Router | gemini-2.5-flash | none | Enum classification |
 | Content Planner | gemini-3-flash-preview | low | Key points & data points |
-| Composition Architect | gemini-3-flash-preview | low | Layered structure & surprises |
+| Composition Architect | gemini-2.5-flash | none | Layered structure & surprises (Fast) |
 | Visual Designer | gemini-3-flash-preview | low | Visual composition |
 | Generator | gemini-3-flash-preview | none | Final slide assembly |
 | Image Gen | gemini-2.5-flash-image → gemini-3-pro-image-preview | - | Background-only images |
 | Qwen3-VL | qwen3-vl-plus-2025-12-19 | - | Primary visual critique (Tier 2) |
-| Gemini Code Drone | gemini-2.5-flash-preview-05-20 | - | Diagram-only code execution (Tier 3) |
+| Gemini Code Drone | gemini-3-flash-preview | - | Diagram-only code execution (Tier 3) |
 
 ---
 

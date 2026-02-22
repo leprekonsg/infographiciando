@@ -33,7 +33,7 @@ const MarkdownInput: React.FC<MarkdownInputProps> = ({ value, onChange, isGenera
   };
 
   const getAccentClass = () => {
-    switch(mode) {
+    switch (mode) {
       case 'presentation': return 'text-blue-500 focus:ring-blue-500/20';
       case 'visual-asset': return 'text-amber-500 focus:ring-amber-500/20';
       case 'vector-svg': return 'text-purple-500 focus:ring-purple-500/20';
@@ -43,7 +43,7 @@ const MarkdownInput: React.FC<MarkdownInputProps> = ({ value, onChange, isGenera
   };
 
   const getBorderClass = () => {
-     switch(mode) {
+    switch (mode) {
       case 'presentation': return 'group-focus-within:border-blue-500/50';
       case 'visual-asset': return 'group-focus-within:border-amber-500/50';
       case 'vector-svg': return 'group-focus-within:border-purple-500/50';
@@ -64,16 +64,16 @@ const MarkdownInput: React.FC<MarkdownInputProps> = ({ value, onChange, isGenera
         </div>
 
         {activeTab === 'upload' ? (
-           <div className="h-full min-h-[440px] border-2 border-dashed border-white/5 rounded-3xl flex flex-col items-center justify-center gap-6 hover:bg-white/[0.02] transition-all cursor-pointer" onClick={() => fileInputRef.current?.click()}>
-             <div className={`p-6 bg-white/5 rounded-full border border-white/10 ${getAccentClass().split(' ')[0]}`}>
-               <Upload className="w-10 h-10 opacity-50" />
-             </div>
-             <p className="text-slate-400 text-sm font-medium">Drop markdown files here</p>
-             <input ref={fileInputRef} type="file" accept=".md,.txt" className="hidden" onChange={(e) => e.target.files?.[0] && readFile(e.target.files[0])} />
-           </div>
+          <div className="h-full min-h-[440px] border-2 border-dashed border-white/5 rounded-3xl flex flex-col items-center justify-center gap-6 hover:bg-white/[0.02] transition-all cursor-pointer" onClick={() => fileInputRef.current?.click()}>
+            <div className={`p-6 bg-white/5 rounded-full border border-white/10 ${getAccentClass().split(' ')[0]}`}>
+              <Upload className="w-10 h-10 opacity-50" />
+            </div>
+            <p className="text-slate-400 text-sm font-medium">Drop markdown files here</p>
+            <input ref={fileInputRef} type="file" accept=".md,.txt" className="hidden" onChange={(e) => e.target.files?.[0] && readFile(e.target.files[0])} />
+          </div>
         ) : (
           <div className="relative flex-1">
-             <textarea
+            <textarea
               disabled={isGenerating}
               value={value}
               onChange={(e) => onChange(e.target.value)}
@@ -83,11 +83,11 @@ const MarkdownInput: React.FC<MarkdownInputProps> = ({ value, onChange, isGenera
               spellCheck={false}
             />
             {value && (
-               <button onClick={() => onChange('')} className="absolute top-6 right-6 p-2 text-slate-500 hover:text-white bg-black/40 rounded-xl transition-all z-10">
-                 <X className="w-4 h-4" />
-               </button>
+              <button onClick={() => onChange('')} className="absolute top-6 right-6 p-2 text-slate-500 hover:text-white bg-black/40 rounded-xl transition-all z-10">
+                <X className="w-4 h-4" />
+              </button>
             )}
-            
+
             <div className="absolute bottom-6 right-6 pointer-events-none">
               <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-600 bg-black/60 px-2 py-1 rounded-md border border-white/5">
                 <Command className="w-3 h-3" />
@@ -97,12 +97,12 @@ const MarkdownInput: React.FC<MarkdownInputProps> = ({ value, onChange, isGenera
           </div>
         )}
       </div>
-      
+
       <div className="px-8 py-5 bg-black/20 flex items-center justify-between">
-        <p className="text-[11px] font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
+        <div className="text-[11px] font-bold text-slate-600 uppercase tracking-widest flex items-center gap-2">
           <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${mode === 'infographic' ? 'bg-emerald-500' : mode === 'presentation' ? 'bg-blue-500' : mode === 'visual-asset' ? 'bg-amber-500' : mode === 'vector-svg' ? 'bg-purple-500' : 'bg-pink-500'}`} />
           Syntax Ready
-        </p>
+        </div>
         <FileText className="w-4 h-4 text-slate-700" />
       </div>
     </div>

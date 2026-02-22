@@ -505,7 +505,7 @@ export function autoRepairSlide(slide: SlideNode, styleGuide?: GlobalStyleGuide)
         metricLabel: 28,
         stepTitle: 15,
         stepDescription: 70,
-        iconLabel: 20,
+        iconLabel: 24,
         iconDescription: 60,
         chartLabel: 18
     };

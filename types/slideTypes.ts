@@ -1100,6 +1100,7 @@ export type VisualElement =
     lineHeight?: number;    // Line height multiplier (1.0 = normal, 1.4 = comfortable body text)
     fontWeight?: number;    // Explicit font weight (400 = regular, 700 = bold, 800 = extra bold)
     textTransform?: 'uppercase' | 'lowercase' | 'capitalize' | 'none';
+    isBullet?: boolean;     // When true, PPTX exporter uses native bullet: true instead of unicode char
   }
   | {
     type: 'image';

@@ -625,16 +625,20 @@ export class AgentLogger {
     }
 }
 
-// --- MODEL TIERS (Phil Schmid's Best Practices) ---
-// Based on benchmarks: Gemini 3 Flash outperforms 3 Pro on agentic tasks (78% vs 76.2% SWE-bench)
-// Use MODEL_SIMPLE for high-volume/simple classification tasks (79% cheaper)
-// Reserve MODEL_REASONING only for long-context synthesis (rarely needed)
+// --- MODEL TIERS ---
+// Interactions API default is configured to Gemini 3.1 Pro.
+// Use MODEL_SIMPLE for high-volume/simple classification tasks.
+// Use MODEL_FALLBACK for reliability fallback from the primary 3.1 Pro model.
+// Reserve MODEL_REASONING for long-context synthesis workflows.
 
-/** Primary workhorse for agentic tasks: 3x faster, 71% cheaper, better agentic performance */
-export const MODEL_AGENTIC = 'gemini-3-flash-preview';
+/** Primary Interactions API model for agentic tasks */
+export const MODEL_AGENTIC = 'gemini-3.1-pro-preview';
 
-/** High-volume/simple tasks: classification, JSON structuring, pattern matching (79% cheaper than Flash) */
+/** High-volume/simple tasks: classification, JSON structuring, pattern matching */
 export const MODEL_SIMPLE = 'gemini-2.5-flash';
+
+/** Reliability fallback for Interactions API requests */
+export const MODEL_FALLBACK = 'gemini-3-flash-preview';
 
 // --- GLOBAL CIRCUIT BREAKER ---
 // Tracks model health across all requests to avoid repeated failures
@@ -657,6 +661,102 @@ const CIRCUIT_BREAKER_CONFIG = {
 };
 
 const circuitBreakerState: Map<string, CircuitBreakerState> = new Map();
+const modelNextAllowedAt: Map<string, number> = new Map();
+const modelCooldownUntil: Map<string, number> = new Map();
+let globalGeminiNextAllowedAt = 0;
+let globalGeminiCooldownUntil = 0;
+
+const MODEL_PACING_CONFIG: Record<string, { minIntervalMs: number; cooldownMs: number; quotaCooldownMs: number }> = {
+    'gemini-3.1-pro-preview': { minIntervalMs: 3500, cooldownMs: 45_000, quotaCooldownMs: 180_000 },
+    'gemini-3-pro-preview': { minIntervalMs: 3500, cooldownMs: 45_000, quotaCooldownMs: 180_000 },
+    'gemini-3-flash-preview': { minIntervalMs: 500, cooldownMs: 12_000, quotaCooldownMs: 60_000 },
+    'gemini-2.5-flash': { minIntervalMs: 350, cooldownMs: 10_000, quotaCooldownMs: 45_000 }
+};
+const GLOBAL_GEMINI_PACING = {
+    minIntervalMs: 2000,
+    cooldownMs: 30_000,
+    quotaCooldownMs: 120_000
+};
+
+function getModelPacingConfig(model: string): { minIntervalMs: number; cooldownMs: number; quotaCooldownMs: number } {
+    const normalized = normalizeModelName(model);
+    return MODEL_PACING_CONFIG[normalized] || { minIntervalMs: 400, cooldownMs: 12_000, quotaCooldownMs: 45_000 };
+}
+
+function isQuotaLimitedError(errorText: string): boolean {
+    const text = String(errorText || '').toLowerCase();
+    return text.includes('not enough quota') ||
+        text.includes('quota to make this request') ||
+        text.includes('resource exhausted');
+}
+
+function getModelCooldownRemainingMs(model: string): number {
+    const normalized = normalizeModelName(model);
+    const until = modelCooldownUntil.get(normalized) || 0;
+    return Math.max(0, until - Date.now());
+}
+
+function setModelCooldown(model: string, durationMs: number, reason: string): void {
+    const normalized = normalizeModelName(model);
+    const until = Date.now() + Math.max(0, durationMs);
+    const existing = modelCooldownUntil.get(normalized) || 0;
+    if (until > existing) {
+        modelCooldownUntil.set(normalized, until);
+        console.warn(`[MODEL PACE] Cooling down ${normalized} for ${Math.ceil(durationMs / 1000)}s (${reason})`);
+    }
+}
+
+function setGlobalGeminiCooldown(durationMs: number, reason: string): void {
+    const until = Date.now() + Math.max(0, durationMs);
+    if (until > globalGeminiCooldownUntil) {
+        globalGeminiCooldownUntil = until;
+        console.warn(`[MODEL PACE] Global Gemini cooldown for ${Math.ceil(durationMs / 1000)}s (${reason})`);
+    }
+}
+
+async function waitForModelPacing(model: string): Promise<void> {
+    const normalized = normalizeModelName(model);
+    const pacing = getModelPacingConfig(normalized);
+    const now = Date.now();
+    const cooldownUntil = modelCooldownUntil.get(normalized) || 0;
+    const nextAllowed = modelNextAllowedAt.get(normalized) || 0;
+    const earliestStart = Math.max(now, cooldownUntil, nextAllowed, globalGeminiCooldownUntil, globalGeminiNextAllowedAt);
+    const waitMs = Math.max(0, earliestStart - now);
+
+    // Reserve the next slot immediately to serialize concurrent callers.
+    modelNextAllowedAt.set(normalized, earliestStart + pacing.minIntervalMs);
+    globalGeminiNextAllowedAt = earliestStart + GLOBAL_GEMINI_PACING.minIntervalMs;
+
+    if (waitMs > 0) {
+        console.log(`[MODEL PACE] Waiting ${waitMs}ms before calling ${normalized}`);
+        await new Promise(r => setTimeout(r, waitMs));
+    }
+}
+
+export async function paceGeminiApiCall(model: string): Promise<void> {
+    await waitForModelPacing(model);
+}
+
+export function registerGeminiRateLimit(model: string, errorText: string, status?: number): void {
+    const statusCode = Number(status || 0);
+    const text = String(errorText || '');
+    const is429 = statusCode === 429 || text.includes('429');
+    if (!is429) return;
+
+    const pacing = getModelPacingConfig(model);
+    const quotaLimited = isQuotaLimitedError(text);
+    setModelCooldown(
+        model,
+        quotaLimited ? pacing.quotaCooldownMs : pacing.cooldownMs,
+        quotaLimited ? 'quota limited' : 'rate limited'
+    );
+    // Keep global cooldown short for quota events so fallback models can still be attempted quickly.
+    // Model-specific cooldown carries the long suppression window.
+    const globalCooldownMs = quotaLimited
+        ? 10_000
+        : GLOBAL_GEMINI_PACING.cooldownMs;
+    setGlobalGeminiCooldown(globalCooldownMs, quotaLimited ? 'quota limited' : 'rate limited');
+}
 
 /**
  * Get or initialize circuit breaker state for a model
@@ -857,7 +957,7 @@ async function callQwenFallback(
 }
 
 /** Reserved for complex reasoning (>1M context synthesis) - rarely needed for slide generation */
-export const MODEL_REASONING = 'gemini-3-pro-preview';
+export const MODEL_REASONING = 'gemini-3.1-pro-preview';
 
 /** @deprecated Use MODEL_AGENTIC instead */
 export const MODEL_FAST = MODEL_AGENTIC;
@@ -887,7 +987,8 @@ export function selectModelForTask(taskType: TaskType): string {
 
 const PRICING = {
     TOKENS: {
-        'gemini-3-pro-preview': { input: 2.00, output: 12.00 },  // Updated Pro pricing
+        'gemini-3.1-pro-preview': { input: 2.00, output: 12.00 }, // Pro pricing
+        'gemini-3-pro-preview': { input: 2.00, output: 12.00 },   // Backward-compatible alias
         'gemini-3-flash-preview': { input: 0.15, output: 3.50 }, // Updated Flash pricing
         'gemini-2.5-flash': { input: 0.075, output: 0.30 },      // Budget tier
         'gemini-2.0-flash': { input: 0.10, output: 0.40 },
@@ -900,12 +1001,39 @@ const PRICING = {
 };
 
 // Pro baseline for savings calculation
-const PRO_RATES = PRICING.TOKENS['gemini-3-pro-preview'];
+const PRO_RATES = PRICING.TOKENS['gemini-3.1-pro-preview'];
 
 // Normalize model names from API responses (e.g., "models/gemini-3-flash-preview")
 function normalizeModelName(model?: string): string {
     if (!model) return 'unknown';
     return model.replace(/^models\//, '').replace(/^model\//, '').trim();
+}
+
+function parseAllowedThinkingLevels(errorText: string): ThinkingLevel[] {
+    const match = errorText.match(/Allowed values are:\s*([a-z,\s-]+)/i);
+    if (!match?.[1]) return [];
+
+    const validLevels: ThinkingLevel[] = ['minimal', 'low', 'medium', 'high'];
+    const parsed = match[1]
+        .split(',')
+        .map(v => v.trim().toLowerCase())
+        .filter((v): v is ThinkingLevel => validLevels.includes(v as ThinkingLevel));
+
+    return Array.from(new Set(parsed));
+}
+
+function pickSupportedThinkingLevel(
+    requested: ThinkingLevel | undefined,
+    allowed: ThinkingLevel[]
+): ThinkingLevel | undefined {
+    if (!requested || allowed.length === 0) return undefined;
+    if (allowed.includes(requested)) return requested;
+
+    // Prefer low when medium/minimal is unsupported to preserve deterministic output.
+    if ((requested === 'medium' || requested === 'minimal') && allowed.includes('low')) return 'low';
+    if (allowed.includes('high')) return 'high';
+    if (allowed.includes('low')) return 'low';
+    return allowed[0];
 }
 
 export class CostTracker {
@@ -1188,6 +1316,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
     async create(request: InteractionRequest): Promise<InteractionResponse> {
         const MAX_RETRIES = 2;
         const BASE_DELAY_MS = 2000;
+        let thinkingLevelCompatibilityRetried = false;
         
         // --- CIRCUIT BREAKER: Check if we should use fallback model ---
         const isAgentRequest = typeof request.agent === 'string' && request.agent.trim().length > 0;
@@ -1199,7 +1328,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
         let usingFallback = false;
         
         if (!isAgentRequest && isFirstTurn && normalizeModelName(requestedModel) === normalizeModelName(MODEL_AGENTIC)) {
-            const circuitResult = getEffectiveModel(requestedModel, MODEL_SIMPLE);
+            const circuitResult = getEffectiveModel(requestedModel, MODEL_FALLBACK);
             effectiveModel = circuitResult.model;
             usingFallback = circuitResult.isFallback;
             
@@ -1217,9 +1346,35 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
             }
         }
 
+        // If 3.1 is actively cooling down, route immediately to Flash fallback to avoid repeated quota hits.
+        // Clear previous_interaction_id because cross-model context chaining is not reliable.
+        const activeRequestedModel = request.model || requestedModel;
+        if (!isAgentRequest && normalizeModelName(activeRequestedModel) === normalizeModelName(MODEL_AGENTIC)) {
+            const cooldownRemainingMs = getModelCooldownRemainingMs(activeRequestedModel);
+            if (cooldownRemainingMs > 0) {
+                console.warn(
+                    `[MODEL PACE] ${normalizeModelName(activeRequestedModel)} cooling down (${Math.ceil(cooldownRemainingMs / 1000)}s left). Routing to ${MODEL_FALLBACK}.`
+                );
+                usingFallback = true;
+                request = {
+                    ...request,
+                    model: MODEL_FALLBACK,
+                    previous_interaction_id: undefined,
+                    generation_config: {
+                        ...(request.generation_config || {}),
+                        temperature: Math.min(request.generation_config?.temperature ?? 0.2, 0.2),
+                        max_output_tokens: Math.min(request.generation_config?.max_output_tokens ?? 4096, 4096),
+                    }
+                };
+            }
+        }
+
         for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             const requestTarget = request.agent ? `agent:${request.agent}` : (request.model || 'model');
             console.log(`[INTERACTIONS CLIENT] Sending request to ${requestTarget}${attempt > 1 ? ` (attempt ${attempt}/${MAX_RETRIES})` : ''}${usingFallback ? ' (circuit breaker fallback)' : ''}...`);
+
+            // Global pacing to avoid bursting high-tier models (especially 3.1 Pro).
+            await waitForModelPacing(request.model || requestedModel);
 
             const controller = new AbortController();
             const timeoutMs = 300_000; // 5 minute timeout
@@ -1249,9 +1404,70 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                 if (!response.ok) {
                     const errorText = await response.text();
                     const status = response.status;
+                    const activeModel = request.model || requestedModel;
+                    const activeModelNormalized = normalizeModelName(activeModel);
+
+                    if (status === 429) {
+                        registerGeminiRateLimit(activeModelNormalized, errorText, status);
+
+                        const isPrimaryAgentic = normalizeModelName(activeModel) === normalizeModelName(MODEL_AGENTIC);
+                        if (!usingFallback && !isAgentRequest && isPrimaryAgentic) {
+                            console.warn(`[CIRCUIT BREAKER] 429 from ${activeModelNormalized}. Retrying with ${MODEL_FALLBACK}.`);
+                            usingFallback = true;
+                            request = {
+                                ...request,
+                                model: MODEL_FALLBACK,
+                                previous_interaction_id: undefined,
+                                generation_config: {
+                                    ...(request.generation_config || {}),
+                                    temperature: Math.min(request.generation_config?.temperature ?? 0.2, 0.2),
+                                    max_output_tokens: Math.min(request.generation_config?.max_output_tokens ?? 4096, 4096)
+                                }
+                            };
+
+                            clearTimeout(timeoutId);
+                            clearInterval(progressInterval);
+                            continue;
+                        }
+                    }
+
+                    // Some models do not support all thinking levels (e.g., 3.1 Pro allows low/high only).
+                    // If this happens, remap to an allowed value and retry once.
+                    if (
+                        status === 400 &&
+                        !thinkingLevelCompatibilityRetried &&
+                        request.generation_config?.thinking_level &&
+                        /not a supported thinking level/i.test(errorText)
+                    ) {
+                        const requestedThinkingLevel = request.generation_config.thinking_level;
+                        const allowedThinkingLevels = parseAllowedThinkingLevels(errorText);
+                        const compatibleThinkingLevel = pickSupportedThinkingLevel(
+                            requestedThinkingLevel,
+                            allowedThinkingLevels
+                        );
+
+                        if (compatibleThinkingLevel && compatibleThinkingLevel !== requestedThinkingLevel) {
+                            thinkingLevelCompatibilityRetried = true;
+                            request = {
+                                ...request,
+                                generation_config: {
+                                    ...(request.generation_config || {}),
+                                    thinking_level: compatibleThinkingLevel
+                                }
+                            };
+
+                            console.warn(
+                                `[INTERACTIONS CLIENT] thinking_level "${requestedThinkingLevel}" unsupported for ${request.model || 'requested model'}. Retrying with "${compatibleThinkingLevel}".`
+                            );
+
+                            clearTimeout(timeoutId);
+                            clearInterval(progressInterval);
+                            continue;
+                        }
+                    }
 
                     // --- CIRCUIT BREAKER: Record failure for the requested model ---
-                    if ((status === 500 || status === 503) && !usingFallback && !isAgentRequest) {
+                    if ((status === 500 || status === 503 || status === 429) && !usingFallback && !isAgentRequest) {
                         recordModelFailure(requestedModel, status);
                     }
 
@@ -1259,7 +1475,9 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     const isTransient = status === 500 || status === 503 || status === 429;
 
                     if (isTransient && attempt < MAX_RETRIES) {
-                        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
+                        const delay = status === 429
+                            ? Math.max(8_000, BASE_DELAY_MS * Math.pow(2, attempt - 1))
+                            : BASE_DELAY_MS * Math.pow(2, attempt - 1); // Exponential backoff
                         console.warn(`[INTERACTIONS CLIENT] Transient error (${status}). Retrying in ${delay}ms...`);
                         clearTimeout(timeoutId);
                         clearInterval(progressInterval);
@@ -1268,12 +1486,12 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                     }
 
                     // --- CIRCUIT BREAKER: Last-ditch fallback if not already using fallback ---
-                    if (status === 500 && attempt === MAX_RETRIES && !usingFallback && isFirstTurn && !isAgentRequest) {
-                        console.warn(`🔴 [CIRCUIT BREAKER] Final fallback to ${MODEL_SIMPLE} after exhausting retries`);
+                    if ((status === 500 || status === 429) && attempt === MAX_RETRIES && !usingFallback && isFirstTurn && !isAgentRequest) {
+                        console.warn(`🔴 [CIRCUIT BREAKER] Final fallback to ${MODEL_FALLBACK} after exhausting retries`);
                         try {
                             const fallbackRequest: InteractionRequest = {
                                 ...request,
-                                model: MODEL_SIMPLE,
+                                model: MODEL_FALLBACK,
                                 previous_interaction_id: undefined,
                                 generation_config: {
                                     ...(request.generation_config || {}),
@@ -1285,6 +1503,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
 
                             clearTimeout(timeoutId);
                             clearInterval(progressInterval);
+                            await waitForModelPacing(MODEL_FALLBACK);
                             
                             const fallbackResponse = await fetch(`${INTERACTIONS_API_BASE}`, {
                                 method: 'POST',
@@ -1303,7 +1522,7 @@ Current value of process.env.API_KEY: ${process.env.API_KEY === undefined ? 'und
                                 } else if (rawFallback?.usage) {
                                     rawFallback.usage = normalizeUsage({ usage: rawFallback.usage }) || rawFallback.usage;
                                 }
-                                console.log(`🟢 [CIRCUIT BREAKER] Fallback to ${MODEL_SIMPLE} succeeded`);
+                                console.log(`🟢 [CIRCUIT BREAKER] Fallback to ${MODEL_FALLBACK} succeeded`);
                                 return rawFallback;
                             }
                         } catch (fallbackErr: any) {
@@ -1827,9 +2046,27 @@ export async function runAgentLoop(
             console.error(`[AGENT LOOP] Error at iteration ${iteration}:`, err.message);
 
             // If it's a rate limit or transient error, wait and retry
-            if (err.message.includes('429') || err.message.includes('503')) {
-                const delay = Math.pow(2, iteration) * 1000;
-                console.warn(`[AGENT LOOP] Rate limited. Waiting ${delay}ms...`);
+            const errMessage = String(err?.message || '');
+            if (errMessage.includes('429') || errMessage.includes('503')) {
+                const quotaLimited = isQuotaLimitedError(errMessage);
+                const pacing = getModelPacingConfig(config.model);
+                if (errMessage.includes('429')) {
+                    registerGeminiRateLimit(config.model, errMessage, 429);
+                } else {
+                    setModelCooldown(
+                        config.model,
+                        pacing.cooldownMs,
+                        'agent loop service unavailable'
+                    );
+                    setGlobalGeminiCooldown(
+                        GLOBAL_GEMINI_PACING.cooldownMs,
+                        'agent loop service unavailable'
+                    );
+                }
+                const delay = quotaLimited
+                    ? Math.max(15_000, Math.pow(2, iteration) * 2_000)
+                    : Math.max(8_000, Math.pow(2, iteration) * 1_000);
+                console.warn(`[AGENT LOOP] ${quotaLimited ? 'Quota limited' : 'Rate limited'}. Waiting ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
                 continue;
             }
@@ -1912,7 +2149,7 @@ export async function createInteraction(
         // Degeneration happens when the model gets stuck in repetition loops.
         // FIX STRATEGY: 
         // 1. First retry with temperature=0.0 for determinism
-        // 2. If still degenerated, fall back to MODEL_SIMPLE (different model architecture)
+        // 2. If still degenerated, fall back to MODEL_FALLBACK (different model architecture)
         // 3. Simplify prompt to avoid layout-type confusion
         if (hasEntropyDegeneration(extractedText)) {
             console.warn(`[INTERACTIONS CLIENT] Degenerate output detected. Reissuing with stabilized config...`);
@@ -1954,18 +2191,18 @@ export async function createInteraction(
                     if (output.type === 'text') {
                         // Check if retry ALSO produced degeneration
                         if (hasEntropyDegeneration(output.text)) {
-                            console.warn(`[INTERACTIONS CLIENT] Degeneration persists after retry. Falling back to ${MODEL_SIMPLE}...`);
-                            break; // Fall through to MODEL_SIMPLE fallback below
+                            console.warn(`[INTERACTIONS CLIENT] Degeneration persists after retry. Falling back to ${MODEL_FALLBACK}...`);
+                            break; // Fall through to MODEL_FALLBACK fallback below
                         }
                         console.log(`[INTERACTIONS CLIENT] Degeneration retry succeeded`);
                         return output.text;
                     }
                 }
                 
-                // If we got here, degeneration persisted. Try MODEL_SIMPLE as last resort
-                console.warn(`[INTERACTIONS CLIENT] Attempting MODEL_SIMPLE fallback for persistent degeneration...`);
+                // If we got here, degeneration persisted. Try MODEL_FALLBACK as last resort
+                console.warn(`[INTERACTIONS CLIENT] Attempting MODEL_FALLBACK fallback for persistent degeneration...`);
                 const simpleFallbackRequest: InteractionRequest = {
-                    model: MODEL_SIMPLE,
+                    model: MODEL_FALLBACK,
                     input: prompt,
                     system_instruction: options.systemInstruction,
                     response_format: options.responseFormat,
@@ -1981,17 +2218,17 @@ export async function createInteraction(
                     const simpleFallbackResponse = await client.create(simpleFallbackRequest);
                     if (costTracker) {
                         const usage = normalizeUsage(simpleFallbackResponse);
-                        if (usage) costTracker.addUsage(normalizeModelName(MODEL_SIMPLE), usage);
+                        if (usage) costTracker.addUsage(normalizeModelName(MODEL_FALLBACK), usage);
                     }
                     
                     for (const output of simpleFallbackResponse.outputs || []) {
                         if (output.type === 'text' && !hasEntropyDegeneration(output.text)) {
-                            console.log(`[INTERACTIONS CLIENT] MODEL_SIMPLE fallback succeeded`);
+                            console.log(`[INTERACTIONS CLIENT] MODEL_FALLBACK fallback succeeded`);
                             return output.text;
                         }
                     }
                 } catch (simpleFallbackErr: any) {
-                    console.error(`[INTERACTIONS CLIENT] MODEL_SIMPLE fallback failed:`, simpleFallbackErr.message);
+                    console.error(`[INTERACTIONS CLIENT] MODEL_FALLBACK fallback failed:`, simpleFallbackErr.message);
                 }
             } catch (retryErr: any) {
                 console.error(`[INTERACTIONS CLIENT] Degeneration retry failed:`, retryErr.message);
@@ -2015,7 +2252,7 @@ export async function createInteraction(
         // Retry without thinking to maximize output budget
         // CRITICAL: Use temperature=0 to avoid degeneration on retries
         const retryRequest: InteractionRequest = {
-            model: MODEL_SIMPLE,  // Use simpler model for reliability
+            model: MODEL_FALLBACK,  // Use fallback model for reliability
             input: prompt,
             system_instruction: options.systemInstruction,
             response_format: options.responseFormat,
@@ -2029,8 +2266,8 @@ export async function createInteraction(
 
         try {
             const retryResponse = await client.create(retryRequest);
-            const retryRequestedModel = normalizeModelName(MODEL_SIMPLE);
-            const retryResolvedModel = normalizeModelName(retryResponse.model || MODEL_SIMPLE);
+            const retryRequestedModel = normalizeModelName(MODEL_FALLBACK);
+            const retryResolvedModel = normalizeModelName(retryResponse.model || MODEL_FALLBACK);
             if (retryResponse.model && retryResolvedModel !== retryRequestedModel) {
                 console.log(`[INTERACTIONS CLIENT] Model resolved to ${retryResolvedModel} (requested ${retryRequestedModel})`);
             }
@@ -2061,7 +2298,7 @@ export async function createInteraction(
                         break; // Fall through to Qwen fallback
                     }
                     
-                    console.log(`[INTERACTIONS CLIENT] Retry succeeded with ${MODEL_SIMPLE}`);
+                    console.log(`[INTERACTIONS CLIENT] Retry succeeded with ${MODEL_FALLBACK}`);
                     return retryText;
                 }
             }

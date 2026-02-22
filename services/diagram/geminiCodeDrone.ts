@@ -24,6 +24,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { paceGeminiApiCall, registerGeminiRateLimit } from '../interactionsClient';
 import type { CostTracker } from '../interactionsClient';
 
 // ============================================================================
@@ -73,12 +74,12 @@ const DEFAULT_OPTIONS: Required<CodeDroneOptions> = {
 /**
  * GeminiCodeDrone - Isolated use case for Python code execution
  * 
- * Uses Gemini 3.0 Flash Preview with code execution capability
+ * Uses Gemini 3 Flash Preview with code execution capability
  * to generate custom diagrams iteratively.
  */
 export class GeminiCodeDrone {
     private apiKey: string;
-    private model: string = 'gemini-2.5-flash-preview-05-20';
+    private model: string = 'gemini-3-flash-preview';
     private client: GoogleGenAI | null = null;
 
     constructor() {
@@ -121,7 +122,7 @@ export class GeminiCodeDrone {
 
         try {
             const prompt = this.buildCodeGenerationPrompt(data, visualIntent, opts);
-            
+
             let bestResult: CodeDroneResult | null = null;
             let iterations = 0;
 
@@ -131,6 +132,7 @@ export class GeminiCodeDrone {
                 console.log(`[GEMINI-CODE-DRONE] Iteration ${iterations}/${opts.maxIterations}`);
 
                 // Use @google/genai SDK with code execution tool
+                await paceGeminiApiCall(this.model);
                 const response = await this.client.models.generateContent({
                     model: this.model,
                     contents: prompt,
@@ -155,10 +157,10 @@ export class GeminiCodeDrone {
 
                 // Extract execution result
                 const executionResult = this.extractExecutionResult(response);
-                
+
                 if (executionResult.svg) {
                     const validation = this.validateSvgOutput(executionResult.svg, opts);
-                    
+
                     bestResult = {
                         svg: executionResult.svg,
                         pythonCode: executionResult.code,
@@ -186,6 +188,7 @@ export class GeminiCodeDrone {
 
             throw new Error('Code execution did not produce valid SVG output');
         } catch (error: any) {
+            registerGeminiRateLimit(this.model, String(error?.message || error), error?.status);
             console.error(`[GEMINI-CODE-DRONE] Error: ${error.message}`);
             throw error;
         }
@@ -200,7 +203,7 @@ export class GeminiCodeDrone {
         opts: Required<CodeDroneOptions>
     ): string {
         const colorPaletteStr = opts.colorPalette.map(c => `'${c}'`).join(', ');
-        
+
         return `Generate a Python script using matplotlib or plotly to create: ${visualIntent}
 
 DATA:
@@ -236,17 +239,17 @@ Execute the code and return the SVG content.`;
             for (const candidate of candidates) {
                 const content = candidate.content || {};
                 const parts = content.parts || [];
-                
+
                 for (const part of parts) {
                     // Extract code from executableCode part
                     if (part.executableCode) {
                         code = part.executableCode.code || '';
                     }
-                    
+
                     // Extract execution result from codeExecutionResult part
                     if (part.codeExecutionResult) {
                         const output = part.codeExecutionResult.output || '';
-                        
+
                         // Check if output contains SVG
                         if (output.includes('<svg')) {
                             const svgMatch = output.match(/<svg[\s\S]*<\/svg>/);
@@ -255,7 +258,7 @@ Execute the code and return the SVG content.`;
                             }
                         }
                     }
-                    
+
                     // Check text parts for SVG (fallback)
                     if (part.text && part.text.includes('<svg')) {
                         const svgMatch = part.text.match(/<svg[\s\S]*<\/svg>/);
@@ -265,7 +268,7 @@ Execute the code and return the SVG content.`;
                     }
                 }
             }
-            
+
             // Also check top-level text property (some SDK versions)
             if (!svg && response.text && typeof response.text === 'string') {
                 if (response.text.includes('<svg')) {
@@ -298,7 +301,7 @@ Execute the code and return the SVG content.`;
             // Extract dimensions
             const widthMatch = svg.match(/width=["']?(\d+)/);
             const heightMatch = svg.match(/height=["']?(\d+)/);
-            
+
             if (widthMatch) dimensions.width = parseInt(widthMatch[1]);
             if (heightMatch) dimensions.height = parseInt(heightMatch[1]);
 
@@ -314,7 +317,7 @@ Execute the code and return the SVG content.`;
 
             // Count elements
             elementsCount = (svg.match(/<(rect|circle|path|text|line|polygon|ellipse)/g) || []).length;
-            
+
             if (elementsCount === 0) {
                 errors.push('SVG contains no visual elements');
             }
@@ -380,13 +383,13 @@ export async function generateCustomVisualization(
     costTracker?: CostTracker
 ): Promise<{ svg: string; validation: CodeDroneValidation }> {
     const drone = getGeminiCodeDrone();
-    
+
     if (!drone.isAvailable()) {
         throw new Error('Gemini Code Drone not available');
     }
 
     const result = await drone.generateCustomDiagram(data, visualIntent, costTracker);
-    
+
     return {
         svg: result.svg,
         validation: result.validation

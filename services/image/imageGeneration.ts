@@ -1,5 +1,5 @@
 import { GoogleGenAI, Modality } from "@google/genai";
-import { CostTracker } from "../interactionsClient";
+import { CostTracker, paceGeminiApiCall, registerGeminiRateLimit } from "../interactionsClient";
 
 // Helper to get AI client for image generation (still uses generateContent)
 const getAiClient = () => {
@@ -117,6 +117,7 @@ NEGATIVE (DO NOT INCLUDE): ${NEGATIVE_PROMPT_INFO}
     for (const modelName of models) {
         try {
             console.log(`[IMAGE GEN] Attempting ${modelName}...`);
+            await paceGeminiApiCall(modelName);
 
             const response = await ai.models.generateContent({
                 model: modelName,
@@ -147,6 +148,7 @@ NEGATIVE (DO NOT INCLUDE): ${NEGATIVE_PROMPT_INFO}
             errors.push({ type: 'unknown', model: modelName, message: 'No image data in response', retryable: true });
 
         } catch (e: any) {
+            registerGeminiRateLimit(modelName, String(e?.message || e), e?.status);
             const classifiedError = classifyImageError(e, modelName);
             errors.push(classifiedError);
 

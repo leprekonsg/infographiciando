@@ -34,7 +34,7 @@ import {
     CostTracker
 } from "./interactionsClient";
 import { PROMPTS } from "./promptRegistry";
-import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence, validateContentCompleteness, checkNoPlaceholderShippingGate } from "./validators";
+import { validateSlide, validateVisualLayoutAlignment, validateGeneratorCompliance, validateDeckCoherence, validateContentCompleteness, checkNoPlaceholderShippingGate, postAssemblySmokeTest } from "./validators";
 import { runVisualDesigner, runVisualCritique, runLayoutRepair } from "./visualDesignAgent";
 import { SpatialLayoutEngine, createEnvironmentSnapshot } from "./spatialRenderer";
 import { autoRepairSlide } from "./repair/autoRepair";
@@ -153,7 +153,7 @@ const clamp01 = (value: number): number => Math.max(0, Math.min(1, value));
 
 const VALID_COMPONENT_TYPES = new Set([
     'text-bullets',
-    'metric-cards', 
+    'metric-cards',
     'process-flow',
     'icon-grid',
     'chart-frame',
@@ -166,30 +166,30 @@ const VALID_COMPONENT_TYPES = new Set([
  */
 function validateComponentType(rawType: string | undefined): string {
     if (!rawType) return 'text-bullets';
-    
+
     // Exact match (fast path)
     const normalized = rawType.toLowerCase().trim();
     if (VALID_COMPONENT_TYPES.has(normalized)) {
         return normalized;
     }
-    
+
     // Check for degeneration patterns (type + garbage)
     for (const validType of VALID_COMPONENT_TYPES) {
         if (normalized.startsWith(validType)) {
-            console.warn(`[BELIEF ANCHOR] Type degeneration detected: "${rawType.slice(0, 40)}" → "${validType}"`);
+            console.warn(`[BELIEF ANCHOR] Type degeneration detected: "${rawType.slice(0, 40)}" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ "${validType}"`);
             return validType;
         }
     }
-    
+
     // Check for embedded type
     for (const validType of VALID_COMPONENT_TYPES) {
         if (normalized.includes(validType)) {
-            console.warn(`[BELIEF ANCHOR] Extracted type from garbage: "${rawType.slice(0, 40)}" → "${validType}"`);
+            console.warn(`[BELIEF ANCHOR] Extracted type from garbage: "${rawType.slice(0, 40)}" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ "${validType}"`);
             return validType;
         }
     }
-    
-    console.warn(`[BELIEF ANCHOR] Unknown type "${rawType.slice(0, 40)}" → "text-bullets" (safe fallback)`);
+
+    console.warn(`[BELIEF ANCHOR] Unknown type "${rawType.slice(0, 40)}" ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ "text-bullets" (safe fallback)`);
     return 'text-bullets';
 }
 
@@ -330,7 +330,7 @@ function normalizeMetricDataPoint(
         const labelTextSource = textCandidates.find((v: any) => typeof v === 'string' && v.trim().length > 0);
         if (typeof labelTextSource === 'string') {
             label = labelTextSource
-                .replace(/[$€£]?\d[\d,.]*(?:\.\d+)?%?/g, ' ')
+                .replace(/[$ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â£]?\d[\d,.]*(?:\.\d+)?%?/g, ' ')
                 .replace(/\s+/g, ' ')
                 .trim()
                 .split(' ')
@@ -378,6 +378,58 @@ function synthesizeMetricsFromDataPoints(
         .filter((d): d is { value: string; label: string; icon: string } => !!d);
 
     return normalized.slice(0, Math.max(2, Math.min(maxItems, 4)));
+}
+
+function normalizeIconGridLabel(raw: string): string {
+    const text = String(raw || '')
+        .replace(/^[-*\d.)\s]+/, '')
+        .replace(/\([^)]*\)/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!text) return '';
+
+    const lead = text.split(/[:;-]/)[0].trim();
+    const words = lead.split(/\s+/).filter(Boolean);
+    return words.slice(0, 4).join(' ').trim();
+}
+
+function synthesizeIconGridItemsFromKeyPoints(
+    keyPoints: string[] | undefined,
+    maxItems = 4
+): Array<{ label: string; icon: string; description?: string }> {
+    const source = Array.isArray(keyPoints) ? keyPoints : [];
+    const items: Array<{ label: string; icon: string; description?: string }> = [];
+    const seen = new Set<string>();
+
+    for (const point of source) {
+        const raw = sanitizeSlideText(String(point || ''), 90);
+        const label = normalizeIconGridLabel(raw);
+        const key = label.toLowerCase();
+        if (!label || seen.has(key)) continue;
+
+        const description = sanitizeSlideText(raw, 80);
+        items.push({
+            label,
+            icon: inferMetricIcon(label, items.length),
+            ...(description && description.toLowerCase() !== label.toLowerCase() ? { description } : {})
+        });
+        seen.add(key);
+
+        if (items.length >= Math.min(Math.max(maxItems, 3), 6)) break;
+    }
+
+    if (items.length === 0) return [];
+
+    const fallbackLabels = ['Priority Focus', 'Execution Track', 'Expected Outcome'];
+    for (let i = 0; i < fallbackLabels.length && items.length < 3; i++) {
+        const label = fallbackLabels[i];
+        const key = label.toLowerCase();
+        if (seen.has(key)) continue;
+        items.push({ label, icon: inferMetricIcon(label, items.length) });
+        seen.add(key);
+    }
+
+    return items.slice(0, Math.min(Math.max(maxItems, 3), 6));
 }
 
 function isOpeningNarrativeSlide(slideMeta: any, slideIndex: number): boolean {
@@ -587,9 +639,21 @@ const VARIANT_LIMITS: Record<string, {
 function trimText(input: string, max: number): string {
     if (!input || typeof input !== 'string') return input as any;
     if (input.length <= max) return input;
-    return input.slice(0, Math.max(0, max - 1)).trimEnd() + '…';
-}
 
+    const safeMax = Math.max(8, max);
+    const clipAt = Math.max(1, safeMax - 3);
+    const target = input.slice(0, clipAt);
+    const lastBoundary = Math.max(
+        target.lastIndexOf(' '),
+        target.lastIndexOf('-'),
+        target.lastIndexOf('/'),
+        target.lastIndexOf(',')
+    );
+    const clipped = lastBoundary >= Math.floor(clipAt * 0.65)
+        ? target.slice(0, lastBoundary)
+        : target;
+    return clipped.trimEnd() + '...';
+}
 function getBodyFontSize(styleGuide?: GlobalStyleGuide): number {
     const body = styleGuide?.themeTokens?.typography?.scale?.body;
     if (typeof body === 'number' && body > 6) return body;
@@ -923,14 +987,14 @@ function applySpatialPreflightAdjustments(
  * TWO-TIER VISUAL CRITIQUE APPROACH:
  *
  * Default (Fast Path):
- * - SVG proxy → PNG (resvg-js) → Qwen-VL critique
+ * - SVG proxy ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ PNG (resvg-js) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Qwen-VL critique
  * - Deterministic, no Chromium dependency
  * - ~200-500ms per critique
  * - Best for iterative refinement in System 2 loop
  * - Render fidelity: "svg-proxy"
  *
  * Escalation (Slow Path - Future):
- * - PPTX export → LibreOffice render → PDF → PNG → Qwen-VL
+ * - PPTX export ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ LibreOffice render ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ PDF ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ PNG ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Qwen-VL
  * - Validates actual PPTX rendering (text wrapping, fonts, etc.)
  * - ~2-5s per critique
  * - Use for persistent issues or final quality gate
@@ -994,7 +1058,7 @@ async function runRecursiveVisualCritique(
             const svgProxy = generateSvgProxy(currentSlide, styleGuide);
 
             // --- QWEN-VL STYLE-AWARE VISUAL CRITIQUE (External Visual Cortex) ---
-            // Fast Path: SVG proxy → PNG (resvg) → Qwen-VL with style rubric
+            // Fast Path: SVG proxy ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ PNG (resvg) ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Qwen-VL with style rubric
             // This provides real bounding box detection and spatial analysis
             let externalCritique: any = null;
             if (isQwenVLAvailable()) {
@@ -1161,7 +1225,7 @@ async function runRecursiveVisualCritique(
                             styleMode  // Pass styleMode for style filtering
                         );
 
-                        console.log(`[SYSTEM 2] Re-routed: ${currentSlide.routerConfig?.layoutVariant} → ${reroutedDecision.layoutVariant}`);
+                        console.log(`[SYSTEM 2] Re-routed: ${currentSlide.routerConfig?.layoutVariant} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${reroutedDecision.layoutVariant}`);
 
                         // Update slide with new layout decision
                         currentSlide.routerConfig = {
@@ -1304,12 +1368,12 @@ async function runRecursiveVisualCritique(
 
                 if (repairedValidation.passed &&
                     (meetsMinImprovement || crossedThreshold)) {
-                    console.log(`[SYSTEM 2] Repair succeeded (${currentValidation.score} → ${repairedValidation.score}, Δ=${improvement})`);
+                    console.log(`[SYSTEM 2] Repair succeeded (${currentValidation.score} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${repairedValidation.score}, ÃƒÅ½Ã¢â‚¬Â=${improvement})`);
                     currentSlide = normalizedRepair;
                     currentValidation = repairedValidation;
                     repairSucceeded = true;
                 } else {
-                    console.warn(`[SYSTEM 2] Repair did not improve slide (Δ=${improvement}), keeping original`);
+                    console.warn(`[SYSTEM 2] Repair did not improve slide (ÃƒÅ½Ã¢â‚¬Â=${improvement}), keeping original`);
                     // Keep current slide, exit loop
                     break;
                 }
@@ -1723,7 +1787,7 @@ async function runGenerator(
     const enforcedVisualDesignSpec = enforceVisualFocusInSpec(visualDesignSpec, routerConfig.visualFocus);
 
     // ============================================================================
-    // EARLY LAYOUT PRECONDITION CHECK (Observe → Think → Act principle)
+    // EARLY LAYOUT PRECONDITION CHECK (Observe ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Think ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Act principle)
     // ============================================================================
     // Check if the requested layout is compatible with available content BEFORE
     // starting the generation loop. This prevents wasted LLM calls and cascading
@@ -1734,7 +1798,7 @@ async function runGenerator(
         'dashboard-tiles': { needsMetrics: true },
         'bento-grid': { needsMetrics: true }
     };
-    
+
     const layoutReq = LAYOUT_METRIC_REQUIREMENTS[routerConfig.layoutVariant];
     if (layoutReq?.needsMetrics && !canUseMetricCards(safeContentPlan.dataPoints)) {
         console.log(`[GENERATOR] Early layout precondition failed: ${routerConfig.layoutVariant} requires valid metric-cards data but dataPoints are insufficient. Auto-rerouting to standard-vertical.`);
@@ -1776,7 +1840,7 @@ async function runGenerator(
             const hasValidDataPoints = canUseMetricCards(safeContentPlan.dataPoints);
 
             // Build metric example with ACTUAL dataPoint values to seed the model's output
-            // This follows the "Observe → Think → Act" principle: inject real data, not placeholders
+            // This follows the "Observe ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Think ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Act" principle: inject real data, not placeholders
             let metricExample: string;
             if (hasValidDataPoints) {
                 // Extract valid dataPoints with proper fallbacks
@@ -1867,7 +1931,7 @@ NOTE: Do NOT add a "title" field to text-bullets - the slide already has a title
                 const simplifiedPrompt = `Generate a slide layout JSON for: "${meta.title}"
 
 Content to include:
-${safeContentPlan.keyPoints.map((p, i) => `${i+1}. ${p}`).join('\n')}
+${safeContentPlan.keyPoints.map((p, i) => `${i + 1}. ${p}`).join('\n')}
 ${safeContentPlan.dataPoints?.length ? `\nData: ${safeContentPlan.dataPoints.map(d => `${d.label}: ${d.value}`).join(', ')}` : ''}
 
 Requirements:
@@ -1953,12 +2017,12 @@ Expected structure:
 
             // Check for degeneration fallback response (returned by early abort in createJsonInteraction)
             // These have generic titles like "Content" or "Content Recovery" from the fallback logic
-            const isDegenerationFallback = raw?.layoutPlan?.title === 'Content' || 
-                                           raw?.layoutPlan?.title === 'Content Recovery' ||
-                                           raw?.speakerNotesLines?.some((n: string) => 
-                                               n.includes('degenerated') || n.includes('recovery') || n.includes('issue')
-                                           );
-            
+            const isDegenerationFallback = raw?.layoutPlan?.title === 'Content' ||
+                raw?.layoutPlan?.title === 'Content Recovery' ||
+                raw?.speakerNotesLines?.some((n: string) =>
+                    n.includes('degenerated') || n.includes('recovery') || n.includes('issue')
+                );
+
             if (isDegenerationFallback) {
                 console.warn(`[GENERATOR] Detected degeneration fallback response - will retry with lower temperature`);
                 generatorFailures++;
@@ -2007,7 +2071,7 @@ Expected structure:
                     }
                     return c;
                 });
-                
+
                 if (beliefAnchorFixed > 0) {
                     console.log(`[GENERATOR] Belief anchor enforced: fixed ${beliefAnchorFixed} component type(s)`);
                     candidate.warnings = [
@@ -2015,7 +2079,7 @@ Expected structure:
                         `Belief anchor: ${beliefAnchorFixed} component type(s) normalized`
                     ];
                 }
-                
+
                 // ============================================================================
                 // EMPTY ARRAY PREVENTION (Fixed 2026-01-26)
                 // ============================================================================
@@ -2037,7 +2101,7 @@ Expected structure:
                     }
                     return clean;
                 };
-                
+
                 candidate.layoutPlan.components = candidate.layoutPlan.components.map((c: any) => {
                     // METRIC-CARDS: Check both precondition AND actual array content
                     if (c.type === 'metric-cards') {
@@ -2067,7 +2131,7 @@ Expected structure:
                         }
 
                         if (!hasEnoughDataPoints || !hasMetricsArray) {
-                            console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${Array.isArray(c.metrics) ? c.metrics.length : 0}) → text-bullets`);
+                            console.warn(`[GENERATOR] Precondition failed: metric-cards without valid data (dataPoints: ${safeContentPlan.dataPoints?.length || 0}, metrics: ${Array.isArray(c.metrics) ? c.metrics.length : 0}) -> text-bullets`);
                             return {
                                 type: 'text-bullets',
                                 ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
@@ -2075,12 +2139,22 @@ Expected structure:
                             };
                         }
                     }
-                    
+
                     // ICON-GRID: Check if items array is populated
                     if (c.type === 'icon-grid') {
                         const hasItemsArray = Array.isArray(c.items) && c.items.length >= 2;
                         if (!hasItemsArray) {
-                            console.warn(`[GENERATOR] Precondition failed: icon-grid without valid items (${c.items?.length || 0}) → text-bullets`);
+                            const synthesizedItems = synthesizeIconGridItemsFromKeyPoints(safeContentPlan.keyPoints, 4);
+                            if (synthesizedItems.length >= 3) {
+                                console.log(`[GENERATOR] Recovered icon-grid from contentPlan.keyPoints (${synthesizedItems.length} items)`);
+                                return {
+                                    ...c,
+                                    type: 'icon-grid',
+                                    cols: Math.min(3, synthesizedItems.length),
+                                    items: synthesizedItems
+                                };
+                            }
+                            console.warn(`[GENERATOR] Precondition failed: icon-grid without valid items (${c.items?.length || 0}) -> text-bullets`);
                             return {
                                 type: 'text-bullets',
                                 ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
@@ -2088,12 +2162,11 @@ Expected structure:
                             };
                         }
                     }
-                    
                     // PROCESS-FLOW: Check if steps array is populated
                     if (c.type === 'process-flow') {
                         const hasStepsArray = Array.isArray(c.steps) && c.steps.length >= 2;
                         if (!hasStepsArray) {
-                            console.warn(`[GENERATOR] Precondition failed: process-flow without valid steps (${c.steps?.length || 0}) → text-bullets`);
+                            console.warn(`[GENERATOR] Precondition failed: process-flow without valid steps (${c.steps?.length || 0}) -> text-bullets`);
                             return {
                                 type: 'text-bullets',
                                 ...(sanitizeFallbackTitle(c.title) ? { title: sanitizeFallbackTitle(c.title) } : {}),
@@ -2101,7 +2174,7 @@ Expected structure:
                             };
                         }
                     }
-                    
+
                     return c;
                 });
             }
@@ -2116,12 +2189,12 @@ Expected structure:
             // This prevents the "[AUTO-REPAIR] chart-frame has no data" cascade
             if (candidate.type === 'data-viz' && candidate.chartSpec && candidate.layoutPlan?.components) {
                 const hasFrame = candidate.layoutPlan.components.some((c: any) => c.type === 'chart-frame');
-                const hasValidChartData = Array.isArray(candidate.chartSpec.data) && 
-                                          candidate.chartSpec.data.length >= 2 &&
-                                          candidate.chartSpec.data.every((d: any) => 
-                                              d && typeof d.value === 'number' && d.label
-                                          );
-                
+                const hasValidChartData = Array.isArray(candidate.chartSpec.data) &&
+                    candidate.chartSpec.data.length >= 2 &&
+                    candidate.chartSpec.data.every((d: any) =>
+                        d && typeof d.value === 'number' && d.label
+                    );
+
                 if (!hasFrame && hasValidChartData) {
                     candidate.layoutPlan.components.push({
                         type: 'chart-frame',
@@ -2135,7 +2208,7 @@ Expected structure:
             }
 
             candidate = autoRepairSlide(candidate, styleGuide);
-            
+
             // ============================================================================
             // LAYOUT-COMPONENT COMPATIBILITY CHECK (Post-autoRepair Safety Net)
             // ============================================================================
@@ -2149,14 +2222,14 @@ Expected structure:
                 'dashboard-tiles': ['metric-cards', 'chart-frame'],
                 'metrics-rail': ['metric-cards']
             };
-            
+
             const currentLayout = candidate.routerConfig?.layoutVariant || routerConfig.layoutVariant;
             const requiredTypes = LAYOUT_REQUIREMENTS[currentLayout];
-            
+
             if (candidate.layoutPlan?.components) {
                 const componentTypes = candidate.layoutPlan.components.map((c: any) => c.type);
                 const hasRequiredType = !requiredTypes || requiredTypes.some(rt => componentTypes.includes(rt));
-                
+
                 // Also check component count for layouts that need 2+ components
                 const LAYOUT_MIN_COMPONENTS: Record<string, number> = {
                     'metrics-rail': 2,
@@ -2174,7 +2247,7 @@ Expected structure:
                 const isAsymmetricGrid = currentLayout === 'asymmetric-grid';
                 const allTextBullets = componentTypes.length > 0 && componentTypes.every((t: string) => t === 'text-bullets');
                 const degradedAsymmetricGrid = isAsymmetricGrid && allTextBullets;
-                
+
                 if (!hasRequiredType || !hasEnoughComponents || degradedAsymmetricGrid) {
                     // Layout requires specific components that are missing - reroute to standard-vertical
                     const reason = degradedAsymmetricGrid
@@ -2182,12 +2255,12 @@ Expected structure:
                         : !hasRequiredType
                             ? `${currentLayout} requires ${requiredTypes.join(' or ')}`
                             : `${currentLayout} requires at least ${minRequired} components`;
-                    
+
                     // Avoid duplicate warnings if early precondition already added one
-                    const alreadyWarned = (candidate.warnings || []).some(w => 
+                    const alreadyWarned = (candidate.warnings || []).some(w =>
                         String(w).includes('precondition') || String(w).includes('Auto-rerouted')
                     );
-                    
+
                     if (!alreadyWarned) {
                         console.warn(`[GENERATOR] Post-repair check: ${reason}. Auto-rerouting to standard-vertical.`);
                         candidate.warnings = [
@@ -2195,14 +2268,14 @@ Expected structure:
                             `Auto-rerouted layout to standard-vertical: ${reason}`
                         ];
                     }
-                    
+
                     candidate.routerConfig = {
                         ...candidate.routerConfig,
                         layoutVariant: 'standard-vertical' as any
                     };
                 }
             }
-            
+
             const preflight = applySpatialPreflightAdjustments(candidate, styleGuide);
             candidate = preflight.slide;
             if (preflight.adjustments.length > 0) {
@@ -2310,7 +2383,7 @@ Expected structure:
             // ============================================================================
             // GATE ORDERING FOR COST CONTROL (Critical Change)
             // ============================================================================
-            // Order of gates (cheap → expensive):
+            // Order of gates (cheap ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ expensive):
             // 1. Content completeness (CHEAP) - if failing, skip VL entirely; regenerate/prune/summarize
             // 2. Fast layout score (CHEAP-ish) - only if content passes
             // 3. Full critique/repairs (EXPENSIVE) - only for slides that pass content AND still fail fit/score
@@ -2460,7 +2533,7 @@ Expected structure:
                         // Check if Qwen-VL Visual Architect is available (DEFAULT)
                         console.log(`[VISUAL ARCHITECT] Availability: ${qwenAvailable ? 'available' : 'unavailable'}`);
                         if (qwenAvailable) {
-                            console.log('✨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
+                            console.log('ÃƒÂ¢Ã…â€œÃ‚Â¨ [VISUAL ARCHITECT] Using Qwen-VL3 Visual Architect (vision-first, default)');
 
                             const visualArchitectOptions = {
                                 layoutVariant,
@@ -2491,7 +2564,7 @@ Expected structure:
                             candidate.validation = validateSlide(candidate);
                             lastValidation = candidate.validation;
 
-                            console.log(`✅ [VISUAL ARCHITECT] Complete: ${system2Rounds} rounds, final score: ${architectResult.finalScore}, converged: ${architectResult.converged}, cost: $${system2Cost.toFixed(4)}`);
+                            console.log(`ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ [VISUAL ARCHITECT] Complete: ${system2Rounds} rounds, final score: ${architectResult.finalScore}, converged: ${architectResult.converged}, cost: $${system2Cost.toFixed(4)}`);
 
                             if (progress?.onProgress) {
                                 progress.onProgress(`Visual Architect complete: score ${Math.round(architectResult.finalScore)} (${architectResult.converged ? 'converged' : 'not converged'})`);
@@ -2916,14 +2989,14 @@ function blueprintToEditableDeck(
             })),
             styleGuide: blueprint.styleGuide || {
                 themeName: 'Default',
-                fontFamilyTitle: 'Inter',
-                fontFamilyBody: 'Inter',
+                fontFamilyTitle: 'Calibri',
+                fontFamilyBody: 'Calibri Light',
                 colorPalette: {
-                    primary: '#10b981',
-                    secondary: '#3b82f6',
-                    background: '#0f172a',
-                    text: '#f8fafc',
-                    accentHighContrast: '#f59e0b'
+                    primary: '028090',
+                    secondary: '00A896',
+                    background: '0F172A',
+                    text: 'F8FAFC',
+                    accentHighContrast: '02C39A'
                 },
                 imageStyle: 'Clean',
                 layoutStrategy: 'Standard'
@@ -2964,26 +3037,26 @@ export const generateAgenticDeck = async (
     // If user pastes a complete presentation outline, extract just the core topic
     // This prevents the entire outline from being sent to each slide generator
     let sanitizedTopic = topic.trim();
-    
+
     // Detect common outline patterns (Slide 1:, Slide 2:, bullet points, etc.)
     const looksLikeFullOutline = (
         /Slide\s*\d+\s*:/i.test(sanitizedTopic) ||
-        /•\s*Title:|•\s*Content:|•\s*Visual:/i.test(sanitizedTopic) ||
+        /ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢\s*Title:|ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢\s*Content:|ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢\s*Visual:/i.test(sanitizedTopic) ||
         sanitizedTopic.split('\n').length > 10 ||
         sanitizedTopic.length > 2000
     );
-    
+
     if (looksLikeFullOutline) {
         console.warn(`[ORCHESTRATOR] Detected full outline input (${sanitizedTopic.length} chars, ${sanitizedTopic.split('\\n').length} lines). Extracting core topic...`);
-        
+
         // Try to extract the presentation title from common patterns
         // Pattern 1: "Presentation: Topic Name"
         const presentationMatch = sanitizedTopic.match(/^Presentation:\s*([^\n]+)/i);
         // Pattern 2: First line before any "Slide X:" or "Audience:"
-        const firstLineMatch = sanitizedTopic.match(/^([^\n•]+)/);
+        const firstLineMatch = sanitizedTopic.match(/^([^\nÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢]+)/);
         // Pattern 3: Title field in slide 1
-        const titleFieldMatch = sanitizedTopic.match(/Title:\s*([^\n•]+)/i);
-        
+        const titleFieldMatch = sanitizedTopic.match(/Title:\s*([^\nÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¢]+)/i);
+
         if (presentationMatch) {
             sanitizedTopic = presentationMatch[1].trim();
         } else if (titleFieldMatch) {
@@ -2994,16 +3067,16 @@ export const generateAgenticDeck = async (
             // Fallback: truncate to first 200 chars
             sanitizedTopic = sanitizedTopic.substring(0, 200).split('\n')[0].trim();
         }
-        
+
         console.log(`[ORCHESTRATOR] Extracted topic: "${sanitizedTopic}"`);
     }
-    
+
     // Safety cap: even after extraction, cap topic length
     if (sanitizedTopic.length > 500) {
         console.warn(`[ORCHESTRATOR] Topic still too long (${sanitizedTopic.length} chars), truncating to 500`);
         sanitizedTopic = sanitizedTopic.substring(0, 500);
     }
-    
+
     // Use sanitized topic for rest of generation
     topic = sanitizedTopic;
 
@@ -3244,7 +3317,7 @@ export const generateAgenticDeck = async (
                 avoidBullets: styleMode === 'serendipitous' && isHeroOrIntro
             };
 
-            console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} → max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars [${styleMode}]`);
+            console.log(`[ORCHESTRATOR] Layout-aware density: ${layoutVariant} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ max ${densityHint.maxBullets} bullets @ ${densityHint.maxCharsPerBullet} chars [${styleMode}]`);
 
             onProgress(`Agent 3b/5: Content Planning Slide ${i + 1} [${styleMode}]...`, 32 + Math.floor((i / (totalSlides * 2)) * 30));
 
@@ -3279,10 +3352,10 @@ export const generateAgenticDeck = async (
             // FIX: Use canUseMetricCards for consistent data quality check across all code paths
             // Previous check (length >= 2) didn't validate data STRUCTURE, causing downstream failures
             const hasValidDataPoints = canUseMetricCards(routedContentPlan.dataPoints);
-            
+
             if (slideMeta.type === 'data-viz' && !hasChartSpec && !hasValidDataPoints) {
-                console.log(`[ORCHESTRATOR] ⚠️ data-viz slide "${slideMeta.title}" lacks valid data (chartSpec: ${!!hasChartSpec}, validDataPoints: ${hasValidDataPoints})`);
-                console.log(`[ORCHESTRATOR] Downgrading slide type: data-viz → content-main`);
+                console.log(`[ORCHESTRATOR] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â data-viz slide "${slideMeta.title}" lacks valid data (chartSpec: ${!!hasChartSpec}, validDataPoints: ${hasValidDataPoints})`);
+                console.log(`[ORCHESTRATOR] Downgrading slide type: data-viz ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ content-main`);
                 slideMeta.type = 'content-main';
                 // Also update purpose to reflect the change
                 if (slideMeta.purpose?.toLowerCase().includes('data') || slideMeta.purpose?.toLowerCase().includes('metric')) {
@@ -3337,7 +3410,7 @@ export const generateAgenticDeck = async (
             // Apply style multiplier to variation budget
             const baseVariationBudget = computeVariationBudget(i, totalSlides, slideMeta.type, slideMeta.title);
             const variationBudget = applyStyleMultiplierToVariationBudget(baseVariationBudget, styleMode);
-            console.log(`[ORCHESTRATOR] Variation budget: ${baseVariationBudget.toFixed(2)} → ${variationBudget.toFixed(2)} (${styleMode} multiplier)`);
+            console.log(`[ORCHESTRATOR] Variation budget: ${baseVariationBudget.toFixed(2)} ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ${variationBudget.toFixed(2)} (${styleMode} multiplier)`);
 
             const visualDesign = await runVisualDesigner(
                 slideMeta.title,
@@ -3632,7 +3705,7 @@ export const generateAgenticDeck = async (
                 console.log(`  - Suggested Action: ${envSnapshot.suggested_action}`);
 
                 if (envSnapshot.health_level === 'critical' || envSnapshot.fit_score < 0.5) {
-                    console.warn(`[ORCHESTRATOR] ⚠️  Slide ${i + 1} has critical spatial issues despite generation.`);
+                    console.warn(`[ORCHESTRATOR] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â  Slide ${i + 1} has critical spatial issues despite generation.`);
                 }
             }
 
@@ -3716,7 +3789,7 @@ export const generateAgenticDeck = async (
 
         if (!shippingGate.canShip) {
             placeholderBlockCount++;
-            console.warn(`[ORCHESTRATOR] ⚠️  Slide ${idx + 1} blocked by shipping gate: ${shippingGate.blockedContent.map(b => b.placeholderFound).join(', ')}`);
+            console.warn(`[ORCHESTRATOR] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â  Slide ${idx + 1} blocked by shipping gate: ${shippingGate.blockedContent.map(b => b.placeholderFound).join(', ')}`);
             console.warn(`[ORCHESTRATOR]    Recommendation: ${shippingGate.recommendation}`);
 
             // Apply auto-fix based on recommendation
@@ -3751,7 +3824,7 @@ export const generateAgenticDeck = async (
                 // Cannot auto-fix - flag for manual attention
                 slide.warnings = [
                     ...(slide.warnings || []),
-                    `⚠️ MANUAL REVIEW REQUIRED: Multiple placeholder content issues found`
+                    `ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â MANUAL REVIEW REQUIRED: Multiple placeholder content issues found`
                 ];
                 slide.readabilityCheck = 'fail' as any;
             }
@@ -3761,7 +3834,7 @@ export const generateAgenticDeck = async (
     if (placeholderBlockCount > 0) {
         console.warn(`[ORCHESTRATOR] Shipping gate: ${placeholderBlockCount}/${slides.length} slides had placeholder content (auto-fixed or flagged)`);
     } else {
-        console.log(`[ORCHESTRATOR] ✅ No-placeholder shipping gate passed for all slides`);
+        console.log(`[ORCHESTRATOR] ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ No-placeholder shipping gate passed for all slides`);
     }
 
     // GAP 2: Deck-Wide Narrative Coherence Validation
@@ -3771,7 +3844,7 @@ export const generateAgenticDeck = async (
     if (!coherenceReport.passed || coherenceReport.issues.length > 0) {
         console.warn(`[ORCHESTRATOR] Coherence validation: score ${coherenceReport.coherenceScore}/100`);
         coherenceReport.issues.forEach(issue => {
-            const severity = issue.severity === 'critical' ? '🔴' : issue.severity === 'major' ? '🟡' : '🔵';
+            const severity = issue.severity === 'critical' ? 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´' : issue.severity === 'major' ? 'ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¡' : 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Âµ';
             const slideRefs = issue.slideIndices.map(i => `#${i + 1}`).join(', ');
             console.warn(`${severity} [${issue.type.toUpperCase()}] ${issue.message} (slides: ${slideRefs})`);
 
@@ -3795,7 +3868,36 @@ export const generateAgenticDeck = async (
         if (arcViolationCount > 0) console.warn(`[ORCHESTRATOR]   - ${arcViolationCount} narrative arc violation(s)`);
         if (driftCount > 0) console.warn(`[ORCHESTRATOR]   - ${driftCount} thematic drift issue(s)`);
     } else {
-        console.log(`[ORCHESTRATOR] ✅ Deck coherence validation passed (score: ${coherenceReport.coherenceScore}/100)`);
+        console.log(`[ORCHESTRATOR] ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Deck coherence validation passed (score: ${coherenceReport.coherenceScore}/100)`);
+    }
+
+    // ============================================================================
+    // POST-ASSEMBLY SMOKE TEST (Tier 1.5: Deck-Wide QA)
+    // ============================================================================
+    // Runs cheap deterministic checks on ALL slides after assembly.
+    // Catches issues that risk-based sampling may skip (consecutive layouts,
+    // text-only slides, contrast issues, empty content).
+    // Source: PPTX skill ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â "Assume there are problems. Your job is to find them."
+    console.log("[ORCHESTRATOR] Running post-assembly smoke test...");
+    const smokeResult = postAssemblySmokeTest(slides);
+
+    if (!smokeResult.passed || smokeResult.slideIssues.length > 0) {
+        console.warn(`[ORCHESTRATOR] ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â¥ Smoke test: ${smokeResult.summary}`);
+        smokeResult.slideIssues.forEach(si => {
+            si.issues.forEach(issue => {
+                const icon = issue.severity === 'error' ? 'ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´' : 'ÃƒÂ°Ã…Â¸Ã…Â¸Ã‚Â¡';
+                console.warn(`${icon} [SMOKE] Slide ${si.slideIndex + 1} "${si.slideTitle}": ${issue.message}`);
+            });
+            // Attach warnings to affected slides
+            if (slides[si.slideIndex]) {
+                slides[si.slideIndex].warnings = [
+                    ...(slides[si.slideIndex].warnings || []),
+                    ...si.issues.map(i => `[SMOKE] ${i.message}`)
+                ];
+            }
+        });
+    } else {
+        console.log(`[ORCHESTRATOR] ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ ${smokeResult.summary}`);
     }
 
     const totalDurationMs = Date.now() - startTime;
@@ -3807,26 +3909,26 @@ export const generateAgenticDeck = async (
         : 0;
     const fallbackRate = totalSlides > 0 ? (fallbackSlides / totalSlides) * 100 : 0;
 
-    console.log("[ORCHESTRATOR] ✅ Level 3 Generation Complete!");
+    console.log("[ORCHESTRATOR] ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Level 3 Generation Complete!");
     console.log(`[ORCHESTRATOR] Duration: ${(totalDurationMs / 1000).toFixed(1)}s`);
     console.log(`[ORCHESTRATOR] Total Cost: $${costSummary.totalCost.toFixed(4)}`);
-    console.log(`[ORCHESTRATOR] 💰 Savings vs Pro: $${costSummary.totalSavingsVsPro.toFixed(4)} (${((costSummary.totalSavingsVsPro / (costSummary.totalCost + costSummary.totalSavingsVsPro)) * 100).toFixed(0)}%)`);
+    console.log(`[ORCHESTRATOR] ÃƒÂ°Ã…Â¸Ã¢â‚¬â„¢Ã‚Â° Savings vs Pro: $${costSummary.totalSavingsVsPro.toFixed(4)} (${((costSummary.totalSavingsVsPro / (costSummary.totalCost + costSummary.totalSavingsVsPro)) * 100).toFixed(0)}%)`);
     console.log(`[ORCHESTRATOR] Tokens: ${costSummary.totalInputTokens} in, ${costSummary.totalOutputTokens} out`);
     console.log(`[ORCHESTRATOR] Tokens (reported total): ${costSummary.totalTokensReported}`);
     console.log(`[ORCHESTRATOR] Model Breakdown:`, costSummary.modelBreakdown);
     console.log(`[ORCHESTRATOR] [LOOP] Runs: ${loopRuns}, accept_with_warnings: ${loopAcceptWithWarnings}, reroute verdicts: ${loopReroutes}`);
     console.log(`[ORCHESTRATOR] [LOOP] Avg iterations: ${loopRuns > 0 ? (totalLoopIterations / loopRuns).toFixed(2) : '0.00'}`);
-    console.log(`[ORCHESTRATOR] 📊 RELIABILITY METRICS:`);
-    console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ≤1/deck`);
-    console.log(`[ORCHESTRATOR]   - Visual First-Pass Success: ${visualAlignmentFirstPassSuccess}/${totalVisualDesignAttempts} (${visualFirstPassRate}%) - Target: ≥80%`);
+    console.log(`[ORCHESTRATOR] ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â  RELIABILITY METRICS:`);
+    console.log(`[ORCHESTRATOR]   - Fallback Slides: ${fallbackSlides}/${totalSlides} (${fallbackRate.toFixed(1)}%) - Target: ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¤1/deck`);
+    console.log(`[ORCHESTRATOR]   - Visual First-Pass Success: ${visualAlignmentFirstPassSuccess}/${totalVisualDesignAttempts} (${visualFirstPassRate}%) - Target: ÃƒÂ¢Ã¢â‚¬Â°Ã‚Â¥80%`);
     console.log(`[ORCHESTRATOR]   - Reroute Count: ${rerouteCount}`);
-    console.log(`[ORCHESTRATOR] 🔍 SYSTEM 2 VISUAL CRITIQUE:`);
+    console.log(`[ORCHESTRATOR] ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â SYSTEM 2 VISUAL CRITIQUE:`);
     console.log(`[ORCHESTRATOR]   - Visual Critique Attempts: ${visualCritiqueAttempts}/${totalSlides}`);
     console.log(`[ORCHESTRATOR]   - Visual Repair Success: ${visualRepairSuccess}/${visualCritiqueAttempts > 0 ? visualCritiqueAttempts : 1}`);
     console.log(`[ORCHESTRATOR]   - System 2 Cost: $${system2TotalCost.toFixed(4)} (${costSummary.totalCost > 0 ? (system2TotalCost / costSummary.totalCost * 100).toFixed(1) : 0}% of total)`);
     console.log(`[ORCHESTRATOR]   - System 2 Tokens: ${system2TotalInputTokens} in, ${system2TotalOutputTokens} out`);
     if (costSummary.qwenVL) {
-        console.log(`[ORCHESTRATOR] 👁️  QWEN-VL VISUAL CORTEX:`);
+        console.log(`[ORCHESTRATOR] ÃƒÂ°Ã…Â¸Ã¢â‚¬ËœÃ‚ÂÃƒÂ¯Ã‚Â¸Ã‚Â  QWEN-VL VISUAL CORTEX:`);
         console.log(`[ORCHESTRATOR]   - Qwen-VL Calls: ${costSummary.qwenVL.calls}`);
         console.log(`[ORCHESTRATOR]   - Qwen-VL Cost: $${costSummary.qwenVL.cost.toFixed(4)}`);
         console.log(`[ORCHESTRATOR]   - Qwen-VL Tokens: ${costSummary.qwenVL.inputTokens} in, ${costSummary.qwenVL.outputTokens} out`);
@@ -3878,14 +3980,14 @@ export const regenerateSingleSlide = async (
     // Use default styleGuide for single slide regeneration
     const defaultStyleGuide: GlobalStyleGuide = {
         themeName: "Default",
-        fontFamilyTitle: "Inter",
-        fontFamilyBody: "Inter",
+        fontFamilyTitle: "Calibri",
+        fontFamilyBody: "Calibri Light",
         colorPalette: {
-            primary: "#10b981",
-            secondary: "#3b82f6",
-            background: "#0f172a",
-            text: "#f8fafc",
-            accentHighContrast: "#f59e0b"
+            primary: "028090",
+            secondary: "00A896",
+            background: "0F172A",
+            text: "F8FAFC",
+            accentHighContrast: "02C39A"
         },
         imageStyle: "Clean",
         layoutStrategy: "Standard"
@@ -3939,3 +4041,4 @@ export const regenerateSingleSlide = async (
     }
     return newSlide;
 };
+

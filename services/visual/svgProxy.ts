@@ -46,9 +46,46 @@ function generateComponentId(component: TemplateComponent, index: number): strin
  */
 function buildComponentManifest(components: TemplateComponent[]): string {
     if (!components || components.length === 0) return '';
-    
+
     const manifest = components.map((c, i) => `${c.type}-${i}`).join(',');
     return `  <!-- ComponentManifest: ${manifest} -->\n`;
+}
+
+/**
+ * Darken a hex color by a given factor (0-1).
+ * E.g., darkenHexColor('0f172a', 0.3) darkens by 30%.
+ */
+function darkenHexColor(hex: string, factor: number): string {
+    const clean = hex.replace('#', '');
+    const r = Math.max(0, Math.round(parseInt(clean.slice(0, 2), 16) * (1 - factor)));
+    const g = Math.max(0, Math.round(parseInt(clean.slice(2, 4), 16) * (1 - factor)));
+    const b = Math.max(0, Math.round(parseInt(clean.slice(4, 6), 16) * (1 - factor)));
+    return r.toString(16).padStart(2, '0') + g.toString(16).padStart(2, '0') + b.toString(16).padStart(2, '0');
+}
+
+/**
+ * Word-wrap text into lines of approximately `maxChars` characters.
+ * Breaks on word boundaries; caps at 4 lines to stay within SVG budget.
+ */
+function wrapText(text: string, maxChars: number): string[] {
+    if (!text || text.length <= maxChars) return [text || ''];
+    const words = text.split(/\s+/);
+    const lines: string[] = [];
+    let currentLine = '';
+    for (const word of words) {
+        if (currentLine.length + word.length + 1 > maxChars && currentLine.length > 0) {
+            lines.push(currentLine);
+            currentLine = word;
+            if (lines.length >= 4) {
+                currentLine += '…';
+                break;
+            }
+        } else {
+            currentLine = currentLine ? currentLine + ' ' + word : word;
+        }
+    }
+    if (currentLine) lines.push(currentLine);
+    return lines;
 }
 
 /**
@@ -84,11 +121,16 @@ export function generateSvgProxy(
     // SVG viewBox: 1000x563 for 16:9 (100x multiplier for 0-10 coordinate system)
     let svg = `<svg viewBox="0 0 1000 563" xmlns="http://www.w3.org/2000/svg">\n`;
 
-    // Background (use visualDesignSpec color if available)
+    // Background: use gradient for higher fidelity (approximates actual slide tone)
     const bgColor = slide.visualDesignSpec?.color_harmony?.background_tone ||
-                    styleGuide.colorPalette.background || '#0f172a';
+        styleGuide.colorPalette.background || '#0f172a';
     const normalizedBg = bgColor.replace('#', '');
-    svg += `  <rect x="0" y="0" width="1000" height="563" fill="#${normalizedBg}" id="bg"/>\n`;
+    const darkerBg = darkenHexColor(normalizedBg, 0.3);
+    svg += `  <defs><linearGradient id="bgGrad" x1="0" y1="0" x2="0" y2="1">`;
+    svg += `<stop offset="0%" stop-color="#${normalizedBg}"/>`;
+    svg += `<stop offset="100%" stop-color="#${darkerBg}"/>`;
+    svg += `</linearGradient></defs>\n`;
+    svg += `  <rect x="0" y="0" width="1000" height="563" fill="url(#bgGrad)" id="bg"/>\n`;
 
     // Metadata: component counts and density
     const componentTypes = components.map(c => c.type);
@@ -97,7 +139,7 @@ export function generateSvgProxy(
         .reduce((sum, el) => sum + ((el as any).content?.length || 0), 0);
 
     svg += `  <!-- Metadata: components=${componentTypes.join(',')} textChars=${totalTextChars} -->\n`;
-    
+
     // CRITICAL: Add component manifest for Visual Architect repair mapping
     // This tells Qwen-VL exactly which component IDs are valid
     svg += buildComponentManifest(components);
@@ -106,7 +148,7 @@ export function generateSvgProxy(
     // CRITICAL: Use componentIdx from VisualElement if available (set by spatialRenderer)
     // This is the authoritative mapping from visual elements to layoutPlan.components
     const elementToComponentMap = new Map<number, number>();
-    
+
     elements.forEach((el, elIdx) => {
         // spatialRenderer sets componentIdx on each VisualElement
         const componentIdx = (el as any).componentIdx;
@@ -148,11 +190,15 @@ export function generateSvgProxy(
         return getPriority(b.el) - getPriority(a.el);
     });
 
+    // Resolve font families from style guide
+    const titleFont = escapeXml(styleGuide.fontFamilyTitle || 'Inter');
+    const bodyFont = escapeXml(styleGuide.fontFamilyBody || 'Inter');
+
     // Render elements with dynamic size limiting
     const MAX_SVG_SIZE = 12000; // Leave headroom below 15KB limit
     let currentSize = svg.length;
     let renderedCount = 0;
-    
+
     // Track sub-element indices within each component (for elements that spawn multiple SVG elements)
     const componentSubElementCounters: Record<number, number> = {};
 
@@ -165,14 +211,14 @@ export function generateSvgProxy(
         const h = Math.round(el.h * 100);
 
         let elementSvg = '';
-        
+
         // CRITICAL: Use component-based IDs that directly map to layoutPlan.components
         // Format: "{component-type}-{component-index}[-{sub-element-index}]"
         // Example: "text-bullets-0", "text-bullets-0-1" (second element from same component)
         const componentIdx = elementToComponentMap.get(originalIdx);
         let elementId: string;
         let componentIdAttr: string;
-        
+
         if (componentIdx !== undefined && componentIdx < components.length) {
             const component = components[componentIdx];
             const componentType = component?.type || 'unknown';
@@ -180,17 +226,17 @@ export function generateSvgProxy(
             componentSubElementCounters[componentIdx] = (componentSubElementCounters[componentIdx] || 0);
             const subIdx = componentSubElementCounters[componentIdx];
             componentSubElementCounters[componentIdx]++;
-            
+
             // First sub-element: just "{type}-{idx}", subsequent: "{type}-{idx}-{sub}"
-            elementId = subIdx === 0 
-                ? `${componentType}-${componentIdx}` 
+            elementId = subIdx === 0
+                ? `${componentType}-${componentIdx}`
                 : `${componentType}-${componentIdx}-${subIdx}`;
             componentIdAttr = ` data-component-idx="${componentIdx}"`;
         } else {
             // Orphan element (not mapped to a component) - use element type
             const elTypeKey = el.type === 'text' && el.bold ? 'title' :
-                              el.type === 'text' ? 'text' :
-                              el.type === 'shape' ? 'shape' : 'element';
+                el.type === 'text' ? 'text' :
+                    el.type === 'shape' ? 'shape' : 'element';
             elementId = `orphan-${elTypeKey}-${originalIdx}`;
             componentIdAttr = '';
         }
@@ -202,17 +248,34 @@ export function generateSvgProxy(
             const anchor = align === 'center' ? 'middle' : (align === 'right' ? 'end' : 'start');
             const anchorX = align === 'center' ? x + w / 2 : (align === 'right' ? x + w : x + 5);
             const fontWeight = el.bold ? 'bold' : 'normal';
+            const fontFamily = el.bold ? titleFont : bodyFont;
             const rawText = (el as any).content || '';
 
-            // Basic text truncation for SVG size control
-            const maxChars = Math.floor(w / (fontSize * 0.6));
-            const truncatedText = rawText.length > maxChars ? rawText.slice(0, maxChars) + '…' : rawText;
-            
-            // CRITICAL: Escape XML entities to prevent "invalid element" errors
-            const safeText = escapeXml(truncatedText);
+            // Multi-line text wrapping via <tspan> elements
+            const charsPerLine = Math.max(10, Math.floor(w / (fontSize * 0.55)));
+            const lines = wrapText(rawText, charsPerLine);
+            const lineHeight = fontSize * 1.3;
 
-            // Include id and data-component-id for Visual Architect repair mapping
-            elementSvg = `  <text id="${elementId}"${componentIdAttr} x="${anchorX}" y="${y + fontSize}" font-size="${fontSize}" fill="#${color}" text-anchor="${anchor}" font-weight="${fontWeight}">${safeText}</text>\n`;
+            // Estimate size: if multi-line would exceed budget, fall back to single-line truncation
+            const estimatedMultiLineSize = lines.length * 80 + 100; // rough estimate per tspan
+            const budgetRemaining = MAX_SVG_SIZE - currentSize;
+
+            if (lines.length > 1 && estimatedMultiLineSize < budgetRemaining * 0.3) {
+                // Multi-line rendering with <tspan>
+                elementSvg = `  <text id="${elementId}"${componentIdAttr} font-size="${fontSize}" fill="#${color}" text-anchor="${anchor}" font-weight="${fontWeight}" font-family="${fontFamily}, sans-serif">`;
+                lines.forEach((line, lineIdx) => {
+                    const safeText = escapeXml(line);
+                    const lineY = y + fontSize + (lineIdx * lineHeight);
+                    elementSvg += `<tspan x="${anchorX}" y="${lineY}">${safeText}</tspan>`;
+                });
+                elementSvg += `</text>\n`;
+            } else {
+                // Single-line truncation fallback
+                const maxChars = Math.floor(w / (fontSize * 0.6));
+                const truncatedText = rawText.length > maxChars ? rawText.slice(0, maxChars) + '…' : rawText;
+                const safeText = escapeXml(truncatedText);
+                elementSvg = `  <text id="${elementId}"${componentIdAttr} x="${anchorX}" y="${y + fontSize}" font-size="${fontSize}" fill="#${color}" text-anchor="${anchor}" font-weight="${fontWeight}" font-family="${fontFamily}, sans-serif">${safeText}</text>\n`;
+            }
         }
         else if (el.type === 'shape') {
             const fill = el.fill?.color?.replace('#', '') || 'FFFFFF';

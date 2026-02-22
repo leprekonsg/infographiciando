@@ -287,65 +287,230 @@ export class InfographicRenderer {
     );
   }
 
+  // --- PPTX SAFETY GUARDS ---
+  // Defensive utilities against pptxgenjs pitfalls that cause file corruption.
+  // Source: https://github.com/anthropics/skills/blob/main/skills/pptx/pptxgenjs.md
+
+  /** Strip '#' prefix and truncate to 6 chars (8-char hex with opacity corrupts PPTX) */
+  private safePptxColor(hex?: string): string {
+    if (!hex) return '000000';
+    const stripped = hex.replace('#', '');
+    // 8-char hex (e.g. "00000020") encodes opacity inline → CORRUPTS FILE
+    return stripped.slice(0, 6).toUpperCase();
+  }
+
+  /** Clamp shadow offset to non-negative (negative values corrupt PPTX file) */
+  private safeShadowOpts(shadow: any): any {
+    if (!shadow) return undefined;
+    return {
+      ...shadow,
+      color: this.safePptxColor(shadow.color),
+      offset: Math.max(0, shadow.offset ?? 0),
+      // Opacity must be via `opacity` property, never encoded in color string
+      opacity: typeof shadow.opacity === 'number' ? shadow.opacity : 0.15
+    };
+  }
+
+  /** Strip unicode bullet chars that create double-bullets in pptxgenjs */
+  private stripUnicodeBullets(text: string): string {
+    return text.replace(/^[•·●○◦▪▸►▶–—]\s*/g, '');
+  }
+
   // --- EXPORTER: PPTX GEN ---
   public async renderSlideFromPlan({ slide, styleGuide, pptSlide, pres }: any) {
     // Use the Compiler to get flat elements, then render to PPTX
     // This ensures 1:1 fidelity between Preview and Export
     const elements = this.compileSlide(slide, styleGuide);
+    const palette = resolvePalette(styleGuide);
 
     elements.forEach(el => {
-      if (el.type === 'shape') {
-        const opts: any = { x: el.x, y: el.y, w: el.w, h: el.h, rotate: el.rotation };
-        if (el.fill) opts.fill = { color: el.fill.color, transparency: (1 - el.fill.alpha) * 100 };
-        if (el.border) opts.line = { color: el.border.color, width: el.border.width };
-        if (el.shapeType === 'rect') opts.rectRadius = 0;
-        if (el.shapeType === 'roundRect') opts.rectRadius = el.rectRadius || 0.1;
+        if (el.type === 'shape') {
+            // Guard: fresh opts per call — pptxgenjs mutates objects in-place (EMU conversion)
+            const opts: any = { x: el.x, y: el.y, w: el.w, h: el.h, rotate: el.rotation };
+            if (el.fill) opts.fill = { color: this.safePptxColor(el.fill.color), transparency: (1 - el.fill.alpha) * 100 };
+            if (el.border) opts.line = { color: this.safePptxColor(el.border.color), width: el.border.width };
+            if (el.shapeType === 'rect') opts.rectRadius = 0;
+            // Guard (pitfall #8): Don't pair ROUNDED_RECTANGLE with accent bar overlays.
+            // Rectangular overlay bars won't cover rounded corners.
+            if (el.shapeType === 'roundRect') opts.rectRadius = el.rectRadius || 0.1;
 
-        // Map generic shapes to PPTX
-        const shapeType = (pres.ShapeType as any)[el.shapeType] || pres.ShapeType.rect;
-        pptSlide.addShape(shapeType, opts);
-      } else if (el.type === 'text') {
-        // Build text options with premium typography support
-        const textOpts: any = {
-          x: el.x, y: el.y, w: el.w, h: el.h,
-          fontSize: el.fontSize,
-          color: el.color,
-          bold: el.bold || (el.fontWeight && el.fontWeight >= 700),
-          fontFace: el.fontFamily,
-          align: el.align,
-          rotate: el.rotation
-        };
+            // Guard: sanitize shadow if present
+            if ((el as any).shadow) {
+                opts.shadow = this.safeShadowOpts((el as any).shadow);
+            }
 
-        // Note: PptxGenJS doesn't natively support letterSpacing
-        // For premium typography, we apply font weight mapping
-        // letterSpacing and lineHeight are visual-only (used in preview renderer)
-        if (el.fontWeight) {
-          // Map fontWeight to bold (700+) or regular
-          textOpts.bold = el.fontWeight >= 700;
+            // Map generic shapes to PPTX
+            const shapeType = (pres.ShapeType as any)[el.shapeType] || pres.ShapeType.rect;
+            pptSlide.addShape(shapeType, opts);
+        } else if (el.type === 'text') {
+            // Build text options with premium typography support
+            // Guard: fresh opts per call — never reuse option objects across addText calls
+            const textOpts: any = {
+                x: el.x, y: el.y, w: el.w, h: el.h,
+                fontSize: el.fontSize,
+                color: this.safePptxColor(el.color),
+                bold: el.bold || (el.fontWeight && el.fontWeight >= 700),
+                fontFace: el.fontFamily,
+                align: el.align,
+                rotate: el.rotation,
+                // Guard: set margin: 0 for precise alignment with shapes/icons
+                margin: 0
+            };
+
+            // Guard: map letterSpacing to charSpacing (letterSpacing is silently ignored by pptxgenjs)
+            if (el.letterSpacing && el.letterSpacing > 0) {
+                textOpts.charSpacing = el.letterSpacing;
+            }
+
+            if (el.fontWeight) {
+                textOpts.bold = el.fontWeight >= 700;
+            }
+
+            // Guard (pitfall #5): Never use lineSpacing with bullets — causes excessive gaps.
+            // Use paraSpaceAfter instead for consistent spacing.
+            if ((el as any).isBullet) {
+                textOpts.bullet = true;
+                textOpts.paraSpaceAfter = 4; // Points of space after each bullet
+                // Don't set lineSpacing on bullet items
+            }
+
+            // Transform content if textTransform is specified
+            let content = el.content;
+            if ((el as any).textTransform === 'uppercase') {
+                content = content.toUpperCase();
+            } else if ((el as any).textTransform === 'lowercase') {
+                content = content.toLowerCase();
+            }
+
+            // Guard: strip unicode bullets (cause double-bullets with pptxgenjs bullet: true)
+            content = this.stripUnicodeBullets(content);
+
+            pptSlide.addText(content, textOpts);
+        } else if (el.type === 'image') {
+            // Render icons/images
+            pptSlide.addImage({
+                data: el.data,
+                x: el.x, y: el.y, w: el.w, h: el.h,
+                transparency: el.transparency || 0
+            });
         }
-
-        // Transform content if textTransform is specified
-        let content = el.content;
-        if ((el as any).textTransform === 'uppercase') {
-          content = content.toUpperCase();
-        } else if ((el as any).textTransform === 'lowercase') {
-          content = content.toLowerCase();
-        }
-
-        pptSlide.addText(content, textOpts);
-      } else if (el.type === 'image') {
-        // Render icons/images
-        pptSlide.addImage({
-          data: el.data,
-          x: el.x, y: el.y, w: el.w, h: el.h,
-          transparency: el.transparency || 0
-        });
-      }
     });
+
+    // ============================================================================
+    // NATIVE CHART RENDERING (pptxgenjs addChart)
+    // ============================================================================
+    // After rendering compiled VisualElements (shapes/text/images), scan the
+    // original slide components for chart-frame. If found, overlay a native
+    // pptxgenjs chart on top of the primitive shapes the spatial renderer drew.
+    // Native charts are editable in PowerPoint and render with real data tables.
+    //
+    // Source: pptxgenjs tutorial - Charts - "Better-Looking Charts"
+    // ============================================================================
+    const components = slide.layoutPlan?.components || [];
+    for (const comp of components) {
+        if (comp.type === 'chart-frame' && comp.data && comp.data.length > 0) {
+            try {
+                this.renderNativeChart(comp, pptSlide, pres, palette);
+            } catch (e: any) {
+                console.warn(`[PPTX EXPORT] Native chart failed, falling back to shapes: ${e.message}`);
+                // Shape-based chart from VisualElements already rendered above — no action needed
+            }
+        }
+    }
 
     // Notes: Join the new array format into a single string for PPTX
     if (slide.speakerNotesLines && Array.isArray(slide.speakerNotesLines)) {
-      pptSlide.addNotes(slide.speakerNotesLines.join('\n'));
+        pptSlide.addNotes(slide.speakerNotesLines.join('\n'));
     }
-  }
+}
+
+  // --- NATIVE PPTXGENJS CHART ---
+  // Renders chart-frame components using pptxgenjs's addChart() for real PowerPoint charts.
+  // Styled per pptxgenjs tutorial "Better-Looking Charts" section.
+  private renderNativeChart(comp: any, pptSlide: any, pres: any, palette: any) {
+    const labels = comp.data.map((d: any) => String(d.label));
+    const values = comp.data.map((d: any) => Number(d.value) || 0);
+
+    // Map component chartType to pptxgenjs chart type
+    const chartTypeMap: Record<string, any> = {
+        'bar': pres.charts?.BAR || 'bar',
+        'line': pres.charts?.LINE || 'line',
+        'pie': pres.charts?.PIE || 'pie',
+        'doughnut': pres.charts?.DOUGHNUT || 'doughnut'
+    };
+    const chartType = chartTypeMap[comp.chartType] || chartTypeMap['bar'];
+
+    // Palette-matched chart colors (6-char hex, no '#' prefix)
+    const chartColors = [
+        this.safePptxColor(palette.primary),
+        this.safePptxColor(palette.secondary),
+        this.safePptxColor(palette.accent)
+    ];
+
+    const chartData = [{
+        name: comp.title || 'Data',
+        labels,
+        values
+    }];
+
+    // Fresh opts (pitfall #7: never reuse option objects)
+    const chartOpts: any = {
+        x: 1.0, y: 1.2, w: 8.0, h: 3.8,
+        barDir: 'col',
+
+        // Custom colors matching presentation palette
+        chartColors,
+
+        // Clean background
+        chartArea: { fill: { color: this.safePptxColor(palette.background) }, roundedCorners: true },
+
+        // Muted axis labels
+        catAxisLabelColor: '64748B',
+        valAxisLabelColor: '64748B',
+        catAxisLabelFontSize: 9,
+        valAxisLabelFontSize: 9,
+
+        // Subtle grid (value axis only)
+        valGridLine: { color: 'E2E8F0', size: 0.5 },
+        catGridLine: { style: 'none' },
+
+        // Data labels on bars
+        showValue: true,
+        dataLabelPosition: 'outEnd',
+        dataLabelColor: this.safePptxColor(palette.text),
+        dataLabelFontSize: 9,
+
+        // Title
+        showTitle: true,
+        title: comp.title || 'Data',
+        titleColor: this.safePptxColor(palette.text),
+        titleFontSize: 14,
+
+        // Hide legend for single series
+        showLegend: false
+    };
+
+    // Pie/doughnut-specific options
+    if (comp.chartType === 'pie' || comp.chartType === 'doughnut') {
+        delete chartOpts.barDir;
+        delete chartOpts.catGridLine;
+        delete chartOpts.valGridLine;
+        delete chartOpts.catAxisLabelColor;
+        delete chartOpts.valAxisLabelColor;
+        chartOpts.showPercent = true;
+        chartOpts.showValue = false;
+        chartOpts.showLegend = true;
+        chartOpts.legendPos = 'r';
+        chartOpts.legendColor = this.safePptxColor(palette.text);
+    }
+
+    // Line chart-specific options
+    if (comp.chartType === 'line') {
+        delete chartOpts.barDir;
+        chartOpts.lineSmooth = true;
+        chartOpts.lineSize = 2;
+    }
+
+    pptSlide.addChart(chartType, chartData, chartOpts);
+}
 }

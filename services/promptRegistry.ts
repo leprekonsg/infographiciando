@@ -10,6 +10,19 @@ const DISTILLED_AESTHETICS_PROMPT = `
     2. **TYPOGRAPHY**: Avoid "Center everything". Use asymmetrical balance.
     3. **DATA**: AESTHETIC: "Financial Times" style. Pink/Blue accents on dark.
   </visual_constitution>
+
+  <design_anti_patterns>
+    NEVER DO THESE — they are hallmarks of AI-generated slides:
+    - **NEVER use accent lines under titles** — this is the #1 AI-slides tell. Use whitespace or background color instead.
+    - **Don't center body text** — left-align paragraphs and bullet lists. Center ONLY titles and hero text.
+    - **Don't repeat the same layout** on consecutive slides — vary columns, cards, and callouts.
+    - **Don't create text-only slides** — every slide needs a visual element (image, chart, icon, or shape). Text + bullets alone is forgettable.
+    - **Don't default to blue** — pick colors that reflect the specific topic, not generic corporate blue.
+    - **Don't mix spacing randomly** — choose 0.3" or 0.5" gaps and use them consistently.
+    - **Don't style one slide and leave the rest plain** — commit fully or keep it simple throughout.
+    - **Don't skimp on size contrast** — titles need 36pt+ to stand out from 14-16pt body text.
+    - **Don't use low-contrast elements** — icons AND text need strong contrast against the background.
+  </design_anti_patterns>
 `;
 
 export const PROMPTS = {
@@ -46,6 +59,37 @@ export const PROMPTS = {
       - Spacing (slide units): xs 0.06-0.1, sm 0.1-0.14, md 0.18-0.24, lg 0.28-0.36.
       - Radii: card 0.14-0.22, pill 0.32-0.45.
       - Surfaces: cardStyle = 'glass' or 'outline' for a modern feel, opacity 0.5-0.75, borderWidth 1.0-1.6.
+
+      FONT PAIRING (choose a pairing that matches the topic's tone):
+      Pick fontFamilyTitle and fontFamilyBody from these curated pairs:
+      | Header Font      | Body Font       | Best For                    |
+      |------------------|-----------------|-----------------------------|
+      | Georgia          | Calibri         | Corporate, traditional      |
+      | Trebuchet MS     | Calibri         | Modern professional         |
+      | Arial Black      | Calibri Light   | Bold, attention-grabbing    |
+      | Cambria          | Calibri         | Financial, formal           |
+      | Palatino         | Garamond        | Editorial, thought leaders  |
+      | Calibri          | Calibri Light   | Clean, universal            |
+      Do NOT default to Arial or Inter for everything. Choose a pair that feels designed for THIS topic.
+      Dominance rule: header font should have more personality, body font should be clean and readable.
+
+      COLOR PALETTE (choose or blend from these curated palettes — don't invent from scratch):
+      Pick colors that match your topic — don't default to generic blue.
+      | Theme              | Primary (bg/hero) | Secondary        | Accent          |
+      |--------------------|-------------------|------------------|------------------|
+      | Midnight Executive | 1E2761 (navy)     | CADCFC (ice blue) | FFFFFF (white)  |
+      | Forest & Moss      | 2C5F2D (forest)   | 97BC62 (moss)    | F5F5F5 (cream)  |
+      | Coral Energy       | F96167 (coral)    | F9E795 (gold)    | 2F3C7E (navy)   |
+      | Warm Terracotta    | B85042 (terra)    | E7E8D1 (sand)    | A7BEAE (sage)   |
+      | Ocean Gradient     | 065A82 (deep blue)| 1C7293 (teal)    | 21295C (midnight)|
+      | Charcoal Minimal   | 36454F (charcoal) | F2F2F2 (off-white)| 212121 (black) |
+      | Teal Trust         | 028090 (teal)     | 00A896 (seafoam) | 02C39A (mint)   |
+      | Berry & Cream      | 6D2E46 (berry)    | A26769 (dusty rose)| ECE2D0 (cream) |
+      | Sage Calm          | 84B59F (sage)     | 69A297 (eucalyptus)| 50808E (slate) |
+      | Cherry Bold        | 990011 (cherry)   | FCF6F5 (off-white)| 2F3C7E (navy)  |
+      Select a palette (or blend 2) that feels purpose-built for this topic.
+      Dominance: One color should dominate (60-70%), 1-2 supporting tones, one sharp accent.
+      Structure: Dark backgrounds for title + conclusion slides, light for content ("sandwich") — or commit to dark throughout for premium feel.
       
       SERENDIPITY DNA (for delightful surprises):
       Include a "serendipityDNA" object with these fields for tasteful variation across the deck:
@@ -56,6 +100,11 @@ export const PROMPTS = {
       - cardStyle: Modern card treatment: glass | outline | solid
       - surpriseBudget: Number 1-3 indicating how many "wow" moments to allow per deck
       - surpriseCues: Array of short phrases describing tasteful novelty opportunities (e.g., "floating metric badge", "gradient divider", "glowing accent")
+      
+      VISUAL MOTIF (commit to ONE and carry it across every slide):
+      Pick ONE distinctive element and repeat it consistently: rounded card frames, icons in colored circles,
+      thick single-side borders, subtle gradient dividers. If swapping your motif into a completely different
+      presentation would still "work", you haven't made specific enough choices.
       
       These DNA values create cohesion while enabling controlled variation - each slide can surprise within the theme.
     `,
@@ -84,9 +133,9 @@ export const PROMPTS = {
           AVOID LAYOUTS: 'standard-vertical' (too safe), 'metrics-rail' (too corporate)
           PRINCIPLES: Visual drama over safety. Be bold, not generic.`
       };
-      
+
       const styleHint = constraints?.styleMode ? STYLE_LAYOUT_HINTS[constraints.styleMode] : '';
-      
+
       return `
       Assign a specific layout structure to: "${slideMeta.title}" - ${slideMeta.purpose}
       LAYOUT VARIANTS: 'standard-vertical', 'split-left-text', 'split-right-text', 'hero-centered', 'bento-grid', 'timeline-horizontal', 'dashboard-tiles', 'metrics-rail', 'asymmetric-grid'.
@@ -125,9 +174,9 @@ export const PROMPTS = {
           - Think "headline + supporting insight" not "comprehensive coverage"
           - Bold claims welcome if backed by facts`
       };
-      
+
       const styleHint = densityHint?.styleMode ? STYLE_CONTENT_HINTS[densityHint.styleMode] : '';
-      
+
       return `
         TASK: Draft the core semantic content for slide "${title}".
         PURPOSE: ${purpose}

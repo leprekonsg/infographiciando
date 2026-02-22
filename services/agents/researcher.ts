@@ -8,6 +8,14 @@ interface ResearchPass {
     targetFacts: number;
 }
 
+function isQuotaExhaustedError(err: any): boolean {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return msg.includes('not enough quota')
+        || msg.includes('quota to make this request')
+        || msg.includes('resource exhausted')
+        || (msg.includes('429') && msg.includes('quota'));
+}
+
 const RESEARCH_FACT_SCHEMA = {
     type: 'object',
     properties: {
@@ -190,6 +198,9 @@ Return JSON only in the format:
         return parsedFacts;
     } catch (err: any) {
         console.warn(`[RESEARCHER] Grounded pass "${pass.id}" failed: ${err.message}`);
+        if (isQuotaExhaustedError(err)) {
+            throw err;
+        }
         return [];
     }
 }
@@ -228,8 +239,16 @@ export async function runFocusedResearch(
         targetFacts: Math.min(8, Math.max(3, options.maxFacts ?? 5))
     };
 
-    const facts = await runGroundedPass(query, pass, costTracker);
-    return mergeAndRankFacts(facts, pass.targetFacts);
+    try {
+        const facts = await runGroundedPass(query, pass, costTracker);
+        return mergeAndRankFacts(facts, pass.targetFacts);
+    } catch (err: any) {
+        if (isQuotaExhaustedError(err)) {
+            console.warn(`[RESEARCHER] Focused research skipped due to API quota exhaustion.`);
+            return [];
+        }
+        throw err;
+    }
 }
 
 export async function runResearcher(topic: string, costTracker: CostTracker): Promise<ResearchFact[]> {
@@ -257,6 +276,7 @@ export async function runResearcher(topic: string, costTracker: CostTracker): Pr
     ];
 
     let collected: ResearchFact[] = [];
+    let quotaExhausted = false;
 
     for (const pass of passes) {
         if (pass.id !== 'baseline' && hasResearchCoverage(collected)) {
@@ -264,14 +284,26 @@ export async function runResearcher(topic: string, costTracker: CostTracker): Pr
             break;
         }
 
-        const passFacts = await runGroundedPass(topic, pass, costTracker);
+        let passFacts: ResearchFact[] = [];
+        try {
+            passFacts = await runGroundedPass(topic, pass, costTracker);
+        } catch (err: any) {
+            if (isQuotaExhaustedError(err)) {
+                quotaExhausted = true;
+                console.warn(`[RESEARCHER] Quota exhausted during "${pass.id}" pass. Stopping further research calls.`);
+                break;
+            }
+            throw err;
+        }
         collected = mergeAndRankFacts([...collected, ...passFacts], 16);
     }
 
-    if (collected.length < 8) {
+    if (collected.length < 8 && !quotaExhausted) {
         console.warn(`[RESEARCHER] Grounded passes produced ${collected.length} facts. Running fallback research pass.`);
         const fallbackFacts = await runFallbackSinglePass(topic, costTracker);
         collected = mergeAndRankFacts([...collected, ...fallbackFacts], 16);
+    } else if (quotaExhausted) {
+        console.warn(`[RESEARCHER] Skipping fallback single-pass due to API quota exhaustion.`);
     }
 
     const finalFacts = mergeAndRankFacts(collected, 12);

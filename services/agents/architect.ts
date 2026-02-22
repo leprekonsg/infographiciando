@@ -82,9 +82,8 @@ export async function runArchitect(
             architectSchema,
             {
                 systemInstruction: PROMPTS.ARCHITECT.ROLE,
-                // Architect is the strategic brain - it benefits from thinking
-                // Output is small (~1KB), so thinking tokens won't cause truncation
-                thinkingLevel: 'medium' as ThinkingLevel,
+                // Gemini 3.1 Pro supports low/high thinking levels (not medium).
+                thinkingLevel: 'low' as ThinkingLevel,
                 temperature: 0.2
             },
             costTracker
@@ -140,14 +139,14 @@ export async function runArchitect(
             factClusters: [],
             styleGuide: {
                 themeName: "Default",
-                fontFamilyTitle: "Inter",
-                fontFamilyBody: "Inter",
+                fontFamilyTitle: "Calibri",
+                fontFamilyBody: "Calibri Light",
                 colorPalette: {
-                    primary: "#10b981",
-                    secondary: "#3b82f6",
-                    background: "#0f172a",
-                    text: "#f8fafc",
-                    accentHighContrast: "#f59e0b"
+                    primary: "028090",
+                    secondary: "00A896",
+                    background: "0F172A",
+                    text: "F8FAFC",
+                    accentHighContrast: "02C39A"
                 },
                 imageStyle: "Clean",
                 layoutStrategy: "Standard",

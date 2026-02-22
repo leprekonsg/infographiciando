@@ -632,24 +632,24 @@ export class SpatialLayoutEngine {
     // Visual Architect sets these on layoutPlan to fix title/divider positioning
     const layoutPlan = slide.layoutPlan as any; // Cast to access _hint fields
     // Guard against NaN - typeof NaN === 'number' so we need isFinite check
-    const titleMarginHint = typeof layoutPlan?._titleMarginTop === 'number' && isFinite(layoutPlan._titleMarginTop) 
-        ? layoutPlan._titleMarginTop 
-        : undefined;
-    const dividerYHint = typeof layoutPlan?._dividerY === 'number' && isFinite(layoutPlan._dividerY) 
-        ? layoutPlan._dividerY 
-        : undefined;
+    const titleMarginHint = typeof layoutPlan?._titleMarginTop === 'number' && isFinite(layoutPlan._titleMarginTop)
+      ? layoutPlan._titleMarginTop
+      : undefined;
+    const dividerYHint = typeof layoutPlan?._dividerY === 'number' && isFinite(layoutPlan._dividerY)
+      ? layoutPlan._dividerY
+      : undefined;
 
     zones.forEach(zone => {
       const allocated = allocation.get(zone.id);
 
       // Apply zone-level hints from Visual Architect
       let effectiveZone = { ...zone };
-      
+
       // Title zone positioning hint
       if ((zone.id === 'title' || zone.id === 'hero-title') && titleMarginHint !== undefined) {
         effectiveZone.y = titleMarginHint;
       }
-      
+
       // Divider positioning hint
       if ((zone.id === 'divider' || zone.id === 'accent-bar') && dividerYHint !== undefined) {
         effectiveZone.y = dividerYHint;
@@ -842,7 +842,7 @@ export class SpatialLayoutEngine {
     }
 
     const els: VisualElement[] = [];
-    
+
     // Helper to stamp componentIdx on elements for SVG ID mapping
     const stampElement = (el: VisualElement): VisualElement => {
       (el as any).componentIdx = componentIdx;
@@ -895,17 +895,17 @@ export class SpatialLayoutEngine {
     // For FIT CALCULATION: Use 1.0 (default) to get accurate fit estimation.
     // For RENDERING: The visual output will honor the hint for actual display.
     // ============================================================================
-    
+
     // Read hints for logging/debugging, but DON'T use them to increase fit requirements
     const rawLineHeightHint = typeof compAny._hintLineHeight === 'number' ? compAny._hintLineHeight : 1.0;
     const rawItemSpacingHint = typeof compAny._hintItemSpacing === 'number' ? compAny._hintItemSpacing : 1.0;
-    
+
     // For fit calculation: hints > 1.0 should NOT increase required height
     // (that would make overflow worse). Instead, treat them as visual styling only.
     // Hints < 1.0 (compression) CAN be applied to fit calculation.
     const lineHeightMultiplier = rawLineHeightHint < 1.0 ? rawLineHeightHint : 1.0;
     const itemSpacingMultiplier = rawItemSpacingHint < 1.0 ? rawItemSpacingHint : 1.0;
-    
+
     // Log when hints are present (helps trace visual repair effectiveness)
     if (rawLineHeightHint !== 1.0 || rawItemSpacingHint !== 1.0) {
       console.log(`[SPATIAL RENDERER] Component ${comp.type} has hints: lineHeight=${rawLineHeightHint.toFixed(2)}, itemSpacing=${rawItemSpacingHint.toFixed(2)} (fit calc uses: ${lineHeightMultiplier.toFixed(2)}, ${itemSpacingMultiplier.toFixed(2)})`);
@@ -1046,7 +1046,7 @@ export class SpatialLayoutEngine {
         const titleH = 0.6 * contentScale;
         // REDUCED PADDING: Was 0.7 * contentScale, now 0.65 to fit tighter zones
         const nextY = curY + (0.65 * contentScale);
-        
+
         // RELAXED CHECK: Allow rendering if it's *close* to fitting (within 0.2 units)
         if (nextY <= maxY + 0.2) {
           els.push({
@@ -1112,11 +1112,12 @@ export class SpatialLayoutEngine {
 
         els.push({
           type: 'text',
-          content: `• ${line}`,
+          content: line,
           x, y: curY, w, h: totalVisualH,
           fontSize: themeTokens.typography.scale.body * contentScale,
           color: p.text,
           fontFamily: styleGuide.fontFamilyBody,
+          isBullet: true,
           zIndex: 10
         });
         curY += advance;
@@ -1248,7 +1249,7 @@ export class SpatialLayoutEngine {
         if (hintSize && hintSize >= 0.2 && hintSize <= 0.9) {
           return Math.min(itemW, itemH) * hintSize;
         }
-        
+
         // Determine emphasis multiplier
         const raw = (item?.emphasis || item?.size || item?.importance || '').toString().toLowerCase();
         let emphasisMult = 1.0;
@@ -1256,19 +1257,19 @@ export class SpatialLayoutEngine {
         else if (['secondary', 'medium', 'md'].includes(raw)) emphasisMult = 1.0;
         else if (['low', 'small', 'sm'].includes(raw)) emphasisMult = 0.85;
         else if (index === 0 && count <= 3) emphasisMult = 1.15; // default hierarchy
-        
+
         // Dynamic base scale based on zone and count
         let baseScale = 0.35; // default
-        
+
         // Adjust for zone height (h is in slide units, ~5.625 max)
         if (itemH < 1.0) baseScale = 0.28;      // Very compact zone
         else if (itemH < 1.5) baseScale = 0.32; // Compact zone
         else if (itemH > 2.5) baseScale = 0.4;  // Spacious zone
-        
+
         // Adjust for item count
         if (count >= 6) baseScale *= 0.85;
         else if (count <= 2) baseScale *= 1.1;
-        
+
         return Math.min(itemW, itemH) * baseScale * emphasisMult;
       };
 
@@ -1293,8 +1294,49 @@ export class SpatialLayoutEngine {
           });
         }
 
-        // Use dynamic icon sizing
-        const iconSize = getIconSize(item, i);
+        const compactText = (value: any, maxLen = 80): string => {
+          if (typeof value !== 'string') return '';
+          const cleaned = value.replace(/\s+/g, ' ').trim();
+          if (!cleaned) return '';
+          if (cleaned.length <= maxLen) return cleaned;
+          const target = cleaned.slice(0, Math.max(1, maxLen - 3));
+          const lastSpace = target.lastIndexOf(' ');
+          return (lastSpace >= Math.floor(target.length * 0.6) ? target.slice(0, lastSpace) : target).trimEnd() + '...';
+        };
+        const normalizedSignature = (value: string): string =>
+          value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+        const labelText = compactText(item.label, 40);
+        if (!labelText) return;
+
+        const rawDescriptionText = compactText(item.description, 72);
+        const labelSig = normalizedSignature(labelText);
+        const descSig = normalizedSignature(rawDescriptionText);
+        const isDuplicateDescription = !!rawDescriptionText && (
+          descSig === labelSig ||
+          descSig.includes(labelSig) ||
+          labelSig.includes(descSig)
+        );
+        const descriptionText = isDuplicateDescription ? '' : rawDescriptionText;
+
+        const labelFontSize = Math.max(9, itemH < 1.3 ? 10 : themeTokens.typography.scale.label);
+        const descriptionFontSize = Math.max(8, itemH < 1.3 ? 8 : themeTokens.typography.scale.micro);
+        const labelLines = this.estimateWrappedLineCount(
+          [labelText],
+          itemW - spacing.sm,
+          labelFontSize,
+          styleGuide.fontFamilyBody
+        );
+        const labelLineHeight = (labelFontSize / 72) * 1.15;
+        const labelH = Math.max(0.28, Math.min(itemH * 0.42, (labelLines * labelLineHeight) + 0.05));
+
+        const minDescriptionH = 0.24;
+        const reserveDescription = descriptionText
+          ? Math.max(minDescriptionH, ((descriptionFontSize / 72) * 2.2)) + spacing.xs
+          : 0;
+        const iconSizeRaw = getIconSize(item, i);
+        const maxIconSizeForText = Math.max(0.14, itemH - (spacing.sm + labelH + reserveDescription + (spacing.xs * 2)));
+        const iconSize = Math.max(0.14, Math.min(iconSizeRaw, maxIconSizeForText, itemW * 0.72));
         const iconX = ix + (itemW / 2) - (iconSize / 2);
         const iconY = iy + spacing.sm;
 
@@ -1305,12 +1347,19 @@ export class SpatialLayoutEngine {
           }
         }
 
-        const labelY = iconY + iconSize + spacing.xs;
+        const descriptionReserveForLabel = descriptionText ? (minDescriptionH + spacing.xs) : spacing.xs;
+        const labelY = Math.max(
+          iy + spacing.xs,
+          Math.min(
+            iy + itemH - labelH - descriptionReserveForLabel,
+            iconY + iconSize + spacing.xs
+          )
+        );
         els.push({
           type: 'text',
-          content: item.label,
-          x: ix + spacing.xs, y: labelY, w: itemW - spacing.sm, h: 0.3,
-          fontSize: themeTokens.typography.scale.label,
+          content: labelText,
+          x: ix + spacing.xs, y: labelY, w: itemW - spacing.sm, h: labelH,
+          fontSize: labelFontSize,
           bold: this.isBold(themeTokens.typography.weights.label),
           color: p.text,
           fontFamily: styleGuide.fontFamilyBody,
@@ -1318,17 +1367,32 @@ export class SpatialLayoutEngine {
           zIndex: 10
         });
 
-        if (item.description) {
-          els.push({
-            type: 'text',
-            content: item.description,
-            x: ix + spacing.xs, y: labelY + 0.32, w: itemW - spacing.sm, h: 0.35,
-            fontSize: themeTokens.typography.scale.micro,
-            color: p.text,
-            fontFamily: styleGuide.fontFamilyBody,
-            align: 'center',
-            zIndex: 10
-          });
+        if (descriptionText) {
+          const descriptionY = labelY + labelH + spacing.xs;
+          const availableDescriptionH = (iy + itemH) - descriptionY - spacing.xs;
+          if (availableDescriptionH >= minDescriptionH) {
+            const descriptionLines = this.estimateWrappedLineCount(
+              [descriptionText],
+              itemW - spacing.sm,
+              descriptionFontSize,
+              styleGuide.fontFamilyBody
+            );
+            const descriptionLineHeight = (descriptionFontSize / 72) * 1.2;
+            const descriptionH = Math.min(
+              availableDescriptionH,
+              Math.max(minDescriptionH, (descriptionLines * descriptionLineHeight) + 0.03)
+            );
+            els.push({
+              type: 'text',
+              content: descriptionText,
+              x: ix + spacing.xs, y: descriptionY, w: itemW - spacing.sm, h: descriptionH,
+              fontSize: descriptionFontSize,
+              color: p.text,
+              fontFamily: styleGuide.fontFamilyBody,
+              align: 'center',
+              zIndex: 10
+            });
+          }
         }
       });
     } else if (comp.type === 'chart-frame') {
@@ -1394,7 +1458,11 @@ export class SpatialLayoutEngine {
     return els.map(stampElement);
   }
 
-  // Helper to render a basic chart using primitives (since VisualElement doesn't support native charts yet)
+  // Helper to render a chart using primitives with modern styling
+  // Improvements from PPTX skill:
+  //   - Bars use alternating palette colors instead of single p.primary
+  //   - Muted axis labels + subtle grid lines for modern look
+  //   - Frame uses deck's cardStyle (glass/outline/solid) for motif consistency (Area 5)
   private renderChartFrame(
     comp: TemplateComponent,
     p: any,
@@ -1404,11 +1472,21 @@ export class SpatialLayoutEngine {
   ): VisualElement[] {
     const els: VisualElement[] = [];
 
-    // Background Frame
-    const frameFill = themeTokens.surfaces.cardStyle === 'outline'
+    // --- MOTIF CONSISTENCY: use same card treatment as metric-cards / icon-grid ---
+    const cardStyle = themeTokens.surfaces.cardStyle;
+    const cardBorderWidth = themeTokens.surfaces.borderWidth;
+    const cardOpacity = themeTokens.surfaces.opacity;
+
+    const frameFill = cardStyle === 'outline'
       ? { color: p.background, alpha: 0.05 }
-      : { color: p.background, alpha: 0.15 };
-    els.push({ type: 'shape', shapeType: 'rect', x, y, w, h, fill: frameFill, border: { color: p.secondary, width: themeTokens.surfaces.borderWidth, alpha: 0.35 }, zIndex: 5 });
+      : cardStyle === 'glass'
+        ? { color: p.background, alpha: 0.35 }
+        : { color: p.background, alpha: Math.min(0.9, cardOpacity) };
+    const frameBorder = cardStyle === 'solid'
+      ? { color: p.accent, width: cardBorderWidth, alpha: 0.75 }
+      : { color: p.accent, width: cardBorderWidth + 0.3, alpha: 0.9 };
+
+    els.push({ type: 'shape', shapeType: 'roundRect', x, y, w, h, fill: frameFill, border: frameBorder, rectRadius: themeTokens.radii.card, zIndex: 5 });
 
     // Title
     els.push({
@@ -1419,49 +1497,66 @@ export class SpatialLayoutEngine {
       bold: this.isBold(themeTokens.typography.weights.subtitle),
       color: p.text,
       fontFamily: styleGuide.fontFamilyTitle,
-      align: 'center',
+      align: 'left', // Left-align chart titles (anti-pattern: don't center everything)
       zIndex: 10
     });
 
-    // Chart Area (Schematic Bar Chart)
-    const chartArea = { x: x + 0.5, y: y + 1.2, w: w - 1.0, h: h - 1.5 };
+    // Chart Area
+    const chartArea = { x: x + 0.5, y: y + 1.0, w: w - 1.0, h: h - 1.5 };
 
     if (comp.type === 'chart-frame' && comp.data && comp.data.length > 0) {
       const maxValue = Math.max(...comp.data.map(d => d.value));
       const barWidth = (chartArea.w / comp.data.length) * 0.6;
       const spacing = (chartArea.w / comp.data.length) * 0.4;
 
+      // --- MODERN CHART STYLING: palette-matched bar colors ---
+      const chartColors = [p.primary, p.secondary, p.accent];
+
+      // Subtle horizontal grid lines (value axis only, muted)
+      const gridLineCount = 4;
+      for (let g = 1; g < gridLineCount; g++) {
+        const gridY = chartArea.y + (chartArea.h * (g / gridLineCount));
+        els.push({
+          type: 'shape', shapeType: 'rect',
+          x: chartArea.x, y: gridY, w: chartArea.w, h: 0.015,
+          fill: { color: p.text, alpha: 0.12 },
+          zIndex: 4
+        });
+      }
+
       comp.data.forEach((d, i) => {
         const barHeight = (d.value / maxValue) * chartArea.h;
         const barX = chartArea.x + (i * (barWidth + spacing)) + (spacing / 2);
         const barY = chartArea.y + (chartArea.h - barHeight);
 
-        // Bar
+        // Bar with palette-matched color
         els.push({
           type: 'shape', shapeType: 'rect',
           x: barX, y: barY, w: barWidth, h: barHeight,
-          fill: { color: p.primary, alpha: 0.8 },
+          fill: { color: chartColors[i % chartColors.length], alpha: 0.85 },
           zIndex: 6
         });
 
-        // Value
+        // Value label above bar (data labels at "outEnd")
         els.push({
           type: 'text', content: d.value.toString(),
           x: barX - themeTokens.spacing.sm, y: barY - 0.3, w: barWidth + themeTokens.spacing.md, h: 0.3,
-          fontSize: themeTokens.typography.scale.micro, color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
+          fontSize: themeTokens.typography.scale.micro, bold: true,
+          color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
         });
 
-        // Label
+        // Category label below axis (muted)
         els.push({
           type: 'text', content: d.label,
-          x: barX - themeTokens.spacing.sm, y: chartArea.y + chartArea.h + 0.1, w: barWidth + themeTokens.spacing.md, h: 0.4,
-          fontSize: themeTokens.typography.scale.label, color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
+          x: barX - themeTokens.spacing.sm, y: chartArea.y + chartArea.h + 0.08, w: barWidth + themeTokens.spacing.md, h: 0.35,
+          fontSize: themeTokens.typography.scale.label,
+          color: p.text, align: 'center', fontFamily: styleGuide.fontFamilyBody, zIndex: 7
         });
       });
 
-      // Axes Lines
-      els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y, w: 0.05, h: chartArea.h, fill: { color: p.text, alpha: 0.5 }, zIndex: 5 }); // Y Axis
-      els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y + chartArea.h, w: chartArea.w, h: 0.05, fill: { color: p.text, alpha: 0.5 }, zIndex: 5 }); // X Axis
+      // --- MUTED AXES: subtle lines (thinner, less opaque) ---
+      els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y, w: 0.03, h: chartArea.h, fill: { color: p.text, alpha: 0.25 }, zIndex: 5 }); // Y Axis
+      els.push({ type: 'shape', shapeType: 'rect', x: chartArea.x, y: chartArea.y + chartArea.h, w: chartArea.w, h: 0.03, fill: { color: p.text, alpha: 0.25 }, zIndex: 5 }); // X Axis
     } else {
       els.push({ type: 'text', content: 'No Data Available', x: x, y: y + (h / 2), w, h: 0.5, fontSize: themeTokens.typography.scale.body, color: p.text, fontFamily: styleGuide.fontFamilyBody, align: 'center', zIndex: 10 });
     }
@@ -1779,7 +1874,7 @@ export function renderWithLayeredComposition(
   // Check if the renderers have the required functions available
   const hasDecorativeRenderer = typeof decorativeRenderers?.renderDecorativeLayer === 'function';
   const hasCardRenderer = typeof cardRenderers?.renderCard === 'function';
-  
+
   if (!hasDecorativeRenderer || !hasCardRenderer) {
     console.warn('[SpatialRenderer] Serendipity renderers not fully available, some features may be limited');
   }
@@ -2091,9 +2186,9 @@ function estimateDecorativeTitleSafeY(
     return 0.14;
   }
 
-  const expandedTitleBand = titleY + Math.min(titleH + 0.35, 0.42 + ((estimatedLines - 1) * 0.34));
-  // Keep decorative elements outside wrapped title bands plus a small safety margin.
-  return Math.max(0.9, Math.min(1.9, expandedTitleBand + 0.08));
+  const expandedTitleBand = titleY + Math.min(titleH + 0.45, 0.52 + ((estimatedLines - 1) * 0.4));
+  // Keep decorative elements outside wrapped title bands plus a stronger safety margin.
+  return Math.max(0.95, Math.min(2.1, expandedTitleBand + 0.14));
 }
 
 function mapPlacementToPosition(

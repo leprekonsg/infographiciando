@@ -1917,14 +1917,14 @@ function contentPlanToComponents(contentPlan: any): any[] {
 function getDefaultStyleGuide() {
     return {
         themeName: 'Corporate Navy',
-        fontFamilyTitle: 'Inter',
-        fontFamilyBody: 'Inter',
+        fontFamilyTitle: 'Calibri',
+        fontFamilyBody: 'Calibri Light',
         colorPalette: {
-            primary: '#10b981',
-            secondary: '#3b82f6',
-            background: '#0f172a',
-            text: '#f8fafc',
-            accent: '#f59e0b'
+            primary: '028090',
+            secondary: '00A896',
+            background: '0F172A',
+            text: 'F8FAFC',
+            accent: '02C39A'
         },
         imageStyle: 'Clean abstract',
         layoutStrategy: 'Balanced'

@@ -73,9 +73,9 @@ export const validatePremiumComposition = (
   // 2. Check card count for card-based patterns
   const cardCount = compositionPlan.layerPlan?.contentStructure?.cardCount || 0;
   const pattern = compositionPlan.layerPlan?.contentStructure?.pattern;
-  
-  if ((pattern === 'card-row' || pattern === 'narrative-flow' || pattern === 'card-grid') 
-      && cardCount > PREMIUM_QUALITY_CHECKS.MAX_CARDS_PER_SLIDE) {
+
+  if ((pattern === 'card-row' || pattern === 'narrative-flow' || pattern === 'card-grid')
+    && cardCount > PREMIUM_QUALITY_CHECKS.MAX_CARDS_PER_SLIDE) {
     score -= 15;
     errors.push({
       code: 'PREMIUM_TOO_MANY_CARDS',
@@ -88,7 +88,7 @@ export const validatePremiumComposition = (
   const surprises = compositionPlan.serendipityPlan?.allocatedSurprises || [];
   const budget = compositionPlan.serendipityPlan?.variationBudget || 0.5;
   const boldSurprises = surprises.filter(s => s.intensity === 'bold').length;
-  
+
   if (budget < 0.5 && boldSurprises > 0) {
     score -= 10;
     errors.push({
@@ -234,6 +234,38 @@ export const validateVisualLayoutAlignment = (
     }
   }
 
+  // 6. MARGIN ENFORCEMENT (0.5" minimum margins from slide edges)
+  // Source: Anthropic PPTX skill — "Leave breathing room — don't fill every inch"
+  // LAYOUT_16x9 canvas is 10" × 5.625"
+  const SLIDE_W = 10;
+  const SLIDE_H = 5.625;
+  const MIN_MARGIN_X = 0.4; // 0.4" from left/right edges
+  const MIN_MARGIN_Y = 0.35; // 0.35" from top/bottom edges
+
+  if (visualDesign.spatial_strategy?.zones) {
+    for (const zone of visualDesign.spatial_strategy.zones) {
+      const tooCloseLeft = zone.x < MIN_MARGIN_X;
+      const tooCloseRight = (zone.x + zone.w) > (SLIDE_W - MIN_MARGIN_X);
+      const tooCloseTop = zone.y < MIN_MARGIN_Y;
+      const tooCloseBottom = (zone.y + zone.h) > (SLIDE_H - MIN_MARGIN_Y);
+
+      if (tooCloseLeft || tooCloseRight || tooCloseTop || tooCloseBottom) {
+        score -= 8;
+        const edges = [
+          tooCloseLeft && 'left',
+          tooCloseRight && 'right',
+          tooCloseTop && 'top',
+          tooCloseBottom && 'bottom'
+        ].filter(Boolean).join(', ');
+        errors.push({
+          code: 'MARGIN_VIOLATION',
+          message: `Zone "${zone.id}" too close to slide ${edges} edge(s) (min margin: ${MIN_MARGIN_X}"/${MIN_MARGIN_Y}")`,
+          suggestedFix: `Inset zone by at least ${MIN_MARGIN_X}" from sides and ${MIN_MARGIN_Y}" from top/bottom`
+        });
+      }
+    }
+  }
+
   return {
     passed: errors.length === 0,
     score,
@@ -253,7 +285,7 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
     metricLabel: 28,
     stepTitle: 15,
     stepDescription: 70,
-    iconLabel: 20,
+    iconLabel: 24,
     iconDescription: 60,
     chartLabel: 18
   };
@@ -519,7 +551,7 @@ export const validateSlide = (slide: SlideNode): ValidationResult => {
   // ============================================================================
   const isDataVizSlide = slide.type === 'data-viz';
   const isDataVizRouterMode = routerConfig?.renderMode === 'data-viz';
-  
+
   // Only warn if the slide is STILL marked as data-viz (not downgraded)
   if (isDataVizSlide) {
     const hasChartFrame = components.some(c => c.type === 'chart-frame');
@@ -569,7 +601,9 @@ const PLACEHOLDER_PATTERNS = [
   /placeholder/i,
   /\[.*\]/,                   // [Insert text here] style
   /n\/a/i,
-  /tbd/i
+  /tbd/i,
+  /lorem\s*ipsum/i,           // Leftover template text
+  /this.*(page|slide).*layout/i // Template layout placeholders
 ];
 
 /** 
@@ -596,11 +630,11 @@ function isPlaceholderContent(text: string): boolean {
  */
 function calculateStringSimilarity(str1: string, str2: string): number {
   // Tokenize into words, filter short words and common stop words
-  const STOP_WORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 
+  const STOP_WORDS = new Set(['the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
     'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might',
     'of', 'in', 'to', 'for', 'with', 'on', 'at', 'by', 'from', 'and', 'or', 'but', 'so', 'yet',
     'this', 'that', 'these', 'those', 'it', 'its']);
-  
+
   const tokenize = (s: string): Set<string> => {
     const words = s.toLowerCase()
       .replace(/[^\w\s]/g, ' ')
@@ -608,16 +642,16 @@ function calculateStringSimilarity(str1: string, str2: string): number {
       .filter(w => w.length > 2 && !STOP_WORDS.has(w));
     return new Set(words);
   };
-  
+
   const tokens1 = tokenize(str1);
   const tokens2 = tokenize(str2);
-  
+
   if (tokens1.size === 0 || tokens2.size === 0) return 0;
-  
+
   // Calculate Jaccard similarity
   const intersection = new Set([...tokens1].filter(t => tokens2.has(t)));
   const union = new Set([...tokens1, ...tokens2]);
-  
+
   return intersection.size / union.size;
 }
 
@@ -641,19 +675,19 @@ export interface ContentCompletenessResult {
 export function validateContentCompleteness(slide: SlideNode): ContentCompletenessResult {
   const issues: ContentCompletenessResult['issues'] = [];
   let score = 100;
-  
+
   const slideTitle = slide.layoutPlan?.title || slide.title || '';
   const components = slide.layoutPlan?.components || [];
-  
+
   // 1. CHECK: Title duplication in body
   // If the title appears verbatim as a bullet, that's lazy content
   const titleLower = slideTitle.toLowerCase().trim();
-  
+
   components.forEach((comp, idx) => {
     if (comp.type === 'text-bullets') {
       // Filter out null/undefined bullets and ensure all are strings
       const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b !== null);
-      
+
       // Check for title duplication (only if we have a non-empty title)
       if (titleLower && bullets.some(b => b.toLowerCase().trim() === titleLower)) {
         score -= 15;
@@ -663,7 +697,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
           severity: 'major'
         });
       }
-      
+
       // Check for empty bullets array when title suggests content
       if (bullets.length === 0 && comp.title) {
         score -= 25;
@@ -673,7 +707,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
           severity: 'critical'
         });
       }
-      
+
       // Check for placeholder bullets
       bullets.forEach((bullet, bulletIdx) => {
         if (isPlaceholderContent(bullet)) {
@@ -685,7 +719,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
           });
         }
       });
-      
+
       // Check for insufficient content (1 bullet that's very short)
       if (bullets.length === 1 && bullets[0] && bullets[0].length < 20) {
         score -= 10;
@@ -696,10 +730,10 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
         });
       }
     }
-    
+
     if (comp.type === 'metric-cards') {
       const metrics = comp.metrics || [];
-      
+
       // Check for "No Data Available" placeholder values
       metrics.forEach((metric, metricIdx) => {
         if (isPlaceholderContent(metric.value) || isPlaceholderContent(metric.label)) {
@@ -711,7 +745,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
           });
         }
       });
-      
+
       // Check for empty metrics array
       if (metrics.length === 0) {
         score -= 25;
@@ -722,10 +756,10 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
         });
       }
     }
-    
+
     if (comp.type === 'chart-frame') {
       const data = comp.data || [];
-      
+
       // Check for empty chart data
       if (data.length === 0) {
         score -= 25;
@@ -735,7 +769,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
           severity: 'critical'
         });
       }
-      
+
       // Check for placeholder chart titles
       if (comp.title && isPlaceholderContent(comp.title)) {
         score -= 10;
@@ -747,7 +781,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       }
     }
   });
-  
+
   // 2. CHECK: "Key Points" pattern with no points
   // This catches slides with a "Key Points" section label but empty content
   const allText = extractSlideTextForCompleteness(slide);
@@ -759,7 +793,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       severity: 'critical'
     });
   }
-  
+
   // 3. CHECK: Overall content density
   // A slide with components but almost no actual text is incomplete
   const totalChars = allText.replace(/\s+/g, '').length;
@@ -771,7 +805,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       severity: 'major'
     });
   }
-  
+
   // ============================================================================
   // 4. CHECK: SEMANTIC REDUNDANCY (within-slide)
   // ============================================================================
@@ -782,7 +816,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
   // 
   // When redundancy is detected, prefer content rewrite over geometry repair,
   // because moving a duplicated bullet doesn't fix the underlying problem.
-  
+
   // 4a. Check for near-duplicate title in component titles
   if (titleLower && titleLower.length > 5) {
     components.forEach((comp, idx) => {
@@ -800,12 +834,12 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       }
     });
   }
-  
+
   // 4b. Check for repeated bullets within text-bullets components
   components.forEach((comp, compIdx) => {
     if (comp.type === 'text-bullets') {
       const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b.length > 10);
-      
+
       // Compare each pair of bullets for similarity
       for (let i = 0; i < bullets.length; i++) {
         for (let j = i + 1; j < bullets.length; j++) {
@@ -813,7 +847,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
             bullets[i].toLowerCase(),
             bullets[j].toLowerCase()
           );
-          
+
           if (similarity > 0.75) { // 75%+ similarity = likely duplicate
             score -= 15;
             issues.push({
@@ -827,12 +861,12 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       }
     }
   });
-  
+
   // 4c. Check for bullet that just restates title with minor changes
   components.forEach((comp, compIdx) => {
     if (comp.type === 'text-bullets' && titleLower.length > 10) {
       const bullets = (comp.content || []).filter((b): b is string => typeof b === 'string' && b.length > 10);
-      
+
       bullets.forEach((bullet, bulletIdx) => {
         const similarity = calculateStringSimilarity(titleLower, bullet.toLowerCase());
         if (similarity > 0.7 && similarity < 0.95) { // Near-duplicate but not exact
@@ -846,7 +880,7 @@ export function validateContentCompleteness(slide: SlideNode): ContentCompletene
       });
     }
   });
-  
+
   return {
     passed: !issues.some(i => i.severity === 'critical'),
     score: Math.max(0, score),
@@ -890,7 +924,7 @@ const SHIPPING_BLOCK_PLACEHOLDERS = [
 const BULLET_ONLY_PLACEHOLDERS = [
   'Key Points',
   'Key Insight',
-  'Main Point', 
+  'Main Point',
   'Bullet Point',
   'Overview',
   'Summary',
@@ -926,13 +960,13 @@ export interface ShippingGateResult {
 export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateResult {
   const blockedContent: ShippingGateResult['blockedContent'] = [];
   const components = slide.layoutPlan?.components || [];
-  
+
   // Check helper: case-insensitive match against block list
   const isBlockedPlaceholder = (text: string): string | null => {
     if (!text || typeof text !== 'string') return null;
     const trimmed = text.trim();
     if (trimmed.length === 0) return null;
-    
+
     for (const placeholder of SHIPPING_BLOCK_PLACEHOLDERS) {
       if (trimmed.toLowerCase() === placeholder.toLowerCase()) {
         return placeholder;
@@ -942,20 +976,20 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
         return placeholder;
       }
     }
-    
+
     // Check for ellipsis-only content
     if (/^\.{2,}$/.test(trimmed)) {
       return '...';
     }
-    
+
     return null;
   };
-  
+
   // Check for bullet-specific placeholders (not blocked in titles)
   const isBulletPlaceholder = (text: string): string | null => {
     if (!text || typeof text !== 'string') return null;
     const trimmed = text.trim().toLowerCase();
-    
+
     for (const placeholder of BULLET_ONLY_PLACEHOLDERS) {
       if (trimmed === placeholder.toLowerCase()) {
         return placeholder;
@@ -963,7 +997,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
     }
     return null;
   };
-  
+
   components.forEach((comp, idx) => {
     // Check component title (all types) - DON'T block bullet-only placeholders in titles
     if ('title' in comp && comp.title) {
@@ -977,7 +1011,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
         });
       }
     }
-    
+
     // Type-specific checks
     if (comp.type === 'text-bullets') {
       (comp.content || []).forEach((bullet, bIdx) => {
@@ -993,12 +1027,12 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
         }
       });
     }
-    
+
     if (comp.type === 'metric-cards') {
       (comp.metrics || []).forEach((metric, mIdx) => {
         const valueBlocked = isBlockedPlaceholder(metric.value);
         const labelBlocked = isBlockedPlaceholder(metric.label);
-        
+
         if (valueBlocked) {
           blockedContent.push({
             componentIndex: idx,
@@ -1017,7 +1051,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
         }
       });
     }
-    
+
     if (comp.type === 'chart-frame') {
       // Check chart title
       if (comp.title) {
@@ -1031,7 +1065,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
           });
         }
       }
-      
+
       // Check if chart has no data (empty chart = placeholder equivalent)
       if (!comp.data || comp.data.length === 0) {
         blockedContent.push({
@@ -1042,12 +1076,12 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
         });
       }
     }
-    
+
     if (comp.type === 'process-flow') {
       (comp.steps || []).forEach((step, sIdx) => {
         const titleBlocked = isBlockedPlaceholder(step.title);
         const descBlocked = isBlockedPlaceholder(step.description);
-        
+
         if (titleBlocked) {
           blockedContent.push({
             componentIndex: idx,
@@ -1067,13 +1101,13 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
       });
     }
   });
-  
+
   // Determine recommendation based on what was found
   let recommendation: ShippingGateResult['recommendation'] = 'ok';
-  
+
   if (blockedContent.length > 0) {
     const uniqueComponents = new Set(blockedContent.map(b => b.componentIndex));
-    
+
     if (uniqueComponents.size === 1 && blockedContent.length <= 2) {
       // Single component with 1-2 issues: can likely convert to text or remove
       const comp = components[blockedContent[0].componentIndex];
@@ -1089,7 +1123,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
       recommendation = 'remove_component';
     }
   }
-  
+
   return {
     canShip: blockedContent.length === 0,
     blockedContent,
@@ -1100,7 +1134,7 @@ export function checkNoPlaceholderShippingGate(slide: SlideNode): ShippingGateRe
 /** Extract all text from slide for content analysis */
 function extractSlideTextForCompleteness(slide: SlideNode): string {
   const parts: string[] = [slide.layoutPlan?.title || '', slide.title || ''];
-  
+
   (slide.layoutPlan?.components || []).forEach(comp => {
     if (comp.type === 'text-bullets') {
       if (comp.title) parts.push(comp.title);
@@ -1122,7 +1156,7 @@ function extractSlideTextForCompleteness(slide: SlideNode): string {
       });
     }
   });
-  
+
   return parts.filter(Boolean).join(' ');
 }
 
@@ -1272,7 +1306,7 @@ export function validateGeneratorCompliance(
   }, 0);
 
   const densityBudget = routerConfig?.densityBudget || { maxChars: 600, maxItems: 4 };
-  
+
   // LOGIC FIX: Ensure we never divide by zero or have a zero budget
   // This prevents the "10700% over" errors when budget is effectively 0
   const safeMaxChars = Math.max(200, densityBudget.maxChars); // Minimum 200 chars allowed
@@ -1448,12 +1482,12 @@ export function validateDeckCoherence(slides: SlideNode[]): CoherenceReport {
       /today.s (agenda|topic)/,
     ];
     const isIntro = introPatterns.some(p => p.test(combined)) ||
-                    (purpose === 'hook' || purpose === 'introduction');
-    
+      (purpose === 'hook' || purpose === 'introduction');
+
     // Also more specific - "overview" alone mid-deck is often valid
     // Only flag if it's clearly meant as a deck introduction
     const isConclusion = /^conclusion|^summary|^takeaway|^key takeaway|^final|^wrap.?up|^next steps$/i.test(title) ||
-                         purpose === 'conclusion';
+      purpose === 'conclusion';
 
     // Intro after slide 2 is suspicious
     if (isIntro && idx > 2 && slides.length > 4) {
@@ -1503,5 +1537,119 @@ export function validateDeckCoherence(slides: SlideNode[]): CoherenceReport {
     coherenceScore: Math.max(0, score),
     issues,
     passed: score >= 70 // 70+ is acceptable coherence
+  };
+}
+
+// ============================================================================
+// POST-ASSEMBLY SMOKE TEST (Deck-Wide Validation)
+// ============================================================================
+// Runs cheap deterministic checks on ALL slides after deck assembly.
+// This is a Tier 1.5 step — more comprehensive than per-slide logic gate
+// but cheaper than Tier 2 (Qwen3-VL). Catches issues that risk-based
+// sampling may skip.
+//
+// Source: Anthropic PPTX skill — "Assume there are problems. Your job is to find them."
+// "Your first render is almost never correct."
+
+export interface SmokeTestResult {
+  passed: boolean;
+  slideIssues: Array<{
+    slideIndex: number;
+    slideTitle: string;
+    issues: Array<{ code: string; message: string; severity: 'error' | 'warning' }>;
+  }>;
+  summary: string;
+}
+
+/**
+ * Post-assembly smoke test that validates ALL slides in a deck.
+ * Catches:
+ * - Consecutive slides with identical layouts (visual repetition)
+ * - Text-only slides (no visual element at all)
+ * - Contrast issues (mid-tone backgrounds)
+ * - Empty/placeholder content that slipped through
+ */
+export function postAssemblySmokeTest(slides: SlideNode[]): SmokeTestResult {
+  const slideIssues: SmokeTestResult['slideIssues'] = [];
+  let totalIssues = 0;
+
+  for (let i = 0; i < slides.length; i++) {
+    const slide = slides[i];
+    const issues: Array<{ code: string; message: string; severity: 'error' | 'warning' }> = [];
+    const components = slide.layoutPlan?.components || [];
+    const layoutVariant = slide.routerConfig?.layoutVariant;
+
+    // CHECK 1: Consecutive identical layouts (anti-pattern: repetitive design)
+    if (i > 0) {
+      const prevLayout = slides[i - 1].routerConfig?.layoutVariant;
+      if (layoutVariant && prevLayout && layoutVariant === prevLayout && layoutVariant !== 'hero-centered') {
+        issues.push({
+          code: 'SMOKE_CONSECUTIVE_LAYOUT',
+          message: `Same layout "${layoutVariant}" as previous slide — vary layouts for visual interest`,
+          severity: 'warning'
+        });
+      }
+    }
+
+    // CHECK 2: Text-only slides (no visual component at all)
+    const hasVisualComponent = components.some(c =>
+      ['metric-cards', 'icon-grid', 'chart-frame', 'process-flow', 'diagram-svg'].includes(c.type)
+    );
+    const hasBackgroundVisual =
+      (typeof slide.backgroundImageUrl === 'string' && slide.backgroundImageUrl.trim().length > 0) ||
+      slide.layoutPlan?.background === 'image';
+    const isHero = layoutVariant === 'hero-centered';
+    if (!hasVisualComponent && !hasBackgroundVisual && !isHero && components.length > 0) {
+      issues.push({
+        code: 'SMOKE_TEXT_ONLY_SLIDE',
+        message: 'Slide has only text-bullets — add a visual element (chart, icons, or metrics) for engagement',
+        severity: 'warning'
+      });
+    }
+
+    // CHECK 3: Background contrast
+    const bgTone = slide.visualDesignSpec?.color_harmony?.background_tone;
+    if (bgTone && !hasGoodContrast(bgTone)) {
+      issues.push({
+        code: 'SMOKE_POOR_CONTRAST',
+        message: `Background tone "${bgTone}" is mid-contrast — text may be hard to read`,
+        severity: 'warning'
+      });
+    }
+
+    // CHECK 4: Empty slide (components exist but no content)
+    const textContent = components.reduce((acc, c) => {
+      if (c.type === 'text-bullets') acc += (c.content || []).join(' ');
+      if (c.type === 'metric-cards') acc += (c.metrics || []).map(m => m.value + m.label).join(' ');
+      if (c.type === 'process-flow') acc += (c.steps || []).map(s => s.title + (s.description || '')).join(' ');
+      if (c.type === 'icon-grid') acc += (c.items || []).map(it => it.label).join(' ');
+      return acc;
+    }, '').replace(/\s+/g, '').length;
+
+    if (textContent < 20 && components.length > 0 && !isHero) {
+      issues.push({
+        code: 'SMOKE_EMPTY_CONTENT',
+        message: `Slide has ${components.length} component(s) but only ${textContent} chars of actual content`,
+        severity: 'error'
+      });
+    }
+
+    if (issues.length > 0) {
+      slideIssues.push({
+        slideIndex: i,
+        slideTitle: slide.title || `Slide ${i + 1}`,
+        issues
+      });
+      totalIssues += issues.length;
+    }
+  }
+
+  const errorCount = slideIssues.reduce((sum, s) => sum + s.issues.filter(i => i.severity === 'error').length, 0);
+  return {
+    passed: errorCount === 0,
+    slideIssues,
+    summary: totalIssues === 0
+      ? `All ${slides.length} slides passed smoke test`
+      : `${totalIssues} issue(s) across ${slideIssues.length} slide(s) (${errorCount} error(s))`
   };
 }
